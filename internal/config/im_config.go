@@ -277,8 +277,7 @@ func UpdateIMConfig(next IMConfig) (*Config, error) {
 	}
 	next.Normalize()
 	cfg.IM = next
-	mgr := NewManager()
-	if err := mgr.SaveGlobal(cfg); err != nil {
+	if err := NewManager().SaveGlobal(cfg); err != nil {
 		return nil, err
 	}
 	return cfg, nil
@@ -351,18 +350,112 @@ type IMMediaConfigPatch struct {
 
 // UpdateIMConfigPatch merges a partial IM config update into the persisted config.
 func UpdateIMConfigPatch(patch IMConfigPatch) (*Config, error) {
-	cfg, err := Load("")
+	return UpdateIMConfigPatchAt("", patch)
+}
+
+// UpdateIMConfigPatchAt 按活动配置路径局部更新 IM 配置。
+// UpdateIMConfigPatchAt partially updates IM configuration at the active path.
+func UpdateIMConfigPatchAt(configPath string, patch IMConfigPatch) (*Config, error) {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load im config: %w", err)
 	}
 	cfg.IM.Normalize()
 	mergeIMConfig(&cfg.IM, patch)
 	cfg.IM.Normalize()
-	mgr := NewManager()
-	if err := mgr.SaveGlobal(cfg); err != nil {
+	if err := saveConfigFieldsAt(configPath, cfg, imConfigOverlayFields(cfg.IM, patch)...); err != nil {
 		return nil, fmt.Errorf("save im config: %w", err)
 	}
 	return cfg, nil
+}
+
+func imConfigOverlayFields(current IMConfig, patch IMConfigPatch) []configOverlayField {
+	fields := make([]configOverlayField, 0, 24)
+	if patch.Enabled != nil {
+		fields = append(fields, overlayField(current.Enabled, "im", "enabled"))
+	}
+	if p := patch.Session; p != nil {
+		if p.Scope != nil {
+			fields = append(fields, overlayField(current.Session.Scope, "im", "session", "scope"))
+		}
+		if p.RecordSender != nil {
+			fields = append(fields, overlayField(current.Session.RecordSender, "im", "session", "record_sender"))
+		}
+		if p.CrossPlatform != nil {
+			fields = append(fields, overlayField(current.Session.CrossPlatform, "im", "session", "cross_platform"))
+		}
+	}
+	if p := patch.Identity; p != nil {
+		if p.Links != nil {
+			fields = append(fields, overlayField(current.Identity.Links, "im", "identity", "links"))
+		}
+		if p.AutoLink != nil {
+			if p.AutoLink.Enabled != nil {
+				fields = append(fields, overlayField(current.Identity.AutoLink.Enabled, "im", "identity", "auto_link", "enabled"))
+			}
+			if p.AutoLink.Trust != nil {
+				fields = append(fields, overlayField(current.Identity.AutoLink.Trust, "im", "identity", "auto_link", "trust"))
+			}
+		}
+	}
+	if p := patch.Command; p != nil {
+		if p.Prefix != nil {
+			fields = append(fields, overlayField(current.Command.Prefix, "im", "command", "prefix"))
+		}
+		if p.ForwardUnknownToAgent != nil {
+			fields = append(fields, overlayField(current.Command.ForwardUnknownToAgent, "im", "command", "forward_unknown_to_agent"))
+		}
+		if p.AdminSenders != nil {
+			fields = append(fields, overlayField(current.Command.AdminSenders, "im", "command", "admin_senders"))
+		}
+		if p.RequireMentionInGroup != nil {
+			fields = append(fields, overlayField(current.Command.RequireMentionInGroup, "im", "command", "require_mention_in_group"))
+		}
+	}
+	if patch.RateLimit != nil {
+		fields = append(fields, overlayField(current.RateLimit, "im", "rate_limit"))
+	}
+	if patch.AuditLog != nil {
+		fields = append(fields, overlayField(current.AuditLog, "im", "audit_log"))
+	}
+	if patch.AuditLocalOnly != nil {
+		fields = append(fields, overlayField(current.AuditLocalOnly, "im", "audit_local_only"))
+	}
+	if patch.ToolsAllowlistDefault != nil {
+		fields = append(fields, overlayField(current.ToolsAllowlistDefault, "im", "tools_allowlist_default"))
+	}
+	if patch.Personas != nil {
+		fields = append(fields, overlayField(current.Personas, "im", "personas"))
+	}
+	if p := patch.Cron; p != nil {
+		if p.Enabled != nil {
+			fields = append(fields, overlayField(current.Cron.Enabled, "im", "cron", "enabled"))
+		}
+		if p.Jobs != nil {
+			fields = append(fields, overlayField(current.Cron.Jobs, "im", "cron", "jobs"))
+		}
+	}
+	if patch.Fallback != nil {
+		fields = append(fields, overlayField(current.Fallback, "im", "fallback"))
+	}
+	if p := patch.Media; p != nil {
+		if p.STT != nil {
+			fields = append(fields, overlayField(current.Media.STT, "im", "media", "stt"))
+		}
+		if p.TTS != nil {
+			fields = append(fields, overlayField(current.Media.TTS, "im", "media", "tts"))
+		}
+		if p.Vision != nil {
+			fields = append(fields, overlayField(current.Media.Vision, "im", "media", "vision"))
+		}
+		if p.FileExtract != nil {
+			fields = append(fields, overlayField(current.Media.FileExtract, "im", "media", "file_extract"))
+		}
+	}
+	if patch.Platforms != nil {
+		fields = append(fields, overlayField(current.Platforms, "im", "platforms"))
+	}
+	return fields
 }
 
 func mergeIMConfig(target *IMConfig, patch IMConfigPatch) {

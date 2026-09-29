@@ -61,7 +61,7 @@ func (h *Handler) UpdateIMConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	updated, err := config.UpdateIMConfigPatch(patch)
+	updated, err := config.UpdateIMConfigPatchAt(h.configPath, patch)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -234,7 +234,11 @@ func (h *Handler) persistWeChatCredential(cred im.WeChatCredential) error {
 		platform.Extra["nickname"] = cred.Nickname
 	}
 	next.Platforms[idx] = platform
-	updated, err := config.UpdateIMConfig(next)
+	enabled := true
+	updated, err := config.UpdateIMConfigPatchAt(h.configPath, config.IMConfigPatch{
+		Enabled:   &enabled,
+		Platforms: &next.Platforms,
+	})
 	if err != nil {
 		return err
 	}

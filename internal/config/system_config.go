@@ -76,9 +76,15 @@ type SystemConfigPatch struct {
 
 // UpdateSystemConfig merges a SystemConfigPatch into the persisted config.
 func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
-	cfg, err := Load("")
+	return UpdateSystemConfigAt("", patch)
+}
+
+// UpdateSystemConfigAt 按活动配置路径更新系统配置。
+// UpdateSystemConfigAt updates system configuration at the active path.
+func UpdateSystemConfigAt(configPath string, patch SystemConfigPatch) (*Config, error) {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load system config: %w", err)
 	}
 
 	if patch.Limits != nil {
@@ -117,11 +123,125 @@ func UpdateSystemConfig(patch SystemConfigPatch) (*Config, error) {
 		}
 	}
 
-	mgr := NewManager()
-	if err := mgr.SaveGlobal(cfg); err != nil {
+	if err := saveConfigFieldsAt(configPath, cfg, systemConfigOverlayFields(cfg, patch)...); err != nil {
 		return nil, fmt.Errorf("save system config: %w", err)
 	}
 	return cfg, nil
+}
+
+func systemConfigOverlayFields(cfg *Config, patch SystemConfigPatch) []configOverlayField {
+	fields := make([]configOverlayField, 0, 32)
+	if p := patch.Limits; p != nil {
+		if p.AutoCompactBuffer != nil {
+			fields = append(fields, overlayField(cfg.Limits.AutoCompactBuffer, "limits", "auto_compact_buffer"))
+		}
+		if p.ToolResultExecCap != nil {
+			fields = append(fields, overlayField(cfg.Limits.ToolResultExecCap, "limits", "tool_result_exec_cap"))
+		}
+		if p.ToolResultReadCap != nil {
+			fields = append(fields, overlayField(cfg.Limits.ToolResultReadCap, "limits", "tool_result_read_cap"))
+		}
+		if p.ToolResultDefaultCap != nil {
+			fields = append(fields, overlayField(cfg.Limits.ToolResultDefaultCap, "limits", "tool_result_default_cap"))
+		}
+		if p.PruneAfterRounds != nil {
+			fields = append(fields, overlayField(cfg.Limits.PruneAfterRounds, "limits", "prune_after_rounds"))
+		}
+		if p.MaxRounds != nil {
+			fields = append(fields, overlayField(cfg.Limits.MaxRounds, "limits", "max_rounds"))
+		}
+		if p.TodoLongRunMode != nil {
+			fields = append(fields, overlayField(cfg.Limits.TodoLongRunMode, "limits", "todo_long_run_mode"))
+		}
+		if p.MaxStoredMessages != nil {
+			fields = append(fields, overlayField(cfg.Limits.MaxStoredMessages, "limits", "max_stored_messages"))
+		}
+	}
+	if p := patch.SubAgent; p != nil {
+		if p.CacheTTL != nil {
+			fields = append(fields, overlayField(cfg.SubAgent.CacheTTL, "subagent", "cache_ttl"))
+		}
+		if p.Timeout != nil {
+			fields = append(fields, overlayField(cfg.SubAgent.Timeout, "subagent", "timeout"))
+		}
+	}
+	if patch.WorkMode != nil && patch.WorkMode.Default != nil {
+		fields = append(fields, overlayField(cfg.WorkMode.Default, "work_mode", "default"))
+	}
+	if patch.UI != nil && patch.UI.CloseBehavior != nil {
+		fields = append(fields, overlayField(cfg.UI.CloseBehavior, "ui", "close_behavior"))
+	}
+	if p := patch.Vision; p != nil {
+		image := cfg.Recognition.Routes[MediaImage]
+		if p.Enabled != nil {
+			fields = append(fields, overlayField(cfg.Vision.Enabled, "vision_recognition", "enabled"))
+		}
+		if p.Provider != nil {
+			fields = append(fields, overlayField(cfg.Vision.Provider, "vision_recognition", "provider"))
+		}
+		if p.Model != nil {
+			fields = append(fields, overlayField(cfg.Vision.Model, "vision_recognition", "model"))
+		}
+		if p.TimeoutSeconds != nil {
+			fields = append(fields, overlayField(cfg.Vision.TimeoutSeconds, "vision_recognition", "timeout_seconds"))
+		}
+		if p.MaxImageBytes != nil {
+			fields = append(fields, overlayField(cfg.Vision.MaxImageBytes, "vision_recognition", "max_image_bytes"))
+		}
+		fields = append(fields, recognitionRouteOverlayFields(MediaImage, image)...)
+	}
+	if patch.Recognition != nil {
+		for kind, routePatch := range patch.Recognition.Routes {
+			if !kind.IsValid() {
+				continue
+			}
+			route := cfg.Recognition.Routes[kind]
+			fields = append(fields, recognitionRouteOverlayFields(kind, route)...)
+			if kind == MediaImage {
+				fields = append(fields, visionOverlayFields(cfg.Vision, routePatch)...)
+			}
+		}
+	}
+	if p := patch.Generation; p != nil {
+		if p.Defaults != nil {
+			fields = append(fields, overlayField(cfg.Generation.Defaults, "generation", "defaults"))
+		}
+		if p.RequireConfirm != nil {
+			fields = append(fields, overlayField(cfg.Generation.RequireConfirm, "generation", "require_confirm"))
+		}
+	}
+	return fields
+}
+
+func recognitionRouteOverlayFields(kind MediaKind, route RecognitionRoute) []configOverlayField {
+	prefix := []string{"recognition", "routes", string(kind)}
+	return []configOverlayField{
+		overlayField(route.Enabled, append(prefix, "enabled")...),
+		overlayField(route.Provider, append(prefix, "provider")...),
+		overlayField(route.Model, append(prefix, "model")...),
+		overlayField(route.TimeoutSeconds, append(prefix, "timeout_seconds")...),
+		overlayField(route.MaxBytes, append(prefix, "max_bytes")...),
+	}
+}
+
+func visionOverlayFields(vision VisionRecognitionConfig, patch RecognitionRoutePatch) []configOverlayField {
+	fields := make([]configOverlayField, 0, 5)
+	if patch.Enabled != nil {
+		fields = append(fields, overlayField(vision.Enabled, "vision_recognition", "enabled"))
+	}
+	if patch.Provider != nil {
+		fields = append(fields, overlayField(vision.Provider, "vision_recognition", "provider"))
+	}
+	if patch.Model != nil {
+		fields = append(fields, overlayField(vision.Model, "vision_recognition", "model"))
+	}
+	if patch.TimeoutSeconds != nil {
+		fields = append(fields, overlayField(vision.TimeoutSeconds, "vision_recognition", "timeout_seconds"))
+	}
+	if patch.MaxBytes != nil {
+		fields = append(fields, overlayField(vision.MaxImageBytes, "vision_recognition", "max_image_bytes"))
+	}
+	return fields
 }
 
 func mergeGeneration(cfg *Config, patch *GenerationConfigPatch) error {

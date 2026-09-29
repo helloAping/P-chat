@@ -76,16 +76,20 @@ LLMConfig 核心字段：
 2. 若 `projectRoot` 非空，加载 `<project>/.p-chat/config.json`
 3. 项目配置覆盖全局配置（shallow merge）
 
-显式 `--config <path>` 是最高优先级 overlay。CLI `KBManager` 与 `pchat-server` 的知识库
-REST 端点都必须保留这条活动路径，并调用 `UpdateKnowledgeConfigAt(path, patch)` 及对应的
-`AddKnowledgeBaseRecordAt` / `RemoveKnowledgeBaseRecordAt`：
+显式 `--config <path>` 是最高优先级 overlay。CLI `KBManager` 及 `pchat-server` 的所有配置
+写端点都必须保留这条活动路径，并调用对应的 `*At(path, ...)` API。当前覆盖 Provider/Model、
+系统配置、Web Search、IM、Browser、MCP 与知识库：
 
 - `path == ""`：沿用全局配置写入；
-- custom path：只更新该 JSON 中显式提交的 `knowledge` 子字段；
-- 未提交的顶层字段及 `knowledge.auto_index` 等子字段保持原样或继续继承，不能把
+- custom path：原始 JSON overlay 编辑器只更新显式提交的字段；
+- 未提交的顶层、普通子对象与未知字段保持原样或继续继承，不能把
   `Load(path)` 得到的完整合并结果整体写回 custom 文件；
-- `KnowledgeConfigPatch.Bases` 使用指针切片区分“未提交”与“显式提交空数组”，因此删除
-  最后一个知识库时会写入 `bases: []`，正确覆盖下层继承值。
+- Provider、Model、MCP server、IM platform 等数组发生增删时写入完整有效数组，确保覆盖继承值；
+  这些显式替换的集合按当前 schema 重写，集合元素内部的未知字段不承诺保留；
+- `generation.defaults` 与 `im.personas` 在 custom 层具有完整替换语义，支持删除继承的 map key；
+  `im.personas.default` 是运行时必备兜底项，缺失时 `Normalize()` 会补回默认值；
+- PATCH 的指针字段区分“未提交”和显式零值/空数组；例如删除最后一个知识库会写入
+  `bases: []`，清空 Provider API key 会写入 `api_key: ""`。
 
 ### 4. 运行时热重载
 

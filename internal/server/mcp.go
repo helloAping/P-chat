@@ -14,7 +14,6 @@ package server
 
 import (
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -134,7 +133,11 @@ func (h *Handler) AddMCPServer(c *gin.Context) {
 		return
 	}
 
-	h.persistMCPServers()
+	if err := h.persistMCPServers(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.reloadAfterConfigChange()
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -149,7 +152,11 @@ func (h *Handler) RemoveMCPServer(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	h.persistMCPServers()
+	if err := h.persistMCPServers(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.reloadAfterConfigChange()
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -164,7 +171,11 @@ func (h *Handler) StartMCPServer(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	h.persistMCPServers()
+	if err := h.persistMCPServers(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.reloadAfterConfigChange()
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -179,7 +190,11 @@ func (h *Handler) StopMCPServer(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 		return
 	}
-	h.persistMCPServers()
+	if err := h.persistMCPServers(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.reloadAfterConfigChange()
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -211,11 +226,15 @@ func (h *Handler) SetMCPGlobal(c *gin.Context) {
 		return
 	}
 	h.mcpMgr.SetGlobalEnabled(body.Enabled)
-	h.persistMCPServers()
+	if err := h.persistMCPEnabled(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	h.reloadAfterConfigChange()
 	c.JSON(http.StatusOK, gin.H{"global_enabled": h.mcpMgr.GlobalEnabled()})
 }
 
-func (h *Handler) persistMCPServers() {
+func (h *Handler) persistMCPServers() error {
 	srvInfos := h.mcpMgr.List()
 	servers := make([]config.MCPServerConfig, 0, len(srvInfos))
 	for _, info := range srvInfos {
@@ -238,11 +257,11 @@ func (h *Handler) persistMCPServers() {
 			Timeout: timeoutStr,
 		})
 	}
-	h.getCfg().MCP.Servers = servers
-	h.getCfg().MCP.Enabled = h.mcpMgr.GlobalEnabled()
-	if mgr := config.NewManager(); mgr != nil {
-		if err := mgr.SaveGlobal(h.getCfg()); err != nil {
-			log.Printf("[mcp] persist config: %v", err)
-		}
-	}
+	_, err := config.UpdateMCPServersAt(h.configPath, servers)
+	return err
+}
+
+func (h *Handler) persistMCPEnabled() error {
+	_, err := config.UpdateMCPEnabledAt(h.configPath, h.mcpMgr.GlobalEnabled())
+	return err
 }

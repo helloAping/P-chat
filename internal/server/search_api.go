@@ -106,7 +106,7 @@ func (h *Handler) UpdateWebSearchSettings(c *gin.Context) {
 		DailyQuota:     req.DailyQuota,
 		RequestTimeout: req.RequestTimeout,
 	}
-	updated, err := config.UpdateSearchConfig(patch)
+	updated, err := config.UpdateSearchConfigAt(h.configPath, patch)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return

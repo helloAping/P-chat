@@ -23,7 +23,7 @@ type AddProviderRequest struct {
 
 // AddProvider POST /api/v1/providers
 //
-// Writes the new provider to ~/.p-chat/config.json and reloads
+// Writes the new provider to the active config layer and reloads
 // the in-memory LLM client so the change takes effect immediately.
 // A name collision returns 409 Conflict (not 500) so the
 // web UI can show a clear "already exists" message.
@@ -37,7 +37,7 @@ func (h *Handler) AddProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := config.AddProvider(config.ProviderConfig{
+	if err := config.AddProviderAt(h.configPath, config.ProviderConfig{
 		Name:            req.Name,
 		ProviderID:      req.ProviderID,
 		StrategyVariant: req.StrategyVariant,
@@ -77,7 +77,7 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除当前默认 provider"})
 		return
 	}
-	if err := config.RemoveProvider(name); err != nil {
+	if err := config.RemoveProviderAt(h.configPath, name); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -100,7 +100,7 @@ type UpdateProviderRequest struct {
 	Protocol        string             `json:"protocol,omitempty"`
 	BaseURL         string             `json:"base_url,omitempty"`
 	APIURL          string             `json:"api_url,omitempty"` // pre-V12 compatibility
-	APIKey          string             `json:"api_key,omitempty"`
+	APIKey          *string            `json:"api_key,omitempty"`
 	CustomHeaders   *map[string]string `json:"custom_headers,omitempty"`
 	// SetDefault, when true, makes this provider the global
 	// default. False is a no-op (the UI can always include
@@ -129,14 +129,21 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	updated, err := config.UpdateProvider(oldName, config.ProviderPatch{
+	apiKey := ""
+	clearAPIKey := false
+	if req.APIKey != nil {
+		apiKey = *req.APIKey
+		clearAPIKey = apiKey == ""
+	}
+	updated, err := config.UpdateProviderAt(h.configPath, oldName, config.ProviderPatch{
 		Name:            req.Name,
 		ProviderID:      req.ProviderID,
 		StrategyVariant: req.StrategyVariant,
 		Protocol:        req.Protocol,
 		APIURL:          req.APIURL,
 		BaseURL:         req.BaseURL,
-		APIKey:          req.APIKey,
+		APIKey:          apiKey,
+		ClearAPIKey:     clearAPIKey,
 		CustomHeaders:   req.CustomHeaders,
 		IsDefault:       req.SetDefault,
 	})
@@ -185,7 +192,7 @@ func (h *Handler) SetDefaultProvider(c *gin.Context) {
 		return
 	}
 	name := c.Param("name")
-	if err := config.SetDefaultProvider(name); err != nil {
+	if err := config.SetDefaultProviderAt(h.configPath, name); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -217,7 +224,7 @@ func (h *Handler) AddModel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if _, err := config.AddModel(name, config.ModelConfig{
+	if _, err := config.AddModelAt(h.configPath, name, config.ModelConfig{
 		Name:             req.Name,
 		APIEndpoint:      req.APIEndpoint,
 		DisplayName:      req.DisplayName,
@@ -246,7 +253,7 @@ func (h *Handler) DeleteModel(c *gin.Context) {
 	}
 	name := c.Param("name")
 	model := c.Param("model")
-	if err := config.RemoveModel(name, model); err != nil {
+	if err := config.RemoveModelAt(h.configPath, name, model); err != nil {
 		if strings.Contains(err.Error(), "used by generation default") {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
@@ -266,7 +273,7 @@ func (h *Handler) SetDefaultModel(c *gin.Context) {
 	}
 	name := c.Param("name")
 	model := c.Param("model")
-	if err := config.SetDefaultModel(name, model); err != nil {
+	if err := config.SetDefaultModelAt(h.configPath, name, model); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

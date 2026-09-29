@@ -1295,9 +1295,12 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 			return nil, fmt.Errorf("read config %s: %w", customPath, err)
 		}
 		data = stripBOM(data)
-		_, _, perr := tryUnmarshalWithTolerance(data, cfg)
+		cleaned, perr := prepareCustomOverlayLoad(data, cfg)
 		if perr != nil {
 			return nil, fmt.Errorf("parse config %s: %w", customPath, perr)
+		}
+		if err := json.Unmarshal(cleaned, cfg); err != nil {
+			return nil, fmt.Errorf("parse config %s: %w", customPath, err)
 		}
 	}
 

@@ -1,9 +1,7 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
-	"os"
 	"strings"
 )
 
@@ -70,64 +68,18 @@ func applyKnowledgePatch(target *KnowledgeConfig, patch KnowledgeConfigPatch) {
 // patchKnowledgeOverlay updates only explicitly supplied knowledge fields in a
 // custom config, preserving all other raw overlay fields and inheritance.
 func patchKnowledgeOverlay(configPath string, patch KnowledgeConfigPatch) error {
-	root := make(map[string]json.RawMessage)
-	data, err := os.ReadFile(configPath)
-	if err == nil {
-		data = stripBOM(data)
-		if _, _, err := tryUnmarshalWithTolerance(data, &root); err != nil {
-			return fmt.Errorf("parse config %s: %w", configPath, err)
-		}
-	} else if !os.IsNotExist(err) {
-		return fmt.Errorf("read config %s: %w", configPath, err)
-	}
-	if root == nil {
-		root = make(map[string]json.RawMessage)
-	}
-
-	knowledgeLayer := make(map[string]json.RawMessage)
-	if raw, ok := root["knowledge"]; ok && strings.TrimSpace(string(raw)) != "" && strings.TrimSpace(string(raw)) != "null" {
-		if err := json.Unmarshal(raw, &knowledgeLayer); err != nil {
-			return fmt.Errorf("parse knowledge config %s: %w", configPath, err)
-		}
-	}
-	if knowledgeLayer == nil {
-		knowledgeLayer = make(map[string]json.RawMessage)
-	}
-
-	setField := func(name string, value any) error {
-		raw, err := json.Marshal(value)
-		if err != nil {
-			return fmt.Errorf("marshal knowledge field %s: %w", name, err)
-		}
-		knowledgeLayer[name] = raw
-		return nil
-	}
+	fields := make([]configOverlayField, 0, 3)
 	if patch.Enabled != nil {
-		if err := setField("enabled", *patch.Enabled); err != nil {
-			return err
-		}
+		fields = append(fields, overlayField(*patch.Enabled, "knowledge", "enabled"))
 	}
 	if patch.AutoIndex != nil {
-		if err := setField("auto_index", *patch.AutoIndex); err != nil {
-			return err
-		}
+		fields = append(fields, overlayField(*patch.AutoIndex, "knowledge", "auto_index"))
 	}
 	if patch.Bases != nil {
 		bases := append([]KnowledgeBase{}, (*patch.Bases)...)
-		if err := setField("bases", bases); err != nil {
-			return err
-		}
+		fields = append(fields, overlayField(bases, "knowledge", "bases"))
 	}
-
-	knowledgeRaw, err := json.Marshal(knowledgeLayer)
-	if err != nil {
-		return fmt.Errorf("marshal knowledge config: %w", err)
-	}
-	root["knowledge"] = knowledgeRaw
-	if err := writeJSONAtomic(configPath, root); err != nil {
-		return fmt.Errorf("write config %s: %w", configPath, err)
-	}
-	return nil
+	return saveConfigFieldsAt(configPath, nil, fields...)
 }
 
 // AddKnowledgeBaseRecord appends a knowledge base config and saves.

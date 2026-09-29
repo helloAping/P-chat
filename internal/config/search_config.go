@@ -52,7 +52,13 @@ type SearchConfigPatch struct {
 // (E_BADCFG) so the settings panel can surface a localised
 // message.
 func UpdateSearchConfig(patch SearchConfigPatch) (*SearchConfig, error) {
-	cfg, err := Load("")
+	return UpdateSearchConfigAt("", patch)
+}
+
+// UpdateSearchConfigAt 按活动配置路径更新 Web Search 配置。
+// UpdateSearchConfigAt updates web-search configuration at the active path.
+func UpdateSearchConfigAt(configPath string, patch SearchConfigPatch) (*SearchConfig, error) {
+	cfg, err := Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
@@ -154,8 +160,32 @@ func UpdateSearchConfig(patch SearchConfigPatch) (*SearchConfig, error) {
 		}
 	}
 
-	mgr := NewManager()
-	if err := mgr.SaveGlobal(cfg); err != nil {
+	fields := make([]configOverlayField, 0, 8)
+	if patch.Enabled != nil {
+		fields = append(fields, overlayField(cfg.Search.Enabled, "search", "enabled"))
+	}
+	if patch.Provider != nil {
+		fields = append(fields, overlayField(cfg.Search.Provider, "search", "provider"))
+	}
+	if patch.ClearAPIKey || patch.APIKey != nil {
+		fields = append(fields, overlayField(cfg.Search.APIKey, "search", "api_key"))
+	}
+	if patch.BaseURL != nil {
+		fields = append(fields, overlayField(cfg.Search.BaseURL, "search", "base_url"))
+	}
+	if patch.Path != nil {
+		fields = append(fields, overlayField(cfg.Search.Path, "search", "path"))
+	}
+	if patch.Topic != nil {
+		fields = append(fields, overlayField(cfg.Search.Topic, "search", "topic"))
+	}
+	if patch.DailyQuota != nil {
+		fields = append(fields, overlayField(cfg.Search.DailyQuota, "search", "daily_quota"))
+	}
+	if patch.RequestTimeout != nil {
+		fields = append(fields, overlayField(cfg.Search.RequestTimeout, "search", "request_timeout"))
+	}
+	if err := saveConfigFieldsAt(configPath, cfg, fields...); err != nil {
 		return nil, fmt.Errorf("save search config: %w", err)
 	}
 	return &cfg.Search, nil

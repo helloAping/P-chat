@@ -214,8 +214,8 @@ type UpdateModelRequest struct {
 //
 // Replaces the editable fields of a model. The model Name is the
 // URL path segment and cannot be changed (callers should
-// delete-and-recreate to rename). Writes to
-// ~/.p-chat/config.json and reloads the in-memory LLM client.
+// delete-and-recreate to rename). Writes to the active config
+// layer and reloads the in-memory LLM client.
 func (h *Handler) UpdateModel(c *gin.Context) {
 	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
@@ -237,7 +237,7 @@ func (h *Handler) UpdateModel(c *gin.Context) {
 		Type:             req.Type,
 		Generation:       req.Generation,
 	}
-	updated, err := config.UpdateModel(providerName, modelName, patch, req.ClearAll)
+	updated, err := config.UpdateModelAt(h.configPath, providerName, modelName, patch, req.ClearAll)
 	if err != nil {
 		if strings.Contains(err.Error(), "used by generation default") {
 			c.JSON(http.StatusConflict, gin.H{"error": "update failed: " + err.Error()})
@@ -270,8 +270,8 @@ type SetCapabilitiesRequest struct {
 
 // SetCapabilities PATCH /api/v1/providers/:name/models/:model/capabilities
 //
-// Replaces the model entry's Capabilities block. Writes to
-// ~/.p-chat/config.json and reloads the in-memory LLM client.
+// Replaces the model entry's Capabilities block. Writes to the
+// active config layer and reloads the in-memory LLM client.
 func (h *Handler) SetCapabilities(c *gin.Context) {
 	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
@@ -300,7 +300,7 @@ func (h *Handler) SetCapabilities(c *gin.Context) {
 		}
 		req.InputModalities = &normalized
 	}
-	if err := config.SetModelCapabilities(name, model, config.Capabilities{
+	if err := config.SetModelCapabilitiesAt(h.configPath, name, model, config.Capabilities{
 		ThinkingEffort:  config.ThinkingEffort(req.ThinkingEffort),
 		ContextWindow:   req.ContextWindow,
 		SupportsVision:  req.SupportsVision,
