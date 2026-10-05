@@ -327,8 +327,11 @@ type ProviderConfig struct {
 type ModelConfig struct {
 	// Name is the model identifier sent to the API (e.g. "gpt-4o").
 	Name string `json:"name"`
+	// Protocol optionally overrides the provider request protocol. Empty means
+	// the model follows ProviderConfig.Protocol.
+	Protocol string `json:"protocol,omitempty"`
 	// APIEndpoint is appended to the provider BaseURL. Conversational models
-	// default to the selected protocol's conventional suffix when omitted.
+	// default to the model's effective protocol suffix when omitted.
 	APIEndpoint string `json:"api_endpoint,omitempty"`
 	// DisplayName is shown in /model and /config. Optional.
 	DisplayName string `json:"display_name,omitempty"`
@@ -375,6 +378,16 @@ func (m ModelConfig) EffectiveType() ModelType {
 		return ModelTypeLLM
 	}
 	return m.Type
+}
+
+// EffectiveProtocol 返回模型实际使用的请求协议；空覆盖继承供应商协议。
+// EffectiveProtocol returns the model request protocol, inheriting the
+// provider protocol when the model has no explicit override.
+func (m ModelConfig) EffectiveProtocol(providerProtocol string) string {
+	if strings.TrimSpace(m.Protocol) != "" {
+		return NormalizeProtocol(m.Protocol)
+	}
+	return NormalizeProtocol(providerProtocol)
 }
 
 const (
@@ -515,6 +528,18 @@ func (p ProviderConfig) GetProtocol() string {
 	return "openai"
 }
 
+// ModelProtocol 返回指定模型实际使用的请求协议。
+// ModelProtocol returns the effective request protocol for a model, falling
+// back to the provider protocol when the model is unknown or inherits it.
+func (p ProviderConfig) ModelProtocol(modelName string) string {
+	for _, model := range p.Models {
+		if model.Name == modelName && model.EffectiveType() == ModelTypeLLM {
+			return model.EffectiveProtocol(p.GetProtocol())
+		}
+	}
+	return NormalizeProtocol(p.GetProtocol())
+}
+
 // DefaultLLMAPIEndpoint 返回新建对话模型默认填入的可编辑端点后缀。
 // DefaultLLMAPIEndpoint returns the editable endpoint suffix offered for a
 // newly-created conversational model.
@@ -601,6 +626,7 @@ func (p ProviderConfig) ModelAPIURL(modelName string) string {
 		return strings.TrimSpace(p.APIURL)
 	}
 	endpoint := ""
+	protocol := p.ModelProtocol(modelName)
 	for _, model := range p.Models {
 		if model.Name == modelName && model.EffectiveType() == ModelTypeLLM {
 			endpoint = model.APIEndpoint
@@ -608,7 +634,7 @@ func (p ProviderConfig) ModelAPIURL(modelName string) string {
 		}
 	}
 	if endpoint == "" {
-		endpoint = DefaultLLMAPIEndpoint(p.GetProtocol())
+		endpoint = DefaultLLMAPIEndpoint(protocol)
 	}
 	return JoinAPIURL(p.EffectiveBaseURL(), endpoint)
 }

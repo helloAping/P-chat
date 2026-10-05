@@ -84,13 +84,14 @@ type ProviderInfo struct {
 }
 
 type providerEntry struct {
-	name          string // provider name (for error messages)
-	protocol      string // openai/openai_chat/openai_responses/anthropic/anthropic_messages
-	model         string
-	apiKey        string
-	baseURL       string
-	modelAPIURLs  map[string]string
-	customHeaders map[string]string
+	name           string // provider name (for error messages)
+	protocol       string // openai/openai_chat/openai_responses/anthropic/anthropic_messages
+	model          string
+	apiKey         string
+	baseURL        string
+	modelAPIURLs   map[string]string
+	modelProtocols map[string]string
+	customHeaders  map[string]string
 
 	// ResponseHeaderTimeout bounds a stalled request before the server
 	// responds. StreamIdleTimeout only applies after a response is open,
@@ -103,15 +104,23 @@ func (p *providerEntry) endpointForModel(model string) string {
 	if endpoint := strings.TrimSpace(p.modelAPIURLs[model]); endpoint != "" {
 		return endpoint
 	}
-	return config.JoinAPIURL(p.baseURL, config.DefaultLLMAPIEndpoint(p.protocol))
+	return config.JoinAPIURL(p.baseURL, config.DefaultLLMAPIEndpoint(p.protocolForModel(model)))
+}
+
+func (p *providerEntry) protocolForModel(model string) string {
+	if protocol := strings.TrimSpace(p.modelProtocols[model]); protocol != "" {
+		return config.NormalizeProtocol(protocol)
+	}
+	return config.NormalizeProtocol(p.protocol)
 }
 
 func (p *providerEntry) adapterForModel(model string) ProtocolAdapter {
 	endpoint := p.endpointForModel(model)
-	if config.ProtocolIsAnthropic(p.protocol) {
+	protocol := p.protocolForModel(model)
+	if config.ProtocolIsAnthropic(protocol) {
 		return NewAnthropicAdapter(endpoint, p.apiKey, p.name)
 	}
-	if config.ProtocolIsOpenAIResponses(p.protocol) {
+	if config.ProtocolIsOpenAIResponses(protocol) {
 		return NewOpenAIResponsesAdapter(endpoint, p.apiKey, p.name)
 	}
 	return NewOpenAIAdapter(endpoint, p.apiKey, p.name)
@@ -312,6 +321,7 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 			apiKey:                p.APIKey,
 			baseURL:               p.EffectiveBaseURL(),
 			modelAPIURLs:          make(map[string]string),
+			modelProtocols:        make(map[string]string),
 			customHeaders:         requestheader.CloneTemplates(p.CustomHeaders),
 			responseHeaderTimeout: defaultResponseHeaderTimeout,
 			streamIdleTimeout:     defaultStreamIdleTimeout,
@@ -322,6 +332,7 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 		for _, model := range p.AllModels() {
 			if model.EffectiveType() == config.ModelTypeLLM {
 				entry.modelAPIURLs[model.Name] = p.ModelAPIURL(model.Name)
+				entry.modelProtocols[model.Name] = model.EffectiveProtocol(p.GetProtocol())
 			}
 		}
 
@@ -416,7 +427,7 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	// Inject reasoning_effort (OpenAI) or thinking (Anthropic)
 	// into the request body when the caller sets a reasoning level.
 	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
-		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
+		req.Body = injectReasoning(req.Body, p.protocolForModel(model), opts.ReasoningEffort)
 	}
 	// T2 diagnostics: log the message vs tool breakdown so an over-window
 	// request can be attributed to the right side. The my-blog dead-loop
@@ -513,7 +524,7 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 		return "", err
 	}
 	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
-		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
+		req.Body = injectReasoning(req.Body, p.protocolForModel(model), opts.ReasoningEffort)
 	}
 	req.Body = forceNonStreamingBody(req.Body)
 
@@ -557,7 +568,7 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 	if resp.StatusCode >= 400 {
 		return "", ClassifyAPIError(p.name, upstreamHTTPError("llm", resp.StatusCode, body))
 	}
-	text, err := parseNonStreamContent(p.protocol, body)
+	text, err := parseNonStreamContent(p.protocolForModel(model), body)
 	if err != nil {
 		return "", ClassifyAPIError(p.name, err)
 	}
@@ -737,11 +748,12 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelN
 		model = p.model
 	}
 
-	if config.ProtocolIsOpenAIResponses(p.protocol) {
+	protocol := p.protocolForModel(model)
+	if config.ProtocolIsOpenAIResponses(protocol) {
 		return c.ChatStreamCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), toolDefsFromOpenAITools(tools), opts)
 	}
 
-	if config.ProtocolIsAnthropic(p.protocol) {
+	if config.ProtocolIsAnthropic(protocol) {
 		// Anthropic support for tools is not implemented in this branch.
 		// Resolve max_tokens the same way the OpenAI branch does
 		// (per-model MaxTokensOutput > global opts.MaxTokens > 0)
@@ -1121,11 +1133,12 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		model = p.model
 	}
 
-	if config.ProtocolIsOpenAIResponses(p.protocol) {
+	protocol := p.protocolForModel(model)
+	if config.ProtocolIsOpenAIResponses(protocol) {
 		return c.ChatCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), ChatOptions{})
 	}
 
-	if config.ProtocolIsAnthropic(p.protocol) {
+	if config.ProtocolIsAnthropic(protocol) {
 		// Resolve max_tokens: per-model MaxTokensOutput > 0
 		// (Anthropic's API requires a positive value; we don't
 		// consult a global default here — the non-streaming Chat
@@ -1183,7 +1196,7 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 	if resp.StatusCode >= http.StatusBadRequest {
 		return "", ClassifyAPIError(p.name, upstreamHTTPError("openai", resp.StatusCode, encoded))
 	}
-	return parseNonStreamContent(p.protocol, encoded)
+	return parseNonStreamContent(protocol, encoded)
 }
 
 func (c *Client) ProviderNames() []string {
@@ -1221,6 +1234,18 @@ func (c *Client) GetModel(providerName string) string {
 func (c *Client) GetProtocol(providerName string) string {
 	if p, ok := c.providers[providerName]; ok {
 		return p.protocol
+	}
+	return ""
+}
+
+// GetModelProtocol 返回模型实际请求协议；未配置覆盖时继承供应商协议。
+// GetModelProtocol returns the model's effective request protocol.
+func (c *Client) GetModelProtocol(providerName, modelName string) string {
+	if p, ok := c.providers[providerName]; ok {
+		if modelName == "" {
+			modelName = p.model
+		}
+		return p.protocolForModel(modelName)
 	}
 	return ""
 }

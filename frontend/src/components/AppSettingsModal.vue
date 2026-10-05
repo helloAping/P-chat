@@ -307,6 +307,7 @@ const showAddModel = ref(false)
 // unused `editModel*` family).
 const editingModelName = ref<string | null>(null)
 const editModelName = ref('')
+const editModelProtocol = ref<api.ProviderProtocol | ''>('')
 const editModelAPIEndpoint = ref('')
 const editModelDisplay = ref('')
 const editModelCtx = ref<number | null>(null)
@@ -346,11 +347,20 @@ function isCompleteHTTPURL(value: string | undefined): boolean {
   }
 }
 
-function defaultLLMAPIEndpoint(protocol = selected.value?.protocol): string {
+function defaultLLMAPIEndpoint(protocol: api.ProviderProtocol | '' | undefined = editModelProtocol.value || selected.value?.protocol): string {
   const normalized = normalizeProviderProtocol(protocol)
   if (normalized === 'anthropic_messages') return '/messages'
   if (normalized === 'openai_responses') return '/responses'
   return '/chat/completions'
+}
+
+function onModelProtocolUpdate(value: api.ProviderProtocol | null) {
+  const currentEndpoint = normalizeEndpointSuffix(editModelAPIEndpoint.value)
+  const previousDefault = defaultLLMAPIEndpoint(editModelProtocol.value || selected.value?.protocol)
+  editModelProtocol.value = value || ''
+  if (!currentEndpoint || currentEndpoint === previousDefault) {
+    editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
+  }
 }
 
 function normalizeProviderProtocol(protocol?: string): api.ProviderProtocol {
@@ -1312,6 +1322,7 @@ async function onSaveProvider() {
 function resetModelForm() {
   editingModelName.value = null
   editModelName.value = ''
+  editModelProtocol.value = ''
   editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
   editModelDisplay.value = ''
   editModelCtx.value = null
@@ -1347,6 +1358,7 @@ async function onAddModel() {
     await api.addModel(providerName, {
       name,
       type: editModelType.value,
+      protocol: editModelType.value === 'llm' ? editModelProtocol.value || undefined : undefined,
       api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value.trim() || undefined,
       max_tokens_context: editModelCtx.value ?? undefined,
@@ -1394,7 +1406,8 @@ function onEditModel(m: api.ModelInfo) {
   editingModelName.value = m.name
   editModelName.value = m.name
   editModelType.value = m.type || 'llm'
-  editModelAPIEndpoint.value = m.api_endpoint || defaultLLMAPIEndpoint()
+  editModelProtocol.value = m.protocol || ''
+  editModelAPIEndpoint.value = m.api_endpoint || defaultLLMAPIEndpoint(editModelProtocol.value || selected.value.protocol)
   editModelDisplay.value = m.display_name || ''
   editModelCtx.value = m.max_tokens_context ?? null
   editModelOut.value = m.max_tokens_output ?? null
@@ -1445,6 +1458,7 @@ async function onSaveModel() {
     const out = editModelOut.value && editModelOut.value > 0 ? editModelOut.value : 0
     await api.updateModel(provider, model, {
       type: editModelType.value,
+      protocol: editModelType.value === 'llm' ? editModelProtocol.value : undefined,
       api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value,
       max_tokens_context: ctx,
@@ -1864,6 +1878,10 @@ const protocolOptions = [
   { label: 'OpenAI Responses', value: 'openai_responses' },
   { label: 'Anthropic Messages', value: 'anthropic_messages' },
 ]
+const modelProtocolOptions = computed(() => [
+  { label: '跟随供应商（默认）', value: '' },
+  ...protocolOptions,
+])
 const providerPresetOptions = computed(() => {
   const options = providerPresets.value.map(preset => ({
     label: preset.display_name,
@@ -3004,6 +3022,16 @@ function kbModelSupportsVision(scanModel: string) {
                 <code v-if="modelEndpointPreview" class="endpoint-preview">{{ modelEndpointPreview }}</code>
                 <template v-else>Base URL + 此后缀</template>。
               </span>
+            </div>
+            <div v-if="editModelType === 'llm'" class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">请求协议</label>
+              <NSelect
+                :value="editModelProtocol"
+                :options="modelProtocolOptions"
+                size="small"
+                @update:value="onModelProtocolUpdate"
+              />
+              <span class="settings-form-hint">留空时跟随供应商协议；仅当该模型使用不同请求格式时设置。</span>
             </div>
             <div v-if="editModelType === 'llm'" class="settings-form-row">
               <label class="settings-form-label">上下文 (tokens)</label>

@@ -152,7 +152,7 @@ func (h *Handler) GetKnowledgeModels(c *gin.Context) {
 		for _, m := range p.AllModels() {
 			out = append(out, modelItem{
 				Provider:       p.Name,
-				Protocol:       p.GetProtocol(),
+				Protocol:       m.EffectiveProtocol(p.GetProtocol()),
 				Model:          m.Name,
 				SupportsVision: m.Capabilities.SupportsInput(config.MediaImage),
 			})

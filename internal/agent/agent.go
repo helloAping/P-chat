@@ -272,18 +272,18 @@ func (a *Agent) SetSubAgentConcurrency(max int) {
 	}
 }
 
-// protocolFor returns the configured protocol ("openai" /
-// "anthropic" / ...) for the given provider name. Falls back to
+// protocolFor returns the effective protocol for a provider/model pair.
+// A model-level override wins over the provider protocol. Falls back to
 // "openai" when the provider is unknown — the existing LLM
 // client already falls back to OpenAI shape in that case so
 // attachment expansion does the same.
-func (a *Agent) protocolFor(providerName string) string {
+func (a *Agent) protocolFor(providerName, modelName string) string {
 	if a.cfg == nil {
 		return "openai"
 	}
 	for _, p := range a.cfg.LLM.Providers {
 		if p.Name == providerName {
-			return p.GetProtocol()
+			return p.ModelProtocol(modelName)
 		}
 	}
 	return "openai"
@@ -605,7 +605,7 @@ func (a *Agent) modelSupportsInput(providerName, modelName string, kind config.M
 	if kind == config.MediaImage {
 		return a.modelSupportsVision(providerName, modelName)
 	}
-	if a == nil || a.cfg == nil || a.protocolFor(providerName) != "openai" {
+	if a == nil || a.cfg == nil || !config.ProtocolIsOpenAICompatible(a.protocolFor(providerName, modelName)) {
 		return false
 	}
 	for _, provider := range a.cfg.LLM.Providers {
@@ -638,7 +638,7 @@ func (a *Agent) mediaRecognitionRoute(kind config.MediaKind) (config.Recognition
 	if !ok {
 		return config.RecognitionRoute{}, false
 	}
-	if kind != config.MediaImage && a.protocolFor(route.Provider) != "openai" {
+	if kind != config.MediaImage && !config.ProtocolIsOpenAICompatible(a.protocolFor(route.Provider, route.Model)) {
 		return config.RecognitionRoute{}, false
 	}
 	if !a.modelExplicitlySupportsInput(route.Provider, route.Model, kind) {
@@ -2386,7 +2386,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Expand any user-uploaded attachments into separate
 		// ChatMessage entries (text msg + image/file msgs).
 		if len(req.Attachments) > 0 && a.attach != nil {
-			protocol := a.protocolFor(req.Provider)
+			protocol := a.protocolFor(req.Provider, req.Model)
 			modelCapable := func(kind config.MediaKind) bool { return a.modelSupportsInput(req.Provider, req.Model, kind) }
 			msgs = ExpandAttachmentsForCapabilitiesCM(protocol, msgs, req.Attachments, a.attach, modelCapable, recognitionCapabilities)
 			msgs = AppendGenerationAttachmentRefs(msgs, req.Attachments, availableGenerationOps)

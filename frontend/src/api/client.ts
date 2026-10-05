@@ -962,6 +962,7 @@ export function uploadURL(id: string): string {
 // --- Providers / Models ---
 export interface ModelInfo {
   name: string
+  protocol?: ProviderProtocol
   api_endpoint?: string
   type?: ModelType
   display_name?: string
@@ -1268,6 +1269,7 @@ export const updateProvider = (name: string, req: UpdateProviderRequest) =>
 // --- Per-model CRUD ---
 export interface AddModelRequest {
   name: string
+  protocol?: ProviderProtocol
   api_endpoint?: string
   type?: ModelType
   display_name?: string
@@ -1284,6 +1286,8 @@ export const addModel = (provider: string, req: AddModelRequest) =>
   )
 
 export interface UpdateModelRequest {
+  // Empty string clears the override and restores provider inheritance.
+  protocol?: ProviderProtocol | ''
   api_endpoint?: string
   type?: ModelType
   display_name?: string

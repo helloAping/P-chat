@@ -120,10 +120,10 @@ OpenAI 流式 usage 解析保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_
 - `ChatCM()` 非流式调用也用于 provider/model 的无状态 `sayhi` 连接测试
 
 Provider 选择 `openai_chat`、`openai_responses` 或 `anthropic_messages` 协议；旧 `openai`
-与 `anthropic` 值会继续兼容。Provider 保存公共 `base_url`，每个 LLM 模型保存可编辑
-`api_endpoint`；OpenAI Chat 新模型默认 `/chat/completions`，OpenAI Responses 默认
+与 `anthropic` 值会继续兼容。Provider 保存公共 `base_url`；每个 LLM 模型可用可选
+`protocol` 覆盖 Provider 协议，空值表示继承，并保存可编辑 `api_endpoint`。OpenAI Chat 新模型默认 `/chat/completions`，OpenAI Responses 默认
 `/responses`，Anthropic Messages 默认 `/messages`。`providerEntry` 根据本次请求的
-模型解析完整 URL，避免同一 Provider 下的模型互相覆盖端点。旧完整 `api_url` 仅由兼容
+模型有效协议选择请求/响应适配器并解析完整 URL，避免同一 Provider 下的模型互相覆盖协议或端点。旧完整 `api_url` 仅由兼容
 读取与 V12 升级步骤拆分。
 
 `internal/requestheader` 从 Agent 注入的请求上下文读取 `SessionID` / `ClientMsgID`，并结合

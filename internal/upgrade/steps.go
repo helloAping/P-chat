@@ -42,6 +42,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V12: stepV12toV13,
 	V13: stepV13toV14,
 	V14: stepV14toV15,
+	V15: stepV15toV16,
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -518,6 +519,16 @@ func stepV13toV14(db *sql.DB) error {
 func stepV14toV15(_ *sql.DB) error {
 	log.Print("[upgrade] V14 → V15: initializing provider strategy ids")
 	return migrateProviderStrategyIDs()
+}
+
+// ---- V15 → V16 ----
+
+func stepV15toV16(_ *sql.DB) error {
+	// No rewrite is necessary: an absent model.protocol intentionally means
+	// "inherit the provider protocol". Recording the step keeps config format
+	// evolution ordered and makes interrupted upgrades resumable.
+	log.Print("[upgrade] V15 → V16: enabling optional per-model request protocols")
+	return nil
 }
 
 func migrateProviderCustomHeaders() error {

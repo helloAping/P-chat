@@ -193,13 +193,16 @@ func (h *Handler) GetProvider(c *gin.Context) {
 // UpdateModelRequest is the body of PUT /api/v1/providers/:name/models/:model.
 //
 // Per-model fields:
-//   - display_name, description, max_tokens_context, max_tokens_output
+//   - protocol, display_name, description, max_tokens_context, max_tokens_output
 //
 // A zero value for a numeric field means "leave it as is" (the
 // API treats 0 as "not provided"). Pass an explicit negative
 // value (e.g. -1) to clear the field. DisplayName and
 // Description accept empty string to clear.
 type UpdateModelRequest struct {
+	// Protocol is a pointer so omitted means "leave unchanged", while an
+	// explicit empty string clears the override and restores inheritance.
+	Protocol         *string                            `json:"protocol"`
 	APIEndpoint      string                             `json:"api_endpoint,omitempty"`
 	DisplayName      string                             `json:"display_name"`
 	Description      string                             `json:"description"`
@@ -237,7 +240,7 @@ func (h *Handler) UpdateModel(c *gin.Context) {
 		Type:             req.Type,
 		Generation:       req.Generation,
 	}
-	updated, err := config.UpdateModelAt(h.configPath, providerName, modelName, patch, req.ClearAll)
+	updated, err := config.UpdateModelProtocolAt(h.configPath, providerName, modelName, patch, req.Protocol, req.ClearAll)
 	if err != nil {
 		if strings.Contains(err.Error(), "used by generation default") {
 			c.JSON(http.StatusConflict, gin.H{"error": "update failed: " + err.Error()})

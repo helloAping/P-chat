@@ -81,7 +81,11 @@ const (
 	// V15 — providers persist provider_id / strategy_variant for strategy presets.
 	V15 AppVersion = 15
 
+	// V16 — conversational models may override the provider request protocol.
+	// Missing model.protocol remains backward compatible and means inheritance.
+	V16 AppVersion = 16
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V15
+	Current AppVersion = V16
 )

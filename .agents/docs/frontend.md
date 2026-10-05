@@ -398,7 +398,7 @@ compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 `GET /api/v1/provider-presets` 和 provider 策略。模型可手工添加，也可通过“获取模型”
 调用策略化模型发现；选择上游模型只会预填普通模型编辑弹窗，用户确认能力、上下文与端点
 后才持久化。它同时支持 `llm/media_generation` 模型类型；LLM 保存可编辑
-`api_endpoint`，媒体模型勾选 operation 能力并保存一份共享端点后缀配置，同时可在
+`api_endpoint`，并可在端点后选择模型级请求协议，留空时继承 Provider；媒体模型勾选 operation 能力并保存一份共享端点后缀配置，同时可在
 `operations[operation]` 中保存单能力覆盖。默认值按供应商、协议与能力带入；运行时再与
 Provider Base URL 拼接。系统页“媒体生成”按能力选择应用默认模型。
 

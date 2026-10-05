@@ -124,7 +124,8 @@ LLMConfig 核心字段：
 媒体生成配置定义在 `generation.go`。媒体模型通过
 `generation.operations` 显式声明规范能力，map value 仅作为能力标记；同一模型只在
 `generation.api` 保存一份 `endpoint`、`query_endpoint`、`timeout_seconds` 和
-`default_params`。Provider 保存公共 `base_url`；LLM 的 `api_endpoint`、媒体模型的
+`default_params`。Provider 保存公共 `base_url`；LLM 可通过可选 `protocol` 覆盖供应商
+请求协议（缺省或空值表示继承），并保存自己的 `api_endpoint`；媒体模型的
 `endpoint` 与可选 `query_endpoint` 都只保存相对路径后缀。运行时统一使用
 `JoinAPIURL(base_url, endpoint)` 拼接，不按厂商猜测 `/v1` 或 `/v3`。新建 LLM 会按协议
 预填 `/chat/completions`、`/responses` 或 `/messages`；新建媒体生成模型会按供应商策略、

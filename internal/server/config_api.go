@@ -203,6 +203,7 @@ func (h *Handler) SetDefaultProvider(c *gin.Context) {
 // AddModelRequest is the body of POST /api/v1/providers/:name/models.
 type AddModelRequest struct {
 	Name             string                             `json:"name" binding:"required"`
+	Protocol         string                             `json:"protocol,omitempty"`
 	APIEndpoint      string                             `json:"api_endpoint,omitempty"`
 	DisplayName      string                             `json:"display_name"`
 	Description      string                             `json:"description"`
@@ -226,6 +227,7 @@ func (h *Handler) AddModel(c *gin.Context) {
 	}
 	if _, err := config.AddModelAt(h.configPath, name, config.ModelConfig{
 		Name:             req.Name,
+		Protocol:         req.Protocol,
 		APIEndpoint:      req.APIEndpoint,
 		DisplayName:      req.DisplayName,
 		Description:      req.Description,
@@ -235,7 +237,7 @@ func (h *Handler) AddModel(c *gin.Context) {
 		Generation:       req.Generation,
 	}); err != nil {
 		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "endpoint") || strings.Contains(err.Error(), "media generation model") || strings.Contains(err.Error(), "unsupported generation operation") {
+		if strings.Contains(err.Error(), "endpoint") || strings.Contains(err.Error(), "protocol") || strings.Contains(err.Error(), "media generation model") || strings.Contains(err.Error(), "unsupported generation operation") {
 			status = http.StatusBadRequest
 		}
 		c.JSON(status, gin.H{"error": err.Error()})

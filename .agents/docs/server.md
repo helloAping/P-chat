@@ -388,8 +388,9 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
   参数已停用，API 收到这两个旧字段时返回 `400`；历史 metadata 字段不会参与运行。
 - `GET /api/v1/generated/:id` 提供已实体化的图片、视频或音频；文件与归属 metadata 位于
   `~/.p-chat/generated/`，URL 在聊天历史中保持稳定。
-- Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含 `api_endpoint`、
-  `type`、`generation`；Provider 的 `custom_headers` 是完整替换的字符串 map，提交 `{}` 可清空。
+- Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含可选 `protocol`、
+  `api_endpoint`、`type`、`generation`；模型协议缺省时继承 Provider，更新时显式提交空字符串可清除覆盖。
+  Provider 的 `custom_headers` 是完整替换的字符串 map，提交 `{}` 可清空。
   LLM/媒体端点均保存相对后缀，并在执行时与 Base URL 拼接。
   `GET /api/v1/providers/:name/upstream-models` 使用 `internal/provider` 策略解析模型列表
   endpoint、默认 Base URL、静态 fallback 与手动兜底，并携带该 Provider 的自定义请求头。

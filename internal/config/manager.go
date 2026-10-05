@@ -365,7 +365,7 @@ func UpdateProviderAt(configPath, oldName string, patch ProviderPatch) (*Provide
 			newDefault := DefaultLLMAPIEndpoint(p.GetProtocol())
 			for modelIndex := range p.Models {
 				model := &p.Models[modelIndex]
-				if model.EffectiveType() != ModelTypeLLM {
+				if model.EffectiveType() != ModelTypeLLM || strings.TrimSpace(model.Protocol) != "" {
 					continue
 				}
 				if model.APIEndpoint == "" || NormalizeAPIEndpointSuffix(model.APIEndpoint) == oldDefault {
@@ -469,8 +469,14 @@ func validateProviderBaseURL(raw string) error {
 
 func normalizeModelAPIConfig(protocol string, model *ModelConfig) error {
 	if model.EffectiveType() == ModelTypeLLM {
+		if strings.TrimSpace(model.Protocol) != "" {
+			if !IsSupportedProtocol(model.Protocol) {
+				return fmt.Errorf("llm model %q: invalid protocol %q (allowed: openai, openai_chat, openai_responses, anthropic, anthropic_messages)", model.Name, model.Protocol)
+			}
+			model.Protocol = NormalizeProtocol(model.Protocol)
+		}
 		if strings.TrimSpace(model.APIEndpoint) == "" {
-			model.APIEndpoint = DefaultLLMAPIEndpoint(protocol)
+			model.APIEndpoint = DefaultLLMAPIEndpoint(model.EffectiveProtocol(protocol))
 		}
 		if err := validateAPIEndpointSuffix(model.APIEndpoint, "api_endpoint", true); err != nil {
 			return fmt.Errorf("llm model %q: %w", model.Name, err)
@@ -480,6 +486,7 @@ func normalizeModelAPIConfig(protocol string, model *ModelConfig) error {
 		return nil
 	}
 
+	model.Protocol = ""
 	model.APIEndpoint = ""
 	if model.Generation != nil && model.Generation.API != nil {
 		if strings.TrimSpace(model.Generation.API.Endpoint) == "" {
@@ -688,6 +695,13 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 // UpdateModelAt 按活动配置路径更新模型。
 // UpdateModelAt updates a model at the active configuration path.
 func UpdateModelAt(configPath, providerName, modelName string, patch ModelConfig, clearAll bool) (*ProviderConfig, error) {
+	return UpdateModelProtocolAt(configPath, providerName, modelName, patch, nil, clearAll)
+}
+
+// UpdateModelProtocolAt 按活动配置路径更新模型，并在 protocol 非 nil 时设置或清空模型级协议覆盖。
+// UpdateModelProtocolAt updates a model and sets or clears its protocol override
+// when protocol is non-nil. A pointer to an empty string restores inheritance.
+func UpdateModelProtocolAt(configPath, providerName, modelName string, patch ModelConfig, protocol *string, clearAll bool) (*ProviderConfig, error) {
 	cfg, err := Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load model config: %w", err)
@@ -710,6 +724,18 @@ func UpdateModelAt(configPath, providerName, modelName string, patch ModelConfig
 			return nil, fmt.Errorf("model %q not found under provider %q", modelName, providerName)
 		}
 		m := &p.Models[idx]
+		oldDefaultEndpoint := NormalizeAPIEndpointSuffix(DefaultLLMAPIEndpoint(m.EffectiveProtocol(p.GetProtocol())))
+		if protocol != nil {
+			requestedProtocol := strings.TrimSpace(*protocol)
+			if requestedProtocol != "" && !IsSupportedProtocol(requestedProtocol) {
+				return nil, fmt.Errorf("llm model %q: invalid protocol %q (allowed: openai, openai_chat, openai_responses, anthropic, anthropic_messages)", modelName, requestedProtocol)
+			}
+			if requestedProtocol == "" {
+				m.Protocol = ""
+			} else {
+				m.Protocol = NormalizeProtocol(requestedProtocol)
+			}
+		}
 		if patch.Type != "" {
 			if !patch.Type.IsValid() {
 				return nil, fmt.Errorf("invalid model type %q", patch.Type)
@@ -724,6 +750,8 @@ func UpdateModelAt(configPath, providerName, modelName string, patch ModelConfig
 		}
 		if patch.APIEndpoint != "" {
 			m.APIEndpoint = patch.APIEndpoint
+		} else if protocol != nil && (strings.TrimSpace(m.APIEndpoint) == "" || NormalizeAPIEndpointSuffix(m.APIEndpoint) == oldDefaultEndpoint) {
+			m.APIEndpoint = DefaultLLMAPIEndpoint(m.EffectiveProtocol(p.GetProtocol()))
 		}
 		if clearAll {
 			m.DisplayName = ""

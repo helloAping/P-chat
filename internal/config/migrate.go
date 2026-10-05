@@ -52,6 +52,7 @@ type yamlProviderCfg struct {
 
 type yamlModel struct {
 	Name             string         `yaml:"name"`
+	Protocol         string         `yaml:"protocol,omitempty"`
 	APIEndpoint      string         `yaml:"api_endpoint,omitempty"`
 	DisplayName      string         `yaml:"display_name,omitempty"`
 	Default          bool           `yaml:"default,omitempty"`
@@ -175,6 +176,7 @@ func unmarshalYAML(data []byte, cfg *Config) error {
 		for _, m := range p.Models {
 			pp.Models = append(pp.Models, ModelConfig{
 				Name:             m.Name,
+				Protocol:         m.Protocol,
 				APIEndpoint:      m.APIEndpoint,
 				DisplayName:      m.DisplayName,
 				Default:          m.Default,
