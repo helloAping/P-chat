@@ -45,22 +45,18 @@ func (h *Handler) ListSessions(c *gin.Context) {
 	}
 	projectPath := c.Query("project_path")
 	hasProjectParam := c.Request.URL.Query().Has("project_path")
-	// Cap the list at 200 to bound the response size for users
-	// with thousands of sessions. The SPA can paginate via
-	// future ?before_id/limit params if it needs more.
-	convs := h.store.ListConversationsLimit(200)
+	// Cap the list at 200 to bound the response size for users with thousands
+	// of sessions. A project filter is applied before this cap so sessions from
+	// other projects cannot hide older sessions in the requested project.
+	var convs []memory.Conversation
+	if hasProjectParam {
+		convs = h.store.ListConversationsByProjectPathLimit(projectPath, 200)
+	} else {
+		convs = h.store.ListConversationsLimit(200)
+	}
 	out := make([]SessionResponse, 0, len(convs))
 	for _, conv := range convs {
 		resp := h.sessionToResponse(conv)
-		if projectPath != "" {
-			if resp.ProjectPath != projectPath {
-				continue
-			}
-		} else if hasProjectParam {
-			if resp.ProjectPath != "" {
-				continue
-			}
-		}
 		out = append(out, resp)
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": out})

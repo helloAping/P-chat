@@ -343,12 +343,11 @@ npm run build                                   # 前端 bundle
 
 ## 4. 已知问题
 
-### 4.1 api-convert.08ms.cn 代理
+### 4.1 api-convert.08ms.cn 代理（2026-07 历史记录）
 
-- `cs` provider 走 `http://api-convert.08ms.cn/v1`
-- **2026-07-12 前**：月度 quota 已用完
-- `doubao-seed-2.0-lite` 路由被屏蔽
-- **这不是 P-Chat 的 bug**
+- 当时的 `cs` provider 配置指向 `http://api-convert.08ms.cn/v1`。
+- 2026-07-12 前曾观察到月度额度耗尽，且 `doubao-seed-2.0-lite` 路由被屏蔽。
+- 排障时须核对当前活动配置和上游响应；这条历史记录不能证明当前额度、路由状态或故障归因。
 
 ### 4.2 LLM 合成错误
 

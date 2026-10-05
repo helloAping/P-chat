@@ -564,6 +564,9 @@ type SendMessageRequest struct {
 	// SkillContext 仅为旧客户端兼容保留，新客户端不应提交指令正文。
 	// SkillContext remains for legacy clients only; new clients must not submit instruction bodies.
 	ActiveSkills []string `json:"active_skills,omitempty"`
+	// ToolsEnabled 仅覆盖当前消息的工具可用性。
+	// ToolsEnabled overrides tool availability for this message only.
+	ToolsEnabled *bool `json:"tools_enabled,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /sessions.

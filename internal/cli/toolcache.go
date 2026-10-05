@@ -11,13 +11,17 @@ import (
 // user can /expand them to see what was returned (instead of the
 // truncated one-line summary shown in the live stream).
 type toolResult struct {
-	seq      int
-	tool     string
-	args     string
-	result   string
-	err      string
-	duration time.Duration
-	at       time.Time
+	seq       int
+	tool      string
+	toolID    string
+	sessionID string
+	args      string
+	result    string
+	err       string
+	duration  time.Duration
+	at        time.Time
+	truncated bool
+	fullLen   int
 }
 
 // toolResultCache holds the most recent N tool results in insertion
@@ -36,16 +40,20 @@ func newToolResultCache(max int) *toolResultCache {
 	return &toolResultCache{max: max}
 }
 
-func (c *toolResultCache) record(tool, args, result, errStr string, dur time.Duration) {
+func (c *toolResultCache) record(tool, toolID, sessionID, args, result, errStr string, dur time.Duration, truncated bool, fullLen int) {
 	c.nextSeq++
 	r := &toolResult{
-		seq:      c.nextSeq,
-		tool:     tool,
-		args:     args,
-		result:   result,
-		err:      errStr,
-		duration: dur,
-		at:       time.Now(),
+		seq:       c.nextSeq,
+		tool:      tool,
+		toolID:    toolID,
+		sessionID: sessionID,
+		args:      args,
+		result:    result,
+		err:       errStr,
+		duration:  dur,
+		at:        time.Now(),
+		truncated: truncated,
+		fullLen:   fullLen,
 	}
 	c.results = append(c.results, r)
 	if len(c.results) > c.max {
@@ -54,13 +62,25 @@ func (c *toolResultCache) record(tool, args, result, errStr string, dur time.Dur
 	}
 }
 
-// get returns the result with the given 1-based index from the
-// beginning. Returns nil if not found.
-func (c *toolResultCache) get(idx int) *toolResult {
-	if idx < 1 || idx > len(c.results) {
-		return nil
+// replaceResult fills a cached truncated result after it is loaded on demand.
+func (c *toolResultCache) replaceResult(r *toolResult, result string) {
+	if r == nil {
+		return
 	}
-	return c.results[idx-1]
+	r.result = result
+	r.truncated = false
+}
+
+// get returns the result with the displayed sequence number.
+// Eviction does not renumber entries, so a positional lookup would
+// expand the wrong result after the cache reaches its limit.
+func (c *toolResultCache) get(seq int) *toolResult {
+	for _, result := range c.results {
+		if result.seq == seq {
+			return result
+		}
+	}
+	return nil
 }
 
 // last returns the most recent result, or nil.
@@ -111,7 +131,11 @@ func describe(r *toolResult) string {
 	if r.args != "" {
 		fmt.Fprintf(&b, "  %s", formatOneLine(r.args, 60))
 	}
-	fmt.Fprintf(&b, "  (%s, %d bytes result", r.duration.Round(time.Millisecond), len(r.result))
+	resultBytes := len(r.result)
+	if r.truncated && r.fullLen > 0 {
+		resultBytes = r.fullLen
+	}
+	fmt.Fprintf(&b, "  (%s, %d bytes result", r.duration.Round(time.Millisecond), resultBytes)
 	if r.err != "" {
 		fmt.Fprintf(&b, ", err=%s", formatOneLine(r.err, 60))
 	}

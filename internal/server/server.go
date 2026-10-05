@@ -236,6 +236,10 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 
 		// Sessions
 		api.GET("/sessions", h.ListSessions)
+		// Session-scoped instruction diagnostics use the same project
+		// root as an agent turn, instead of the server's CWD.
+		api.GET("/sessions/:id/rules", h.ListSessionRules)
+		api.GET("/sessions/:id/agents", h.GetSessionAgents)
 		api.GET("/search", h.SearchMessages)
 		api.GET("/token-stats", h.TokenStats)
 		api.POST("/sessions", h.CreateSession)

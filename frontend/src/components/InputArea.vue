@@ -696,7 +696,7 @@ async function runSlash(name: string, args: string): Promise<boolean> {
   }
   // Fall back to the server's command endpoint for anything else.
   try {
-    const r = await api.runCommand(name, args)
+    const r = await api.runCommand(name, args, state.currentID)
     appendSystemMessage(r.output || '(无输出)')
     return true
   } catch (e: any) {

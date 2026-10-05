@@ -7,11 +7,12 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agents"
+	"github.com/p-chat/pchat/internal/rules"
 )
 
-// commandSpec describes a slash command. The HTTP layer exposes
-// every command in the CLI's slash registry (see internal/cli);
-// this struct is the trimmed-down public form.
+// commandSpec 描述 HTTP 命令面板公开的 CLI 命令子集。
+// commandSpec describes the CLI command subset exposed by the HTTP palette.
 type commandSpec struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
@@ -23,9 +24,8 @@ type commandSpec struct {
 	WebSafe bool `json:"web_safe"`
 }
 
-// commandRegistry is the authoritative list of slash commands the
-// HTTP layer exposes. Keep in sync with internal/cli/commands.go
-// when commands are added/removed.
+// commandRegistry 是 HTTP 命令面板的目录；CLI 新增命令时应检查是否需要公开。
+// commandRegistry is the HTTP palette catalog; review new CLI commands for inclusion.
 //
 // Each entry is a tiny self-contained spec —the actual command
 // logic still lives in internal/cli (run by the CLI) and isn't
@@ -53,7 +53,7 @@ var commandRegistry = []commandSpec{
 	{Name: "tools", Description: "列出可用工具 + on/off", Args: "[on|off]", Group: "config", WebSafe: true},
 	{Name: "init", Description: "在当前目录初始化 .p-chat/", Group: "session", WebSafe: false},
 	{Name: "recall", Description: "知识库语义检索", Args: "<query>", Group: "info", WebSafe: true},
-	{Name: "kb", Description: "知识库管理(list|add|remove|scan)", Args: "[subcommand]", Group: "info", WebSafe: true},
+	{Name: "kb", Description: "知识库管理(list|add|remove|scan|status)", Args: "[subcommand]", Group: "info", WebSafe: true},
 	{Name: "debug", Description: "诊断信息 (cache|memory)", Args: "[topic]", Group: "info", WebSafe: true},
 	{Name: "expand", Description: "查看工具调用历史结果", Args: "[index|last]", Group: "info", WebSafe: true},
 	{Name: "plan", Description: "让LLM 制定计划后再执行", Args: "<task>", Group: "session", WebSafe: false},
@@ -86,9 +86,73 @@ func (h *Handler) ListCommands(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"commands": out})
 }
 
+// ListSessionRules 返回现有会话项目范围内加载的规则。
+// ListSessionRules returns the rules loaded for one existing session. The
+// session id anchors project resolution and prevents arbitrary file paths from
+// being supplied through this diagnostic endpoint.
+func (h *Handler) ListSessionRules(c *gin.Context) {
+	projectRoot, ok := h.observationProjectRoot(c, c.Param("id"))
+	if !ok {
+		return
+	}
+	loaded, err := rules.LoadAllWithRoot(projectRoot)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	result := make([]RuleObservation, 0, len(loaded))
+	for _, rule := range loaded {
+		scope := "project"
+		if rule.IsGlobal {
+			scope = "global"
+		}
+		result = append(result, RuleObservation{Name: rule.Name, Path: rule.Path, Scope: scope})
+	}
+	c.JSON(http.StatusOK, gin.H{"rules": result})
+}
+
+// GetSessionAgents 返回现有会话选用的 AGENTS.md 候选文件与实际提示词。
+// GetSessionAgents returns the AGENTS.md candidates and exact prompt selected
+// by the loader's OR policy for one existing session.
+func (h *Handler) GetSessionAgents(c *gin.Context) {
+	projectRoot, ok := h.observationProjectRoot(c, c.Param("id"))
+	if !ok {
+		return
+	}
+	inspection := agents.InspectWithRoot(projectRoot)
+	result := AgentsObservation{
+		Candidates: make([]AgentsCandidateObservation, 0, len(inspection.Candidates)),
+		Prompt:     inspection.Prompt,
+	}
+	for _, candidate := range inspection.Candidates {
+		result.Candidates = append(result.Candidates, AgentsCandidateObservation{
+			Slot: candidate.Slot, Label: candidate.Label, Path: candidate.Path,
+			Exists: candidate.Exists, Selected: candidate.Selected,
+		})
+	}
+	c.JSON(http.StatusOK, result)
+}
+
+func (h *Handler) observationProjectRoot(c *gin.Context, sessionID string) (string, bool) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return "", false
+	}
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session_id is required"})
+		return "", false
+	}
+	if _, err := h.store.GetConversation(sessionID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return "", false
+	}
+	return h.sessionProjectPath(sessionID), true
+}
+
 // RunCommandRequest is the body of POST /api/v1/commands/:name.
 type RunCommandRequest struct {
-	Args string `json:"args"`
+	Args      string `json:"args"`
+	SessionID string `json:"session_id,omitempty"`
 }
 
 // CommandResult is the response of POST /api/v1/commands/:name.
@@ -97,6 +161,32 @@ type RunCommandRequest struct {
 // returns richer data.
 type CommandResult struct {
 	Output string `json:"output"`
+}
+
+// RuleObservation 是会话项目范围内可见的一条规则。
+// RuleObservation is one rule visible to a session's project scope.
+type RuleObservation struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	Scope string `json:"scope"`
+}
+
+// AgentsCandidateObservation 描述一个 AGENTS.md 候选文件，不返回其原始内容。
+// AgentsCandidateObservation describes one AGENTS.md candidate without
+// returning its raw content. Only the selected prompt body is returned.
+type AgentsCandidateObservation struct {
+	Slot     string `json:"slot"`
+	Label    string `json:"label"`
+	Path     string `json:"path"`
+	Exists   bool   `json:"exists"`
+	Selected bool   `json:"selected"`
+}
+
+// AgentsObservation 是会话范围内 AGENTS.md 诊断响应。
+// AgentsObservation is the session-scoped AGENTS.md diagnostic response.
+type AgentsObservation struct {
+	Candidates []AgentsCandidateObservation `json:"candidates"`
+	Prompt     string                       `json:"prompt"`
 }
 
 // RunCommand POST /api/v1/commands/:name
@@ -130,7 +220,15 @@ func (h *Handler) RunCommand(c *gin.Context) {
 	// "use the dedicated endpoint" hint.
 	switch spec.Group {
 	case "info":
-		out, err := h.runInfoCommand(name, req.Args)
+		projectRoot := ""
+		if name == "rules" || name == "agents" {
+			var ok bool
+			projectRoot, ok = h.observationProjectRoot(c, req.SessionID)
+			if !ok {
+				return
+			}
+		}
+		out, err := h.runInfoCommand(name, req.Args, projectRoot)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
@@ -159,7 +257,7 @@ func (h *Handler) RunCommand(c *gin.Context) {
 // runInfoCommand produces a text rendering of the "info" group
 // commands. The output mirrors what the CLI prints (sometimes
 // paraphrased for HTML friendliness).
-func (h *Handler) runInfoCommand(name, args string) (string, error) {
+func (h *Handler) runInfoCommand(name, args, projectRoot string) (string, error) {
 	switch name {
 	case "help":
 		var b strings.Builder
@@ -187,8 +285,6 @@ func (h *Handler) runInfoCommand(name, args string) (string, error) {
 				key := "(已设置)"
 				if p.APIKey == "" {
 					key = "(未设置)"
-				} else if len(p.APIKey) > 8 {
-					key = p.APIKey[:4] + "..." + p.APIKey[len(p.APIKey)-4:]
 				}
 				return fmt.Sprintf("当前提供商: %s\n  协议: %s\n  BaseURL: %s\n  Model: %s\n  APIKey: %s",
 					p.Name, p.GetProtocol(), p.BaseURL, p.EffectiveModel(), key), nil
@@ -201,11 +297,40 @@ func (h *Handler) runInfoCommand(name, args string) (string, error) {
 			return h.loadSkillsList()
 		})
 	case "rules":
-		return infoList("rules", func() ([]string, error) {
-			return h.loadRulesList()
-		})
+		loaded, err := rules.LoadAllWithRoot(projectRoot)
+		if err != nil {
+			return "", err
+		}
+		if len(loaded) == 0 {
+			return "暂无已加载规则", nil
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "已加载规则 (%d):\n", len(loaded))
+		for _, rule := range loaded {
+			scope := "项目"
+			if rule.IsGlobal {
+				scope = "全局"
+			}
+			fmt.Fprintf(&b, "  • %s [%s]\n    %s\n", rule.Name, scope, rule.Path)
+		}
+		return b.String(), nil
 	case "agents":
-		return infoAgents()
+		inspection := agents.InspectWithRoot(projectRoot)
+		var b strings.Builder
+		b.WriteString("AGENTS.md 候选文件（按优先级）:\n")
+		for _, candidate := range inspection.Candidates {
+			status := "未找到"
+			if candidate.Exists {
+				status = "可用，未选中"
+			}
+			if candidate.Selected {
+				status = "胜出"
+			}
+			fmt.Fprintf(&b, "  • [%s] %s — %s\n", candidate.Label, status, candidate.Path)
+		}
+		b.WriteString("\n实际注入提示词:\n")
+		b.WriteString(inspection.Prompt)
+		return b.String(), nil
 	case "tools":
 		// The CLI prints the tool list from the agent's
 		// registry. We don't have a direct accessor here;
@@ -227,10 +352,8 @@ func findCommand(name string) (commandSpec, bool) {
 	return commandSpec{}, false
 }
 
-// loadSkillsList / loadRulesList / infoAgents are thin adapters
-// over the loader packages. The CLI's RunSkillsList / RunRulesList
-// print to stdout, which is awkward to capture; we just re-read
-// the same files and return a slice of names.
+// loadSkillsList reads the same skill catalog as the CLI without capturing
+// the CLI command's stdout.
 
 func (h *Handler) loadSkillsList() ([]string, error) {
 	all, err := loadAllSkills()
@@ -242,38 +365,6 @@ func (h *Handler) loadSkillsList() ([]string, error) {
 		out = append(out, s.Name)
 	}
 	return out, nil
-}
-
-func (h *Handler) loadRulesList() ([]string, error) {
-	all, err := loadAllRules()
-	if err != nil {
-		return nil, err
-	}
-	out := make([]string, 0, len(all))
-	for _, r := range all {
-		out = append(out, r.Name)
-	}
-	return out, nil
-}
-
-func infoAgents() (string, error) {
-	g, p, err := readAgentsContext()
-	if err != nil {
-		return "", err
-	}
-	var b strings.Builder
-	b.WriteString("AGENTS.md:\n")
-	if g == "" {
-		b.WriteString("  [全局] 未找到 ~/.p-chat/AGENTS.md\n")
-	} else {
-		fmt.Fprintf(&b, "  [全局] ~/.p-chat/AGENTS.md (%d 字符)\n", len(g))
-	}
-	if p == "" {
-		b.WriteString("  [项目] 未找到 ./AGENTS.md\n")
-	} else {
-		fmt.Fprintf(&b, "  [项目] ./AGENTS.md (%d 字符)\n", len(p))
-	}
-	return b.String(), nil
 }
 
 // infoList is a tiny helper for "list N items" commands. Each

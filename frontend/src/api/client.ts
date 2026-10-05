@@ -1192,10 +1192,10 @@ export interface CommandSpec {
 export const listCommands = () =>
   jsonFetch<{ commands: CommandSpec[] }>('/api/v1/commands')
 
-export const runCommand = (name: string, args: string) =>
+export const runCommand = (name: string, args: string, sessionID?: string) =>
   jsonFetch<{ output: string }>(`/api/v1/commands/${encodeURIComponent(name)}`, {
     method: 'POST',
-    body: JSON.stringify({ args }),
+    body: JSON.stringify({ args, session_id: sessionID }),
   })
 
 // --- App-level provider configuration ---

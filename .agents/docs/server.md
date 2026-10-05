@@ -25,7 +25,8 @@ Provider/Model、系统配置、Web Search、IM、Browser、MCP 与知识库的�
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
 | `server.go` | Gin 引擎构建、路由注册、CORS 中间件 + trace id middleware | `New()`, `NewWithStaticFS()`, `corsMiddleware()`, `traceIDMiddleware()` |
-| `handler.go` | 所有 API handler 实现（~2130行） | `SendMessage()`, `ListMessages()`, `chunkToEvent()` 等 |
+| `handler.go` | Handler 结构及通用 API 处理 | `Handler` 等 |
+| `stream_adapter.go` | Agent chunk 到 SSE 事件的映射 | `chunkToEvent()` |
 | `messages.go` | 消息发送 / 重答 / SSE 写循环 / 自动续跑控制 | `SendMessage()`, `respondSSE()` |
 | `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
@@ -33,7 +34,7 @@ Provider/Model、系统配置、Web Search、IM、Browser、MCP 与知识库的�
 | `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe / 连接测试 | `FetchUpstreamModels`, `ProbeUpstreamModels`, `TestProvider` |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
-| `command_api.go` | 斜杠命令执行 | |
+| `command_api.go` | Web 斜杠命令与会话规则/AGENTS.md 诊断接口 | `RunCommand()`, `ListSessionRules()`, `GetSessionAgents()` |
 | `tool_api.go` | P3-2 工具列表端点 | `ListTools()` |
 | `upload.go` | 文件上传/下载 | |
 | `dialog.go` | 本地文件选择对话框 | |
@@ -260,6 +261,16 @@ compressed_summary, messages:[{role, tokens, preview, is_tool_result}]}`。
 `clear` 端点执行后自动调用 `agent.Reload()` 刷新 L1 overview 缓存。
 
 `nodes` 端点返回扁平 `NodeTreeItem[]`（含 `parent_id` / `child_count` / `content_count`），前端据此构建三层树视图。
+
+### 7.1 会话范围的指令诊断
+
+`GET /sessions/:id/rules` 返回当前 session 项目根下的全局与项目 Rule，带 `name`、`path` 和
+`scope`。`GET /sessions/:id/agents` 返回三个 AGENTS.md 候选（项目根、项目 `.p-chat`、全局）
+及实际注入 agent 的 `prompt`；候选采用 OR 优先级，首个非空可读文件胜出。两个接口都要求
+已存在的 session ID，避免诊断接口接收任意本地路径。
+
+Web 输入框的 `POST /commands/rules` 和 `POST /commands/agents` 请求体携带
+`session_id`，按相同的会话项目根解析；未传会话 ID 返回 400，找不到会话返回 404。
 
 ### 8. 端到端 trace id (P3-3, 2026-07-16)
 

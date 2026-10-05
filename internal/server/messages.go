@@ -249,6 +249,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		ProjectRoot:       meta.ProjectPath,
 		SkillContext:      req.SkillContext,
 		ActiveSkills:      append([]string(nil), req.ActiveSkills...),
+		ToolCallsEnabled:  req.ToolsEnabled,
 		PlanMode:          turnModePolicy == agent.TurnModePlan,
 		TurnModePolicy:    turnModePolicy,
 		PermissionLevel:   meta.PermissionLevel,

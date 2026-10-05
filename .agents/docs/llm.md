@@ -54,7 +54,7 @@ type ProtocolAdapter interface {
 **Anthropic Adapter** (`anthropic_adapter.go`):
 - Build: 将 ChatMessage[] 转为 Anthropic `MessagesRequest` JSON
   - **assistant 消息合并**（P2-3）：连续 assistant-role 的 text 块和 `tool_use` 块合并到同一条 assistant 消息的 content 数组；连续 `tool_result` 块也合并到同一条 user 消息的 content 数组。
-- ParseStream: 逐行读取 SSE (`event: ...` → `data: ...`)，解析 content_block_start/delta/stop、thinking_delta 等事件
+- ParseStream: 逐行读取 SSE (`event: ...` → `data: ...`)，解析 content_block_start/delta/stop、thinking_delta；`tool_use` 按 content block `index` 归集，起始事件发出 ID/名称，`input_json_delta.partial_json` 原样作为参数增量，并在无参 block stop 时补 `{}`
 - 原生支持 `thinking` 块
 - DeepSeek 带 tools 请求回传已有 thinking；其他模型不注入缺少签名的 DeepSeek thinking 块。
 - `pchat_context_*` 动态快照包装为原位置的 user 内容，不合并到顶层 system。

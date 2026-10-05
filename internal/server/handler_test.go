@@ -383,6 +383,68 @@ func TestListSessions(t *testing.T) {
 	}
 }
 
+func TestListSessions_ProjectFilterAppliesBeforeLimit(t *testing.T) {
+	s, _ := newTestServer(t)
+	targetPath := filepath.Join(t.TempDir(), "target-project")
+	targetID := s.handler.store.CurrentConversationID()
+	if err := s.handler.store.UpdateConversationMeta(targetID, sessionProjectMetaJSON(t, targetPath)); err != nil {
+		t.Fatal(err)
+	}
+	globalID, err := s.handler.store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(t.TempDir(), "other-project")
+
+	for i := 0; i < 200; i++ {
+		id, err := s.handler.store.NewConversation()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.handler.store.UpdateConversationMeta(id, sessionProjectMetaJSON(t, otherPath)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions?project_path="+url.QueryEscape(targetPath), nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Sessions []SessionResponse `json:"sessions"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Sessions) != 1 || body.Sessions[0].ID != targetID {
+		t.Fatalf("project sessions = %+v, want only %q beyond the first global 200", body.Sessions, targetID)
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/sessions?project_path=", nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("global status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Sessions) != 1 || body.Sessions[0].ID != globalID {
+		t.Fatalf("global sessions = %+v, want only %q", body.Sessions, globalID)
+	}
+}
+
+func sessionProjectMetaJSON(t *testing.T, projectPath string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]string{"project_path": projectPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 func TestCreateSession_ReuseEmptyWithinProject(t *testing.T) {
 	s, _ := newTestServer(t)
 	projectPath := filepath.Join(t.TempDir(), "repo")

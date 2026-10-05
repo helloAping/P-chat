@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -20,8 +21,9 @@ import (
 //  3. The LLM response as plain streaming text
 //  4. A final status bar with model, tokens, elapsed
 type ChatUI struct {
-	provider string
-	model    string
+	provider         string
+	model            string
+	turnHeaderOutput io.Writer
 
 	// Question support
 	sessionID           string
@@ -53,10 +55,11 @@ type ChatUI struct {
 // NewChatUI creates a new chat UI renderer.
 func NewChatUI(provider, model string) *ChatUI {
 	return &ChatUI{
-		provider:     provider,
-		model:        model,
-		start:        time.Now(),
-		firstContent: true,
+		provider:         provider,
+		model:            model,
+		turnHeaderOutput: os.Stdout,
+		start:            time.Now(),
+		firstContent:     true,
 	}
 }
 
@@ -793,9 +796,9 @@ func (u *ChatUI) printStatusBar() {
 	dim.Printf("  ⏵ %s\n", strings.Join(parts, " · "))
 }
 
-// PrintBannerHeader prints a small "user message" header before the response.
-// This makes the chat look like a conversation.
-func (u *ChatUI) PrintBannerHeader(userInput string) {
+// BeginTurn 初始化一次终端响应的渲染状态，并输出回合分隔。
+// BeginTurn initializes terminal rendering state and prints the turn separator.
+func (u *ChatUI) BeginTurn(userInput string, showUserInput bool) {
 	u.start = time.Now()
 	u.tokensIn.Store(0)
 	u.tokensOut.Store(0)
@@ -806,9 +809,11 @@ func (u *ChatUI) PrintBannerHeader(userInput string) {
 	u.maxRound = 0
 	u.firstContent = true
 	u.inTextBlock = false
-	dim := color.New(color.FgCyan, color.Bold)
-	dim.Printf("  ❯ %s\n", userInput)
-	fmt.Println()
+	if showUserInput {
+		dim := color.New(color.FgCyan, color.Bold)
+		dim.Fprintf(u.turnHeaderOutput, "  ❯ %s\n", userInput)
+	}
+	fmt.Fprintln(u.turnHeaderOutput)
 }
 
 func (u *ChatUI) startSpinner(msg string) {

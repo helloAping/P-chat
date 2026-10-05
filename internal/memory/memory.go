@@ -2206,9 +2206,28 @@ func scanConversation(scanner conversationScanner) (Conversation, error) {
 // "no cap" (used by legacy callers / tests). The handler-layer
 // pagination passes limit=200 to bound the response size.
 func (s *Store) ListConversationsLimit(limit int) []Conversation {
+	return s.listConversationsLimit(limit, "", false)
+}
+
+// ListConversationsByProjectPathLimit 返回属于 projectPath 的最多 limit 条活跃会话，
+// 按 updated_at DESC 排序。空 projectPath 只选择全局会话。路径清理后比较，Windows
+// 上使用不区分大小写的匹配。
+//
+// ListConversationsByProjectPathLimit returns up to limit active conversations
+// for projectPath, ordered by updated_at DESC. An empty projectPath selects
+// global conversations only. Project paths are compared after cleaning and use
+// case-insensitive matching on Windows.
+func (s *Store) ListConversationsByProjectPathLimit(projectPath string, limit int) []Conversation {
+	return s.listConversationsLimit(limit, projectPath, true)
+}
+
+func (s *Store) listConversationsLimit(limit int, projectPath string, filterProject bool) []Conversation {
 	_ = s.Flush()
 	q := conversationSelectWithActivity + ` WHERE c.archived = 0 ORDER BY c.updated_at DESC, c.id DESC`
-	if limit > 0 {
+	// 按项目过滤时必须先解码并规范化 metadata，再截取上限；Windows 路径不区分大小写。
+	// Decode and normalize metadata before applying the cap when filtering by
+	// project; Windows paths compare case-insensitively.
+	if limit > 0 && !filterProject {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
 	rows, err := s.db.Query(q)
@@ -2222,7 +2241,13 @@ func (s *Store) ListConversationsLimit(limit int) []Conversation {
 		if err != nil {
 			return out
 		}
+		if filterProject && !sameConversationProjectPath(conversationProjectPath(c.Metadata), projectPath) {
+			continue
+		}
 		out = append(out, c)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
 	}
 	return out
 }

@@ -1327,6 +1327,9 @@ type ChatRequest struct {
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
+	// ToolCallsEnabled 可按请求覆盖工具可用性；nil 保持既有默认行为。
+	// ToolCallsEnabled optionally overrides tool availability for this request.
+	ToolCallsEnabled *bool `json:"tool_calls_enabled,omitempty"`
 	// TurnModePolicy controls whether this turn is routed as auto/plan/build.
 	// Empty keeps the legacy PlanMode boolean behavior.
 	TurnModePolicy TurnModePolicy `json:"turn_mode_policy,omitempty"`
@@ -2232,6 +2235,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		availableTools = a.imageRecognitionGatedTools(imageRecognitionToolAvailable, availableTools)
 		availableTools = filterMediaRecognitionTools(mediaRecognitionToolAvailable, availableTools)
 		availableTools = filterAttachmentReadTools(attachmentReadAvailable, availableTools)
+		if req.ToolCallsEnabled != nil && !*req.ToolCallsEnabled {
+			availableTools = nil
+		}
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -3045,6 +3051,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			if len(toolCalls) == 0 {
 				toolCalls = parseMarkdownToolCalls(fullContent)
+			}
+			if req.ToolCallsEnabled != nil && !*req.ToolCallsEnabled {
+				toolCalls = nil
 			}
 			// The final safety round must not execute a markdown-formatted call
 			// that bypassed the empty native tool list.

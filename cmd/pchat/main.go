@@ -15,7 +15,6 @@ import (
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/paths"
-	"github.com/p-chat/pchat/internal/recall"
 	"github.com/p-chat/pchat/internal/rotatelog"
 	"github.com/p-chat/pchat/internal/serverproc"
 	"github.com/p-chat/pchat/internal/style"
@@ -167,58 +166,54 @@ func runREPL(cmd *cobra.Command, args []string) error {
 		dim.Printf("  (warn: failed to list providers: %v)\n", err)
 	}
 	httpClient.SetCfgProviders(providers)
-	httpClient.SetCurrentProvider(prov)
 
 	// Find or create a session for the REPL.
-	sessions, err := httpClient.ListSessions(context.Background())
+	projectPath, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("get current project directory: %w", err)
+	}
+	projectPath, err = filepath.Abs(projectPath)
+	if err != nil {
+		return fmt.Errorf("resolve current project directory: %w", err)
+	}
+	projectPath = filepath.Clean(projectPath)
+	sessions, err := httpClient.ListSessionsForProject(context.Background(), &projectPath)
 	if err != nil {
 		dim.Printf("  (warn: failed to list sessions: %v)\n", err)
 	}
 	var curSess string
+	mode := cfg.WorkMode.Default.Normalize()
+	var restoredModel string
 	if len(sessions) > 0 {
-		curSess = sessions[len(sessions)-1].ID
+		// API 按 updated_at 降序排列，首项是当前项目最近的会话。
+		// The API sorts by updated_at descending; the first item is this project's latest session.
+		curSess = sessions[0].ID
+		s, mode, prov, restoredModel = resolveSessionSettings(sessions[0], s, mode, prov, styleStr != "", provider != "")
 	} else {
 		newSess, err := httpClient.CreateSession(context.Background(), httpcli.CreateSessionOpts{
-			Style:    string(s),
-			WorkMode: string(cfg.WorkMode.Default.Normalize()),
-			Provider: prov,
+			Style:       string(s),
+			WorkMode:    string(mode),
+			Provider:    prov,
+			ProjectPath: projectPath,
 		})
 		if err != nil {
 			return fmt.Errorf("create session: %w", err)
 		}
 		curSess = newSess.ID
 	}
+	httpClient.SetCurrentProvider(prov)
+	if restoredModel != "" {
+		if err := httpClient.SetModel(prov, restoredModel); err != nil {
+			dim.Printf("  (warn: failed to restore session model %s/%s: %v)\n", prov, restoredModel, err)
+		}
+	}
 
-	cliCtx := cli.NewHTTPContext(httpClient, string(s), string(cfg.WorkMode.Default.Normalize()), prov, curSess)
+	cliCtx := cli.NewHTTPContext(httpClient, string(s), string(mode), prov, curSess, projectPath)
 	repl := cli.NewREPL(cliCtx, cfg, s, prov)
 	// T13: propagate the long-lived ctx so SIGINT cancels
 	// in-flight recall/snapshot operations instead of
 	// leaving them to finish after the user hits Ctrl+C.
 	repl.SetRunContext(ctx)
-
-	// T13: wire up the recall engine. We open a read-only
-	// handle on the first enabled knowledge base so /recall
-	// actually searches (the engine is a no-op stub until
-	// this is set). The wiki.db lives under the base's
-	// directory per knowledge.NewWikiStore's contract.
-	if cfg.Knowledge.Enabled {
-		for _, base := range cfg.Knowledge.Bases {
-			if !base.Enabled || base.Path == "" {
-				continue
-			}
-			eng := recall.NewEngine(base.Name, base.Path, os.Stdout)
-			repl.SetRecallEngine(eng)
-			dim.Printf("  recall: 已挂载知识库 %q (%s)\n", base.Name, base.Path)
-			break
-		}
-	}
-
-	// Wire up the /kb command surface. Without this the local REPL's
-	// kbManager stays nil and every /kb subcommand reports "知识库未初始化".
-	// The manager is attached unconditionally (even when the knowledge
-	// system is disabled) so `/kb add` can flip it on — AddPath enables
-	// cfg.Knowledge.Enabled as part of persisting the new base.
-	repl.SetKBManager(cli.NewKBManager(cfg, cfgFile))
 
 	// Run REPL in a goroutine; listen for SIGINT in the main goroutine
 	// so we can cleanly stop the server on Ctrl+C.
@@ -240,6 +235,25 @@ func runREPL(cmd *cobra.Command, args []string) error {
 
 	srv.Stop()
 	return nil
+}
+
+// resolveSessionSettings 恢复会话的风格、模式和模型，显式 CLI 参数优先。
+// resolveSessionSettings restores saved session settings while preserving explicit CLI overrides.
+func resolveSessionSettings(sess httpcli.Session, currentStyle style.Style, currentMode config.WorkMode, currentProvider string, styleExplicit, providerExplicit bool) (style.Style, config.WorkMode, string, string) {
+	if !styleExplicit && sess.Style != "" {
+		if parsed, err := style.ParseStyle(sess.Style); err == nil {
+			currentStyle = parsed
+		}
+	}
+	if sess.WorkMode != "" {
+		currentMode = config.WorkMode(sess.WorkMode).Normalize()
+	}
+	model := ""
+	if !providerExplicit && sess.Provider != "" {
+		currentProvider = sess.Provider
+		model = sess.Model
+	}
+	return currentStyle, currentMode, currentProvider, model
 }
 
 func runInit(cmd *cobra.Command, args []string) error {

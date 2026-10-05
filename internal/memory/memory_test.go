@@ -276,6 +276,41 @@ func TestStore_ListConversations_Order(t *testing.T) {
 	}
 }
 
+func TestStore_ListConversationsByProjectPathLimit_FiltersBeforeLimit(t *testing.T) {
+	s := testStore(t)
+	targetPath := filepath.Join(t.TempDir(), "target-project")
+	targetID := s.CurrentConversationID()
+	if err := s.UpdateConversationMeta(targetID, projectMetaJSON(t, targetPath)); err != nil {
+		t.Fatal(err)
+	}
+	globalID, err := s.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(t.TempDir(), "other-project")
+
+	for i := 0; i < 200; i++ {
+		id, err := s.NewConversation()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateConversationMeta(id, projectMetaJSON(t, otherPath)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := s.ListConversationsByProjectPathLimit(targetPath, 200)
+	if len(got) != 1 || got[0].ID != targetID {
+		t.Fatalf("project sessions = %+v, want only %q beyond the first global 200", got, targetID)
+	}
+	if got := s.ListConversationsByProjectPathLimit("", 200); len(got) != 1 || got[0].ID != globalID {
+		t.Fatalf("global sessions = %+v, want only %q", got, globalID)
+	}
+	if got := s.ListConversationsLimit(200); len(got) != 200 {
+		t.Fatalf("unfiltered sessions = %d, want 200", len(got))
+	}
+}
+
 // TestStore_ListConversations_SameSecondStable reproduces the bug
 // where two conversations created in the same second had an
 // unstable order in ListConversations (ORDER BY updated_at DESC
