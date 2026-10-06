@@ -2598,6 +2598,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				fullThinkingBuilder strings.Builder
 				toolCalls           []nativeToolCall
 				argsAccum           = make(map[int]*nativeToolCall)
+				responsesItems      = make(map[int]llm.ResponsesOutputItem)
 				roundAnyToolErrored bool
 				// roundFailSigs collects the normalized signatures of
 				// this round's failing tool calls, fed to the T4
@@ -2785,6 +2786,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					fullContentBuilder.Reset()
 					fullThinkingBuilder.Reset()
 					argsAccum = make(map[int]*nativeToolCall)
+					responsesItems = make(map[int]llm.ResponsesOutputItem)
 					streamBytes = 0
 					totalIn, totalOut = roundStartTotalIn, roundStartTotalOut
 					if hadPartial {
@@ -2978,6 +2980,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if chunk.ToolCallDelta != nil {
 						chunkBytes += len(chunk.ToolCallDelta.ID) + len(chunk.ToolCallDelta.Name) + len(chunk.ToolCallDelta.ArgsJSON)
 					}
+					if chunk.ResponsesOutputItem != nil {
+						chunkBytes += len(chunk.ResponsesOutputItem.Item)
+					}
 					if streamBytes+chunkBytes > MaxStreamBytesPerRound {
 						cancelStream()
 						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
@@ -3012,7 +3017,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						tcd := chunk.ToolCallDelta
 						existing, ok := argsAccum[tcd.Index]
 						if !ok {
-							existing = &nativeToolCall{ID: tcd.ID, Name: tcd.Name}
+							existing = &nativeToolCall{ID: tcd.ID, ItemID: tcd.ItemID, Name: tcd.Name, OutputIndex: tcd.Index}
 							argsAccum[tcd.Index] = existing
 						}
 						if tcd.ID != "" {
@@ -3021,7 +3026,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						if tcd.Name != "" {
 							existing.Name = tcd.Name
 						}
+						if tcd.ItemID != "" {
+							existing.ItemID = tcd.ItemID
+						}
 						existing.ArgsJSON += tcd.ArgsJSON
+					}
+					if chunk.ResponsesOutputItem != nil {
+						responsesItems[chunk.ResponsesOutputItem.OutputIndex] = *chunk.ResponsesOutputItem
 					}
 				} // inner for chunk
 				cancelStream()
@@ -3106,13 +3117,28 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// Build the assistant message for the conversation.
 			// Emit as a single text ChatMessage (tool calls are
 			// separate messages appended below).
+			assistantMeta := map[string]any{"thinking": modelThinking}
+			if len(responsesItems) > 0 {
+				indices := make([]int, 0, len(responsesItems))
+				for index := range responsesItems {
+					indices = append(indices, index)
+				}
+				sort.Ints(indices)
+				ordered := make([]llm.ResponsesOutputItem, 0, len(indices))
+				for _, index := range indices {
+					ordered = append(ordered, responsesItems[index])
+				}
+				if encoded, err := json.Marshal(ordered); err == nil {
+					assistantMeta[llm.ResponsesOutputItemsMetaKey] = string(encoded)
+				}
+			}
 			assistantMsg := llm.ChatMessage{
 				Role:        llm.RoleAssistant,
 				Type:        llm.TypeText,
 				Content:     fullContent,
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
-				Meta:        map[string]any{"thinking": modelThinking},
+				Meta:        assistantMeta,
 			}
 			msgs = append(msgs, assistantMsg)
 			// 以实际请求顺序入库：助手文本，再工具调用，再工具结果。
@@ -3206,6 +3232,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			normalizeToolCallArgs(toolCalls)
 			for i := range toolCalls {
 				tc := &toolCalls[i]
+				toolMeta := map[string]any{}
+				if tc.ItemID != "" {
+					toolMeta["responses_item_id"] = tc.ItemID
+					toolMeta["responses_output_index"] = tc.OutputIndex
+				}
 				tcm := llm.ChatMessage{
 					Role:        llm.RoleAssistant,
 					Type:        llm.TypeToolCall,
@@ -3214,6 +3245,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					ToolInput:   tc.ArgsJSON,
 					MsgType:     llm.MsgTypeTool,
 					SubmitToLLM: 1,
+					Meta:        toolMeta,
 				}
 				msgs = append(msgs, tcm)
 				roundToolMessages = append(roundToolMessages, tcm)

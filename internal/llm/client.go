@@ -44,6 +44,11 @@ type StreamChunk struct {
 	// Native tool calls (from OpenAI tool_calls field).
 	// Each chunk may contain a partial tool call. Collect them via index.
 	ToolCallDelta *ToolCallDelta
+
+	// ResponsesOutputItem 保留一个完整的 Responses API 输出项，供后续工具轮精确回放。
+	// ResponsesOutputItem preserves one complete Responses API output item for exact replay in a later tool round.
+	// 其他协议适配器保持 nil。Other protocol adapters leave it nil.
+	ResponsesOutputItem *ResponsesOutputItem
 }
 
 // ToolCallDelta is a single delta for one tool call.
@@ -51,9 +56,23 @@ type StreamChunk struct {
 type ToolCallDelta struct {
 	Index    int    // 0-based index of the tool call in the response
 	ID       string // empty in subsequent chunks (same as first)
+	ItemID   string // Responses 输出项 ID（fc_*），不同于 call_id。Responses output item id, distinct from call_id.
 	Name     string // empty in subsequent chunks (same as first)
 	ArgsJSON string // accumulated JSON arguments
 }
+
+// ResponsesOutputItem 是 response.output_item.done 输出项的无损表示。
+// ResponsesOutputItem is the lossless representation of an item emitted by response.output_item.done.
+// Item 故意保留原始 JSON，以便未来字段和 encrypted_content 能被原样回放。
+// Item intentionally remains raw JSON so future fields and encrypted_content survive replay.
+type ResponsesOutputItem struct {
+	OutputIndex int             `json:"output_index"`
+	Item        json.RawMessage `json:"item"`
+}
+
+// ResponsesOutputItemsMetaKey 在助手消息上保存 JSON 编码的原生输出项。
+// ResponsesOutputItemsMetaKey stores JSON-encoded native output items on an assistant message.
+const ResponsesOutputItemsMetaKey = "responses_output_items"
 
 // ChatOptions carries per-request sampling parameters. Zero values
 // mean "use the underlying API default". When OpenAI receives
@@ -590,6 +609,9 @@ func forceNonStreamingBody(body []byte) []byte {
 }
 
 func parseNonStreamContent(protocol string, body []byte) (string, error) {
+	if config.ProtocolIsOpenAIResponses(protocol) {
+		return parseResponsesNonStreamContent(body)
+	}
 	if proxyErr := extractProxyError(body); proxyErr != "" {
 		return "", errors.New(proxyErr)
 	}
@@ -609,10 +631,6 @@ func parseNonStreamContent(protocol string, body []byte) (string, error) {
 		}
 		return "", fmt.Errorf("empty response from anthropic")
 	}
-	if config.ProtocolIsOpenAIResponses(protocol) {
-		return parseResponsesNonStreamContent(body)
-	}
-
 	var resp struct {
 		Choices []struct {
 			Message struct {
@@ -1582,6 +1600,11 @@ func injectReasoning(body []byte, protocol, level string) []byte {
 	}
 	if config.ProtocolIsOpenAIResponses(protocol) {
 		m["reasoning"] = map[string]any{"effort": level}
+		// 当前推理模型会拒绝 reasoning 与采样参数并用，因此在 Build 后移除。
+		// Current reasoning models reject sampling controls while reasoning is enabled, so remove them after Build.
+		delete(m, "temperature")
+		delete(m, "top_p")
+		delete(m, "top_logprobs")
 	} else if config.ProtocolIsOpenAICompatible(protocol) {
 		m["reasoning_effort"] = level
 	} else if config.ProtocolIsAnthropic(protocol) {

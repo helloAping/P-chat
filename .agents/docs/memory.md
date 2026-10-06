@@ -91,6 +91,7 @@ subagent_jobs: id, task_id, session_id, status, subagent_type, model, descriptio
 - `origin` — 内部来源标记；自动续跑 nudge 使用 `"auto_resume"`，动态上下文快照使用 `"runtime_context"`
 - `ui_hidden` — `"true"` 表示该消息只参与 LLM 上下文，不应通过历史 API 渲染给用户
 - `thinking` — 原始模型思考文本；`decodeChatMessages()` 恢复到助手文本消息的 `Meta["thinking"]`，供 DeepSeek 回传，展示仍使用 parts
+- `responses_output_items` — OpenAI Responses 的原生 output item JSON；读取时恢复到助手消息 Meta，供工具续轮精确回放 reasoning/message/function_call 的 ID、顺序和加密内容
 - `parts` — 结构化 parts JSON（tool + sub_agent）
 
 `encodeChatMeta()` 会先把 `llm.ChatMessage.Meta` 合并进 metadata，再补充规范字段。

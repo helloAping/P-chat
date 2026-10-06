@@ -50,6 +50,9 @@ type ProtocolAdapter interface {
 - ParseStream: 解析 `response.output_text.delta`、`response.refusal.delta`、reasoning summary / reasoning text、function call arguments、`response.completed` / `response.failed` 等事件。
 - 工具调用按 Responses 的 `call_id` / `output_item.done` 归一成 `ToolCallDelta`；usage 解析 `input_tokens` / `output_tokens` 与 cached tokens。
 - `reasoning_effort` 在 Responses 下会转换为顶层 `reasoning.effort`。
+- SSE 按标准 event 边界拼接多条 `data:` 行，支持 `data:` 后无空格；只有 `response.completed` 才是成功终态。`error`、`response.failed`、`response.incomplete`、解析失败、提前 EOF 和孤立 `[DONE]` 都返回错误，避免把截断响应误报为成功。
+- `response.output_item.done` 的原始 item 按 `output_index` 保存到助手消息 `Meta["responses_output_items"]`。工具续轮和数据库重载后直接回放原 item，保留 reasoning summary、`encrypted_content`、`fc_*` item id、`call_id` 和 message/function_call 的原始顺序。
+- Responses 开启 reasoning 时会移除 `temperature`、`top_p`、`top_logprobs`，避免当前推理模型因不兼容采样参数拒绝请求。
 
 **Anthropic Adapter** (`anthropic_adapter.go`):
 - Build: 将 ChatMessage[] 转为 Anthropic `MessagesRequest` JSON
@@ -83,6 +86,10 @@ type ChatMessage struct {
 - `tool_call` — LLM 发出的工具调用（OpenAI native）
 - `tool_result` — 工具执行结果
 - `thinking` — 展示用思考行（不直接发送）；DeepSeek 需要的回传内容取自助手文本消息的 `Meta["thinking"]`
+
+Responses 的 reasoning 不是 `TypeThinking` 回放：适配器使用助手文本消息上的
+`Meta["responses_output_items"]` 保存并恢复原生 output item。该值是 JSON 编码的
+`[]ResponsesOutputItem`，不得改写其中未知字段。
 
 图片消息的提交边界由 Agent 决定，而不是 LLM adapter 决定：
 - 当前轮图片和重答目标图片可以保留为 `TypeImage`，adapter 才会把它转为 OpenAI `image_url` 或 Anthropic `image` block。

@@ -243,6 +243,23 @@ func ClassifyAPIError(providerName string, err error) error {
 	return err
 }
 
+// newResponsesAPIError 保留 Responses SSE/JSON 错误码，使重试和 UI 能正确分类。
+// newResponsesAPIError preserves Responses error codes for retry and UI classification.
+func newResponsesAPIError(providerName, errorType, code, message string) error {
+	message = sanitizeProviderDetail(message, 1024)
+	if message == "" {
+		message = "OpenAI Responses request failed"
+	}
+	if strings.TrimSpace(errorType) == "" {
+		errorType = code
+	}
+	return ClassifyAPIError(providerName, &openai.APIError{
+		Message: message,
+		Type:    errorType,
+		Code:    code,
+	})
+}
+
 func isTransientProviderUnavailable(msg string) bool {
 	lc := strings.ToLower(msg)
 	if strings.Contains(lc, "provider_unavailable") {

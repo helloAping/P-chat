@@ -149,9 +149,11 @@ var PartKindStr = map[string]int{
 // dispatch tool execution and to build the assistant message's
 // persistence metadata.
 type nativeToolCall struct {
-	ID       string
-	Name     string
-	ArgsJSON string
+	ID          string
+	ItemID      string
+	Name        string
+	ArgsJSON    string
+	OutputIndex int
 }
 
 // partsAccumulator mutates a `[]MessagePart` in place as

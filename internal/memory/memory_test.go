@@ -40,6 +40,68 @@ func TestStore_AddAndGet(t *testing.T) {
 	}
 }
 
+func TestStore_PreservesResponsesOutputItemsMeta(t *testing.T) {
+	s := testStore(t)
+	cid := s.CurrentConversationID()
+	raw := `[{"output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}}]`
+	s.AddChatMessageTo(cid, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     "answer",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+		Meta:        map[string]any{llm.ResponsesOutputItemsMetaKey: raw},
+	})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	msgs := s.GetChatMessagesFor(cid, 10)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1", len(msgs))
+	}
+	if got, _ := msgs[0].Meta[llm.ResponsesOutputItemsMetaKey].(string); got != raw {
+		t.Fatalf("responses items meta = %q, want %q", got, raw)
+	}
+}
+
+func TestArchiveSiblingsArchivesToolRowsOwnedByReply(t *testing.T) {
+	s := testStore(t)
+	cid := s.CurrentConversationID()
+	s.AddChatMessageTo(cid, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeText, Content: "question", MsgType: llm.MsgTypeText, SubmitToLLM: 1})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	userID := s.GetLastUserMessageID(cid)
+	groupID := fmt.Sprintf("%d", userID)
+	replyID, err := s.AddChatMessageWithMetaToRegenNow(cid, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText, Content: "checking", MsgType: llm.MsgTypeText, SubmitToLLM: 1}, nil, groupID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.AddChatMessageTo(cid, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeToolCall, ToolID: "call_old", ToolName: "read_file", ToolInput: `{}`, MsgType: llm.MsgTypeTool, SubmitToLLM: 1})
+	s.AddChatMessageTo(cid, llm.ChatMessage{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "call_old", ToolName: "read_file", Content: "old result", MsgType: llm.MsgTypeTool, SubmitToLLM: 1})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ArchiveSiblings(cid, groupID, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range s.GetChatMessagesFor(cid, 20) {
+		if msg.ToolID == "call_old" {
+			t.Fatalf("archived reply left old tool branch active: %+v", msg)
+		}
+	}
+	if err := s.ActivateSibling(cid, groupID, replyID); err != nil {
+		t.Fatal(err)
+	}
+	foundTool := false
+	for _, msg := range s.GetChatMessagesFor(cid, 20) {
+		foundTool = foundTool || msg.ToolID == "call_old"
+	}
+	if !foundTool {
+		t.Fatal("activating a sibling did not restore its tool branch")
+	}
+}
+
 func TestStore_MaxHistory(t *testing.T) {
 	s := testStore(t)
 	_ = s.Flush()

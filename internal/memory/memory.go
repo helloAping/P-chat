@@ -1138,12 +1138,23 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 	// 使用既有 thinking 元数据恢复协议上下文，无需新增存储字段。
 	// Restore protocol reasoning from the existing thinking metadata without new storage fields.
 	defer func() {
-		if thinking := meta["thinking"]; thinking != "" {
-			for i := range decoded {
-				if decoded[i].Role == llm.RoleAssistant && decoded[i].Type == llm.TypeText {
-					decoded[i].Meta = map[string]any{"thinking": thinking}
-					break
+		thinking := meta["thinking"]
+		responsesItems := meta[llm.ResponsesOutputItemsMetaKey]
+		if thinking == "" && responsesItems == "" {
+			return
+		}
+		for i := range decoded {
+			if decoded[i].Role == llm.RoleAssistant && decoded[i].Type == llm.TypeText {
+				if decoded[i].Meta == nil {
+					decoded[i].Meta = make(map[string]any)
 				}
+				if thinking != "" {
+					decoded[i].Meta["thinking"] = thinking
+				}
+				if responsesItems != "" {
+					decoded[i].Meta[llm.ResponsesOutputItemsMetaKey] = responsesItems
+				}
+				break
 			}
 		}
 	}()
@@ -2727,6 +2738,14 @@ func (s *Store) ArchiveSiblings(convID, groupID string, keepActiveID int64) (del
 	); err != nil {
 		return 0, fmt.Errorf("archive siblings: %w", err)
 	}
+	if err := archiveReplyToolRows(tx, convID, groupID); err != nil {
+		return 0, fmt.Errorf("archive sibling tool rows: %w", err)
+	}
+	if keepActiveID > 0 {
+		if err := setReplyToolRowsArchived(tx, convID, keepActiveID, false); err != nil {
+			return 0, fmt.Errorf("restore active sibling tool rows: %w", err)
+		}
+	}
 	if _, err := tx.Exec(
 		`UPDATE media_contexts
 			 SET archived = 1, archive_reason = 'regen'
@@ -2965,6 +2984,12 @@ func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
 	if err != nil {
 		return err
 	}
+	if err := archiveReplyToolRows(tx, convID, groupID); err != nil {
+		return err
+	}
+	if err := setReplyToolRowsArchived(tx, convID, activeID, false); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
 		`UPDATE media_contexts
 			 SET archived = CASE WHEN message_id = ? THEN 0 ELSE 1 END,
@@ -2975,6 +3000,60 @@ func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// archiveReplyToolRows 归档重答组中各助手回复所属的 tool_call/tool_result 行。
+// archiveReplyToolRows archives tool_call/tool_result rows owned by replies in a regenerate group.
+// 旧工具行没有 regen_group_id，因此按“助手行之后、下一条非工具行之前”的持久化顺序推断归属。
+// Legacy tool rows lack regen_group_id, so ownership is inferred from their persisted order.
+func archiveReplyToolRows(tx *sql.Tx, convID, groupID string) error {
+	_, err := tx.Exec(
+		`UPDATE messages AS candidate
+		 SET is_archived = 1
+		 WHERE candidate.conversation_id = ?
+		   AND candidate.msg_type = ?
+		   AND EXISTS (
+		       SELECT 1
+		       FROM messages AS reply
+		       WHERE reply.conversation_id = candidate.conversation_id
+		         AND reply.regen_group_id = ?
+		         AND reply.id < candidate.id
+		         AND NOT EXISTS (
+		             SELECT 1
+		             FROM messages AS boundary
+		             WHERE boundary.conversation_id = candidate.conversation_id
+		               AND boundary.id > reply.id
+		               AND boundary.id < candidate.id
+		               AND boundary.msg_type != ?
+		         )
+		   )`,
+		convID, llm.MsgTypeTool, groupID, llm.MsgTypeTool,
+	)
+	return err
+}
+
+func setReplyToolRowsArchived(tx *sql.Tx, convID string, replyID int64, archived bool) error {
+	value := 0
+	if archived {
+		value = 1
+	}
+	_, err := tx.Exec(
+		`UPDATE messages AS candidate
+		 SET is_archived = ?
+		 WHERE candidate.conversation_id = ?
+		   AND candidate.msg_type = ?
+		   AND candidate.id > ?
+		   AND NOT EXISTS (
+		       SELECT 1
+		       FROM messages AS boundary
+		       WHERE boundary.conversation_id = candidate.conversation_id
+		         AND boundary.id > ?
+		         AND boundary.id < candidate.id
+		         AND boundary.msg_type != ?
+		   )`,
+		value, convID, llm.MsgTypeTool, replyID, replyID, llm.MsgTypeTool,
+	)
+	return err
 }
 
 // DeleteMessagesFrom deletes all messages with id >= fromID in the
