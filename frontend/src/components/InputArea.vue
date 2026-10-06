@@ -18,7 +18,7 @@ import {
 } from './icons'
 import * as api from '../api/client'
 import {
-  state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments, waitForPendingAttachments,
+  state, currentMeta, currentAttachments, addAttachments, removeAttachment, clearAttachments, waitForPendingAttachments,
   isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
@@ -308,13 +308,9 @@ function onPickFiles() {
 
 async function onFiles(files: FileList | null) {
   if (!files) return
-  for (const f of Array.from(files)) {
-    try {
-      await addAttachment(f)
-    } catch (e: any) {
-      message.error(`上传失败: ${e.message}`)
-    }
-  }
+  void addAttachments(Array.from(files)).catch((e: any) => {
+    message.error(`上传失败: ${e.message}`)
+  })
   if (fileInput.value) fileInput.value.value = ''
 }
 
@@ -390,22 +386,20 @@ function onPaste(e: ClipboardEvent) {
   }
   if (files.length === 0) return
   e.preventDefault()
-  // addAttachment() pushes the placeholder to the store
+  // addAttachments() pushes placeholders to the store
   // synchronously, so the chip below the textarea appears
   // the moment this function returns — the upload +
   // readAsDataURL work happens in the background. Going
-  // through addAttachment directly (instead of building a
+  // through addAttachments directly (instead of building a
   // synthetic FileList for onFiles()) keeps the call chain
   // one frame shorter, which matters because the chip's
   // appearance is the user's primary feedback that "the
   // paste worked". Also avoids the synthetic FileList +
   // Array.from round-trip — that path is fine, but the
   // direct call is more obviously correct.
-  for (const f of files) {
-    addAttachment(f).catch((err: any) => {
-      message.error(`上传失败: ${err.message}`)
-    })
-  }
+  void addAttachments(files).catch((err: any) => {
+    message.error(`上传失败: ${err.message}`)
+  })
   // Toast the user. The chip below the textarea is the
   // primary indicator, but a screenshot paste is easy to
   // miss if the user's eye is on the textarea. The toast
@@ -917,14 +911,14 @@ async function clearUnfinishedTodosBeforeSend(id: string): Promise<TodoSendMode 
   }
 }
 
-function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.MessageAttachment[] {
+function buildLocalBubbleAttachments(attachments: PendingAttachment[], sessionID: string): api.MessageAttachment[] {
   const result: api.MessageAttachment[] = []
   for (const a of attachments) {
     if (a._error) continue
     if (a.kind === 'image' || a.kind === 'audio' || a.kind === 'video') {
       const type = a.kind === 'image' ? 'image_url' : a.kind === 'audio' ? 'audio_url' : 'video_url'
       const url = a._file ? URL.createObjectURL(a._file) : dataURLToBlobURL(a._dataURL)
-      const previewURL = url || (a.id ? api.uploadURL(a.id) : '')
+		const previewURL = url || (a.id ? api.uploadURL(a.id, sessionID) : '')
       if (previewURL) result.push({
         type,
         url: previewURL,
@@ -938,7 +932,7 @@ function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.Mess
     const url = a._file
       ? URL.createObjectURL(a._file)
       : a.id
-        ? api.uploadURL(a.id)
+			? api.uploadURL(a.id, sessionID)
         : dataURLToBlobURL(a._dataURL)
     result.push({
       type: 'text',
@@ -971,6 +965,10 @@ function buildInlineAttachments(attachments: PendingAttachment[]): api.InlineAtt
       })
       continue
     }
+    // Documents must retain a durable upload reference. Their inline bytes are
+    // intentionally never used as a fallback because the server cannot expose
+    // such a transient PDF/DOCX to read_attachment on later rounds.
+    if (a.kind === 'file' && !a.id) continue
     if (!a.id && !data) continue
     result.push({
       type: 'text',
@@ -984,9 +982,15 @@ function buildInlineAttachments(attachments: PendingAttachment[]): api.InlineAtt
   return result
 }
 
+function assertRequiredAttachmentsUploaded(attachments: PendingAttachment[]): void {
+  const failed = attachments.filter(a => a.kind === 'file' && (a._error || !a.id))
+  if (!failed.length) return
+  throw new Error(`文档上传失败，未发送消息：${failed.map(a => a.name).join('、')}`)
+}
+
 async function send() {
   const raw = inputText.value.trim()
-  if (!raw) return
+  if (!raw && currentAttachments.value.length === 0) return
   // NOTE: we intentionally do NOT gate on `sending.value`
   // here. That ref is local to this InputArea instance, but
   // multiple conversations can stream in parallel. If session
@@ -1038,8 +1042,7 @@ async function send() {
   }
 
   const text = inputText.value.trim()
-  inputText.value = ''
-  if (!text) return
+  if (!text && currentAttachments.value.length === 0) return
 
   if (!state.currentID) {
     // Use the store's createSession() — it both creates the
@@ -1055,7 +1058,15 @@ async function send() {
   const meta = currentMeta.value
   // Snapshot this session's staged files. Selection owns the single upload;
   // sending only waits for that work and reuses its upload id.
-  const stagedAttachments = currentAttachments.value.filter(a => !a._error)
+  const stagedAttachments = [...currentAttachments.value]
+  try {
+    await waitForPendingAttachments(stagedAttachments)
+    assertRequiredAttachmentsUploaded(stagedAttachments)
+  } catch (e: any) {
+    message.error(e?.message || '附件上传失败，消息未发送')
+    return
+  }
+  inputText.value = ''
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
   // Mint a row id for this user message at send time so
   // rollback and regenerate always have a valid `msg.id`
@@ -1073,7 +1084,7 @@ async function send() {
   if (!shouldQueue) {
     // The bubble is optimistic: local object URLs render immediately while a
     // just-selected attachment finishes its existing read/upload task.
-    const bubbleAttachments = buildLocalBubbleAttachments(stagedAttachments)
+		const bubbleAttachments = buildLocalBubbleAttachments(stagedAttachments, id)
     optimisticUserMessage = {
       id: clientMsgId,
       role: 'user',
@@ -1089,10 +1100,9 @@ async function send() {
     markSessionActive(id, 'pending')
   }
 
-  await waitForPendingAttachments(stagedAttachments)
-  // Uploads can finish after the optimistic bubble was inserted. Keep the
-  // durable id on that GUI message so an immediate rollback can restore the
-  // same files without reading or uploading them again.
+  // Preparation completed before this bubble was created. Keep each durable id
+  // on the GUI message so an immediate rollback can restore the same files
+  // without reading or uploading them again.
   optimisticUserMessage?.attachments?.forEach((attachment, index) => {
     const uploadID = stagedAttachments[index]?.id
     if (uploadID) attachment.upload_id = uploadID

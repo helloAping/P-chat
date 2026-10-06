@@ -84,7 +84,7 @@ func (a *Agent) truncateToolResultForProject(name, projectRoot, content string) 
 	case "exec_command", "bash", "shell":
 		cap_ = execCap
 		keepHead = false
-	case "read_file", "list_files", "recall":
+	case "read_file", "read_attachment", "list_files", "recall":
 		cap_ = readCap
 	default:
 		cap_ = defaultCap

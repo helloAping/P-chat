@@ -14,11 +14,13 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -65,6 +67,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many attachments: %d (max 16)", len(req.Attachments))})
 		return
 	}
+	attachmentSignature := agent.AttachmentSignature(req.Attachments)
 	if req.ClientMsgID < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "client_msg_id must be a positive integer"})
 		return
@@ -98,7 +101,8 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			return
 		}
 		if found {
-			if identity.ConversationID == id && identity.Role == llm.RoleUser && identity.Content == req.Message {
+			storedSignature := attachmentSignatureFromMetadata(identity.Metadata)
+			if identity.ConversationID == id && identity.Role == llm.RoleUser && identity.Content == req.Message && storedSignature == attachmentSignature {
 				c.JSON(http.StatusConflict, gin.H{
 					"error": "this client message has already been accepted; recover the existing reply instead of resending it",
 					"code":  "duplicate_client_message",
@@ -111,6 +115,16 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			})
 			return
 		}
+	}
+	// Do not create inline upload files until after idempotency is resolved. An
+	// exact retry must not leave a second orphaned materialization on disk.
+	if err := h.materializeInlineFileAttachments(id, req.Attachments); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_attachment"})
+		return
+	}
+	if err := h.validateAttachmentOwnership(id, req.Attachments); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_attachment"})
+		return
 	}
 
 	// Resolve style: body override → per-session override →
@@ -232,6 +246,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		Messages:                msgs,
 		HistoryMessageCount:     historyMessageCount,
 		Attachments:             req.Attachments,
+		AttachmentSignature:     attachmentSignature,
 		UseImageRecognition:     useImageRecognition,
 		RecognitionCapabilities: h.sessionRecognitionCapabilities(id),
 		GenerationOperations:    h.sessionGenerationOperations(id),
@@ -352,6 +367,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		// the first attempt already expanded + persisted them; TodoMode
 		// is forced to resume so an active task chain is preserved.
 		histMsgs, compSummary := h.loadHistoryForSend(baseCtx, id, provider, model)
+		resumeDocumentAttachments := latestUserDocumentAttachments(histMsgs)
 		resumeMsgs := buildLLMMessages(histMsgs)
 		// The nudge names the reason dynamically: when todos are still
 		// unfinished (the common auto-continue case — the LLM ended without
@@ -377,6 +393,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		chatReq.HistoryMessageCount = len(resumeMsgs) - 1
 		chatReq.ClientMsgID = 0
 		chatReq.Attachments = nil
+		chatReq.DocumentContextAttachments = resumeDocumentAttachments
 		chatReq.CompressedSummary = compSummary
 		chatReq.TodoMode = agent.TodoModeResume
 	}
@@ -391,6 +408,49 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	if h.agent != nil {
 		h.agent.ClearBreakerState(id)
 	}
+}
+
+func latestUserDocumentAttachments(messages []llm.ChatMessage) []agent.Attachment {
+	var reversed []agent.Attachment
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role != llm.RoleUser {
+			continue
+		}
+		if message.Type == llm.TypeText {
+			if origin, _ := message.Meta["origin"].(string); origin == "auto_resume" {
+				continue
+			}
+			break
+		}
+		if message.Type != llm.TypeFile {
+			continue
+		}
+		id := strings.TrimSpace(message.UploadID)
+		if id == "" {
+			id, _ = strings.CutPrefix(message.Content, "upl://")
+		}
+		if id != "" {
+			reversed = append(reversed, agent.Attachment{ID: id, UploadID: id, Name: message.Name, Kind: "file", MIME: message.MimeType})
+		}
+	}
+	result := make([]agent.Attachment, len(reversed))
+	for i := range reversed {
+		result[len(reversed)-1-i] = reversed[i]
+	}
+	return result
+}
+
+func attachmentSignatureFromMetadata(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	var meta map[string]any
+	if json.Unmarshal([]byte(raw), &meta) != nil {
+		return ""
+	}
+	value, _ := meta["attachment_signature"].(string)
+	return value
 }
 
 // turnCancelRegistration is the cleanup handle returned by

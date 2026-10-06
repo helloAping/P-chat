@@ -199,12 +199,16 @@ OpenAI Chat、OpenAI Responses、Anthropic Messages。
 
 ### 8.3 附件预览与发送时序
 
-`addAttachment()` 在选择文件时立即插入本地预览占位，并用同一个 `_ready`
-任务完成文件读取和 `/uploads` 上传。普通消息发送时，`InputArea.send()` 先用独立的
-本地 blob URL 插入用户气泡，再等待 `_ready`，随后复用已有 `upload_id` 组装请求；
-发送阶段不得再次调用上传接口。图片、视频、音频、PDF 和 Office 文档都携带同一
-`upload_id` 引用；只有上传失败时才回退到内联数据。非媒体附件不再把 data URL
-误放进 `text` 字段，服务端会把引用持久化并按需交给 `read_attachment`。
+`addAttachments()` 在选择或粘贴文件时同步插入全部本地预览占位，按选择顺序保留，
+并以最多 4 个并发任务完成读取和 `/uploads` 上传。每次上传必须附带当前 `session_id`；
+待选附件上限为 16 个。普通消息发送时，`InputArea.send()` 先等待各附件的 `_ready`，
+再创建用户气泡并复用已有 `upload_id` 组装请求；发送阶段不得再次调用上传接口。
+附件下载/历史预览 URL 必须带当前 `session_id`；服务端会拒绝无会话或跨会话的 upload 读取。
+
+PDF、Office 文档及其他 `file` 附件必须取得持久化 `upload_id`：上传失败会原子中止
+本次发送，保留输入文字和附件并显示错误，绝不将文档字节伪装为成功的内联附件或留下
+乐观用户气泡。图片、视频、音频和纯文本才允许在上传失败时使用内联回退。文件选择与
+剪贴板粘贴必须共用 `addAttachments()`，避免两条路径出现不同的并发或失败语义。
 
 所有 data URL 预览统一通过 `utils/mediaPreview.ts` 转换；Blob MIME 只取 data URL
 元数据中第一个分号前的媒体类型，不能把 `;base64` 当作 MIME 的一部分。会话换页、
@@ -213,7 +217,8 @@ OpenAI Chat、OpenAI Responses、Anthropic Messages。
 撤回用户消息时，GUI 以被点击的用户消息作为草稿来源，同时从撤回响应中合并该回合
 拆开的附件行，将文字和附件原子回填到 `InputArea`。历史 `/uploads/:id` 地址转换为
 已有上传引用，不重新上传；回填附件带撤回来源标记。点击“撤销”时只移除仍属于该
-来源的附件，并且仅当输入文字未被用户修改时清空文字。关闭撤回提示只放弃撤销能力，
+来源的附件，并且仅当输入文字未被用户修改时清空文字。新写入的附件行通过
+`attachment_parent_user_id` 绑定源用户消息，历史旧行才回退到相邻合并。关闭撤回提示只放弃撤销能力，
 不清空已经回填的草稿。撤销后消息列表使用撤回前已归一化的 GUI 消息恢复，避免附件
 行重新拆成多个气泡。
 

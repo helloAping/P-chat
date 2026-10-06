@@ -130,6 +130,27 @@ Chunk 字段检查顺序（优先级从高到低）:
 - `SaveSystemMessage` — 保存自定义系统提示词
 - `GetTodos` — 获取待办列表
 
+#### 上传附件归属
+
+`POST /uploads` 的 multipart body 必须携带已有会话的 `session_id`。上传完成时，服务端把
+上传字节与仅 owner 可读的 sidecar 一起落在 `~/.p-chat/uploads/`；发送消息会在进入 Agent 前
+一次性验证所有 `upload_id` 都属于 URL 中的会话。错误的、缺失的或跨会话的引用返回
+`400 invalid_attachment`，不会静默丢弃。V17 前的历史无 owner 上传仅在该会话已持久化了相同
+`upl://` 引用时兼容读取。
+
+`GET /uploads/:id` 同样必须携带 `session_id`，并复用 owner/历史引用校验；历史响应和前端本地
+气泡生成的下载地址都带上该参数，已知 upload id 不能跨会话直接读取。上传请求的 body 上限在
+multipart 解析前安装，文件字节再单独按 25 MiB 截断校验。
+
+遗留客户端若把 `kind=file` 文档以内联 `data:` URL（或把 `kind=text` 作为纯文本）提交，服务端会先将其
+实体化为当前会话的受归属 upload；不符合该可读编码的 inline file 会明确拒绝，不能再生成一个
+LLM 无法用 `upload_id` 读取的伪附件。
+
+`client_msg_id` 幂等身份同时包含正文和原始附件签名。完全相同的重试返回
+`duplicate_client_message`；同 ID 但附件不同返回 `client_message_id_conflict`。该检查早于 inline
+实体化，重试不会额外落下孤儿文件。孤儿清理也会把 queued/running/failed turn queue payload 中的
+upload 引用视为存活引用。
+
 `POST /sessions/:id/messages` 和 turn queue payload 支持 `active_skills: string[]`。
 服务端只接收名称，由当前会话的项目根解析有效 Skill；旧 `skill_context` 字段暂时保留兼容，
 新客户端不得继续发送 Skill 正文。
@@ -191,6 +212,9 @@ blob (持久化 parts[])。响应 `{ messages, next_seq }`。
 - 不放 undo buffer（regen 是正常流，不是破坏性操作）
 - 不接受 style/model 覆盖（保持与上轮一致，避免意外切换）
 - 共享 `sessionLocks` 防并发 regen
+- 重答会保留当前用户回合的 image、audio、video 与 file 附件；文档始终保留 `upl://` 引用，
+  不在历史加载时整文件 base64 化；进入首个重答模型请求前，会从目标回合的 `TypeFile` 行重建
+  同样公平、有界的文档正文预览。
 
 #### respondSSE helper
 

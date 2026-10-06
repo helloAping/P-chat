@@ -93,6 +93,7 @@ type MessageIdentity struct {
 	ConversationID string
 	Role           string
 	Content        string
+	Metadata       string
 }
 
 // Summary records an LLM-generated compression of a range of messages.
@@ -637,15 +638,19 @@ func (s *Store) FindMessageIdentity(rowID int64) (MessageIdentity, bool, error) 
 	}
 
 	var identity MessageIdentity
+	var metadata sql.NullString
 	err := s.db.QueryRow(
-		`SELECT conversation_id, role, content FROM messages WHERE id = ?`,
+		`SELECT conversation_id, role, content, metadata FROM messages WHERE id = ?`,
 		rowID,
-	).Scan(&identity.ConversationID, &identity.Role, &identity.Content)
+	).Scan(&identity.ConversationID, &identity.Role, &identity.Content, &metadata)
 	if err == sql.ErrNoRows {
 		return MessageIdentity{}, false, nil
 	}
 	if err != nil {
 		return MessageIdentity{}, false, err
+	}
+	if metadata.Valid {
+		identity.Metadata = metadata.String
 	}
 	return identity, true, nil
 }

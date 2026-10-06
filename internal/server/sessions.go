@@ -453,7 +453,7 @@ func (h *Handler) RollbackMessages(c *gin.Context) {
 		// what we want here (one DB row should produce
 		// one MessageResponse, not several).
 		cm := memoryMessageToChatMessage(m)
-		if resp := buildMessageResponse(cm, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i]); resp != nil {
+		if resp := buildMessageResponseForSession(id, cm, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i]); resp != nil {
 			deletedResp = append(deletedResp, *resp)
 		}
 	}

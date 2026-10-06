@@ -198,7 +198,7 @@ func buildRegenerateMessages(histMsgs []llm.ChatMessage, rowIDs []int64, userMes
 	current := []llm.ChatMessage{histMsgs[target]}
 	for i := target + 1; i < len(histMsgs); i++ {
 		m := histMsgs[i]
-		if m.Role != llm.RoleUser || !isMediaType(m.Type) {
+		if m.Role != llm.RoleUser || !isAttachmentType(m.Type) {
 			break
 		}
 		current = append(current, m)
@@ -308,7 +308,7 @@ func (h *Handler) ListRegenReplies(c *gin.Context) {
 		// decode via buildMessageResponse so the wire
 		// shape matches ListMessages exactly (parts
 		// decoded, attachments reconstructed, etc.).
-		resp := buildMessageResponse(cm, metas, createds, i, ids[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
+		resp := buildMessageResponseForSession(convID, cm, metas, createds, i, ids[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
 		if resp == nil {
 			continue
 		}
@@ -385,7 +385,7 @@ func (h *Handler) ActivateRegenReply(c *gin.Context) {
 	var activeID int64
 	for i := range ids {
 		cm := llm.ChatMessage{Role: "assistant"}
-		resp := buildMessageResponse(cm, metas, createds, i, ids[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
+		resp := buildMessageResponseForSession(convID, cm, metas, createds, i, ids[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
 		if resp == nil {
 			continue
 		}

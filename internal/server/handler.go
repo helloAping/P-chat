@@ -732,6 +732,9 @@ type MessageResponse struct {
 	// blocks for files). The frontend renders them as part of the
 	// message bubble so the user can see what was actually sent.
 	Attachments []AttachmentPart `json:"attachments,omitempty"`
+	// AttachmentParentUserID links a storage-only attachment row to the
+	// user message it belongs to. It is not serialized to the frontend.
+	AttachmentParentUserID int64 `json:"-"`
 	// Parts is the assistant message's structured rendering:
 	// text + thinking + tool calls + sub-agent cards in stream
 	// order. Mirrors src/api/client.ts:MessagePart on the client.

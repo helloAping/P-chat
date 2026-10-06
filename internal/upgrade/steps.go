@@ -43,6 +43,18 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V13: stepV13toV14,
 	V14: stepV14toV15,
 	V15: stepV15toV16,
+	V16: stepV16toV17,
+}
+
+// stepV16toV17 establishes the uploads directory used by the V17 owner
+// sidecars. Existing uploads intentionally remain ownerless: their original
+// conversation is not knowable from disk alone, and the server only accepts
+// such a legacy reference when it was already persisted by that session.
+func stepV16toV17(_ *sql.DB) error {
+	if err := os.MkdirAll(filepath.Join(paths.GlobalDir(), "uploads"), 0o755); err != nil {
+		return fmt.Errorf("create uploads directory for owner metadata: %w", err)
+	}
+	return nil
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.

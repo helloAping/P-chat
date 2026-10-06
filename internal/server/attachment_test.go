@@ -122,6 +122,20 @@ func TestBuildLLMMessagesKeepsAllUploadReferences(t *testing.T) {
 	}
 }
 
+func TestBuildRegenerateMessagesKeepsFileAttachment(t *testing.T) {
+	msgs := []llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "remember this", MsgType: llm.MsgTypeText, SubmitToLLM: 1},
+		{Role: llm.RoleUser, Type: llm.TypeFile, Content: "upl://abcd1234567890ab", UploadID: "abcd1234567890ab", Name: "report.pdf", SubmitToLLM: 0},
+	}
+	out, historyCount, ok := buildRegenerateMessages(msgs, []int64{10, 11}, 10)
+	if !ok || historyCount != 0 || len(out) != 2 {
+		t.Fatalf("ok=%v history=%d messages=%#v", ok, historyCount, out)
+	}
+	if out[1].Type != llm.TypeFile || out[1].UploadID != "abcd1234567890ab" {
+		t.Fatalf("file attachment was dropped: %#v", out[1])
+	}
+}
+
 // TestResolveHistoryUploads_RehydratesBase64 verifies the LLM
 // context path: upl:// rows are re-read from disk into base64 so
 // the model sees the image, and a missing file degrades to a text
@@ -181,11 +195,28 @@ func TestResolveHistoryUploads_EmptyUploadDegradesToText(t *testing.T) {
 	}
 }
 
+func TestResolveHistoryUploads_PreservesFileReference(t *testing.T) {
+	dir := t.TempDir()
+	id := "abcd1234567890ab"
+	if err := os.WriteFile(filepath.Join(dir, id+"-report.pdf"), []byte("large document bytes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver := &agent.DiskAttachmentResolver{BaseDir: dir}
+	out := resolveHistoryUploads([]llm.ChatMessage{{
+		Role: llm.RoleUser, Type: llm.TypeFile, Content: "upl://" + id,
+		Name: "report.pdf", SubmitToLLM: 0,
+	}}, resolver)
+	if len(out) != 1 || out[0].Type != llm.TypeFile || out[0].Content != "upl://"+id || out[0].UploadID != id {
+		t.Fatalf("document was not preserved as upload ref: %#v", out)
+	}
+}
+
 // TestUploadAndSend_Image uploads a tiny PNG via /api/v1/uploads
 // and verifies the file is on disk + the response carries the
 // metadata the web UI uses to attach it to the next message.
 func TestUploadAndSend_Image(t *testing.T) {
 	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	sessionID, _ := s.handler.store.NewConversation()
 
 	// 1x1 transparent PNG: 8-byte signature + IHDR + IDAT + IEND
 	png := []byte{
@@ -200,6 +231,9 @@ func TestUploadAndSend_Image(t *testing.T) {
 	}
 	body := &bytes.Buffer{}
 	mw := multipart.NewWriter(body)
+	if err := mw.WriteField("session_id", sessionID); err != nil {
+		t.Fatal(err)
+	}
 	fw, err := mw.CreateFormFile("file", "dot.png")
 	if err != nil {
 		t.Fatal(err)
@@ -235,13 +269,164 @@ func TestUploadAndSend_Image(t *testing.T) {
 	if _, err := os.Stat(wantPath); err != nil {
 		t.Errorf("uploaded file missing at %s: %v", wantPath, err)
 	}
+
+	missingSession := httptest.NewRecorder()
+	s.engine.ServeHTTP(missingSession, httptest.NewRequest(http.MethodGet, "/api/v1/uploads/"+up.ID, nil))
+	if missingSession.Code != http.StatusBadRequest {
+		t.Fatalf("download without session status=%d, want 400", missingSession.Code)
+	}
+	otherSession, _ := s.handler.store.NewConversation()
+	wrongSession := httptest.NewRecorder()
+	s.engine.ServeHTTP(wrongSession, httptest.NewRequest(http.MethodGet, "/api/v1/uploads/"+up.ID+"?session_id="+otherSession, nil))
+	if wrongSession.Code != http.StatusForbidden {
+		t.Fatalf("cross-session download status=%d, want 403", wrongSession.Code)
+	}
+	ownerSession := httptest.NewRecorder()
+	s.engine.ServeHTTP(ownerSession, httptest.NewRequest(http.MethodGet, "/api/v1/uploads/"+up.ID+"?session_id="+sessionID, nil))
+	if ownerSession.Code != http.StatusOK {
+		t.Fatalf("owner download status=%d body=%s", ownerSession.Code, ownerSession.Body.String())
+	}
+}
+
+func TestUploadRequiresKnownSession(t *testing.T) {
+	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	if _, err := mw.CreateFormFile("file", "notes.pdf"); err != nil {
+		t.Fatal(err)
+	}
+	_ = mw.Close()
+
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/v1/uploads", body)
+	r.Header.Set("Content-Type", mw.FormDataContentType())
+	s.engine.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status=%d body=%s, want 400", w.Code, w.Body.String())
+	}
+}
+
+func TestValidateAttachmentOwnershipRejectsOtherSession(t *testing.T) {
+	s, _ := newTestServer(t)
+	owner, _ := s.handler.store.NewConversation()
+	other, _ := s.handler.store.NewConversation()
+	id := "abcd1234567890ab"
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(UploadDir(), id+"-report.pdf"), []byte("pdf"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUploadOwner(id, owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handler.validateAttachmentOwnership(other, []agent.Attachment{{UploadID: id, Name: "report.pdf", Kind: "file"}}); err == nil {
+		t.Fatal("cross-session upload was accepted")
+	}
+	if err := s.handler.validateAttachmentOwnership(owner, []agent.Attachment{{UploadID: id, Name: "report.pdf", Kind: "file"}}); err != nil {
+		t.Fatalf("owner upload rejected: %v", err)
+	}
+}
+
+func TestMaterializeInlineFileAttachmentBindsOwner(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	atts := []agent.Attachment{{
+		Name: "report.pdf", Kind: "file", MIME: "application/pdf",
+		Data: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString([]byte("pdf bytes")),
+	}}
+	if err := s.handler.materializeInlineFileAttachments(sessionID, atts); err != nil {
+		t.Fatal(err)
+	}
+	if atts[0].UploadID == "" || atts[0].ID != atts[0].UploadID || atts[0].Data != "" {
+		t.Fatalf("inline attachment was not materialized: %+v", atts[0])
+	}
+	owner, found, err := readUploadOwner(atts[0].UploadID)
+	if err != nil || !found || owner != sessionID {
+		t.Fatalf("owner = %q found=%v err=%v", owner, found, err)
+	}
+}
+
+func TestMaterializeInlineTextAttachmentBindsOwner(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	atts := []agent.Attachment{{Name: "notes.txt", Kind: "text", MIME: "text/plain", Data: "纯文本内容"}}
+	if err := s.handler.materializeInlineFileAttachments(sessionID, atts); err != nil {
+		t.Fatal(err)
+	}
+	if atts[0].UploadID == "" || atts[0].Data != "" {
+		t.Fatalf("inline text was not materialized: %+v", atts[0])
+	}
+}
+
+func TestMaterializeInlineAttachmentsRollsBackBatchOnFailure(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	before, _ := os.ReadDir(UploadDir())
+	atts := []agent.Attachment{
+		{Name: "notes.txt", Kind: "text", MIME: "text/plain", Data: "first succeeds"},
+		{Name: "broken.pdf", Kind: "file", MIME: "application/pdf", Data: "not-a-data-url"},
+	}
+	if err := s.handler.materializeInlineFileAttachments(sessionID, atts); err == nil {
+		t.Fatal("invalid second attachment was accepted")
+	}
+	after, _ := os.ReadDir(UploadDir())
+	if len(after) != len(before) {
+		t.Fatalf("failed batch left upload artifacts: before=%d after=%d", len(before), len(after))
+	}
+	if atts[0].UploadID != "" || atts[0].Data != "first succeeds" {
+		t.Fatalf("failed batch mutated caller attachments: %+v", atts[0])
+	}
+}
+
+func TestLatestUserDocumentAttachmentsSkipsAutoResumeNudge(t *testing.T) {
+	got := latestUserDocumentAttachments([]llm.ChatMessage{
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "remember"},
+		{Role: llm.RoleUser, Type: llm.TypeFile, Content: "upl://aaaaaaaaaaaaaaaa", UploadID: "aaaaaaaaaaaaaaaa", Name: "a.pdf", MimeType: "application/pdf"},
+		{Role: llm.RoleAssistant, Type: llm.TypeText, Content: "working"},
+		{Role: llm.RoleUser, Type: llm.TypeText, Content: "continue", Meta: map[string]any{"origin": "auto_resume"}},
+	})
+	if len(got) != 1 || got[0].UploadID != "aaaaaaaaaaaaaaaa" {
+		t.Fatalf("resume documents = %#v", got)
+	}
+}
+
+func TestValidateAttachmentOwnershipRejectsMissingBytes(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	id := "1111222233334444"
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUploadOwner(id, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handler.validateAttachmentOwnership(sessionID, []agent.Attachment{{UploadID: id, Name: "gone.pdf", Kind: "file"}}); err == nil {
+		t.Fatal("owner sidecar without upload bytes was accepted")
+	}
+}
+
+func TestMergeUserAttachmentRowsRespectsParentMessage(t *testing.T) {
+	msgs := []MessageResponse{
+		{ID: 10, SourceMessageIDs: []int64{10}, Role: "user", Content: "first"},
+		{ID: 20, SourceMessageIDs: []int64{20}, Role: "user", Content: "second"},
+		{ID: 21, SourceMessageIDs: []int64{21}, Role: "user", Attachments: []AttachmentPart{{Name: "first.pdf"}}, AttachmentParentUserID: 10},
+	}
+	got := mergeUserAttachmentRows(msgs)
+	if len(got) != 3 {
+		t.Fatalf("attachment was merged into adjacent wrong turn: %#v", got)
+	}
 }
 
 func TestUploadRejectsEmptyFile(t *testing.T) {
 	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	sessionID, _ := s.handler.store.NewConversation()
 
 	body := &bytes.Buffer{}
 	mw := multipart.NewWriter(body)
+	if err := mw.WriteField("session_id", sessionID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := mw.CreateFormFile("file", "empty.png"); err != nil {
 		t.Fatal(err)
 	}
@@ -380,5 +565,42 @@ func TestUploadRefsAndPrune(t *testing.T) {
 	n = s.handler.sweepOrphanUploads(24 * time.Hour)
 	if n != 1 {
 		t.Errorf("sweep removed %d files, want 1 (aged orphan upC)", n)
+	}
+}
+
+func TestQueuedUploadReferencePreventsPruneAndSweep(t *testing.T) {
+	s, _ := newTestServer(t)
+	convID, _ := s.handler.store.NewConversation()
+	id := "abcdefabcdefabcd"
+	dir := UploadDir()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, id+"-queued.pdf")
+	if err := os.WriteFile(path, []byte("queued"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(path, old, old); err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"message":"queued","client_msg_id":1730000000001002,"attachments":[{"upload_id":"abcdefabcdefabcd"}]}`)
+	item, err := s.handler.store.CreateTurnQueueItem(convID, payload, "queued", 1730000000001002, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.handler.pruneUploadFiles([]string{id})
+	if removed := s.handler.sweepOrphanUploads(24 * time.Hour); removed != 0 {
+		t.Fatalf("sweep removed %d queued upload(s)", removed)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("queued upload was pruned: %v", err)
+	}
+	if _, ok, err := s.handler.store.CancelTurnQueueItem(convID, item.ID); err != nil || !ok {
+		t.Fatalf("cancel queue item: ok=%v err=%v", ok, err)
+	}
+	s.handler.pruneUploadFiles([]string{id})
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("unreferenced upload still exists after queue cancellation: %v", err)
 	}
 }

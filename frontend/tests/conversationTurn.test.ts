@@ -44,7 +44,7 @@ test('input asks the server for a semantic session title after the first turn', 
   assert.doesNotMatch(sendSource, /text\.slice\(0,\s*40\)/)
 })
 
-test('input shows the local user bubble before attachment preparation and reuses uploaded files', () => {
+test('input requires durable document uploads before it creates a user turn', () => {
   const source = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
   const sendStart = source.indexOf('async function send()')
   const sendEnd = source.indexOf('\nfunction stop()', sendStart)
@@ -54,12 +54,29 @@ test('input shows the local user bubble before attachment preparation and reuses
   const prepareIndex = sendSource.indexOf('await waitForPendingAttachments(')
   assert.ok(appendIndex >= 0, 'send should append the local user message')
   assert.ok(prepareIndex >= 0, 'send should await the existing attachment preparation')
-  assert.ok(appendIndex < prepareIndex, 'the user bubble should render before attachment preparation finishes')
+  assert.ok(prepareIndex < appendIndex, 'a failed document upload must not leave an optimistic ghost message')
   assert.doesNotMatch(sendSource, /await api\.uploadFile\(/, 'send must not upload a selected file a second time')
   assert.match(source, /upload_id: a\.id \|\| undefined/, 'media should reuse the upload id created during selection')
   assert.match(source, /type: 'text',[\s\S]*?upload_id: a\.id \|\| undefined/, 'documents should reuse the upload id created during selection')
-  assert.match(source, /data: a\.id \? undefined : data/, 'documents should only inline bytes when upload failed')
+  assert.match(sendSource, /assertRequiredAttachmentsUploaded\(stagedAttachments\)/, 'document upload failures should abort before a send')
+  assert.doesNotMatch(sendSource, /data: a\.id \? undefined : data/, 'documents must not silently fall back to inline bytes')
   assert.match(source, /\.docx,\.docm,\.pptx,\.pptm,\.xlsx,\.xlsm/, 'the file picker should expose supported Office attachments')
+})
+
+test('attachment selection batches placeholders, limits concurrency, and binds uploads to its session', () => {
+  const store = readFileSync(new URL('../src/stores/chat.ts', import.meta.url), 'utf8')
+  const input = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
+  const client = readFileSync(new URL('../src/api/client.ts', import.meta.url), 'utf8')
+
+  assert.match(store, /export function addAttachments\(files: Iterable<File>\): Promise<void>/)
+  assert.match(store, /const MAX_PENDING_ATTACHMENTS = 16/)
+  assert.match(store, /const ATTACHMENT_PREPARE_CONCURRENCY = 4/)
+  assert.match(store, /runAttachmentPreparationQueue\(jobs, id\)/)
+  assert.match(store, /api\.uploadFile\(file, sessionID\)/)
+  assert.match(input, /void addAttachments\(Array\.from\(files\)\)/)
+  assert.match(input, /void addAttachments\(files\)/)
+  assert.match(client, /export async function uploadFile\(file: File, sessionID: string\)/)
+  assert.match(client, /fd\.append\('session_id', sessionID\)/)
 })
 
 test('conversation turn drains queued turns after a completed stream', () => {

@@ -1294,6 +1294,13 @@ type ChatRequest struct {
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// DocumentContextAttachments supplies already-persisted current-turn
+	// documents that need a first-request preview without being expanded or
+	// persisted again (for example an automatic resume after a timeout).
+	DocumentContextAttachments []Attachment `json:"-"`
+	// AttachmentSignature is computed from the original request payload before
+	// inline fallbacks are materialized, then persisted on the root user row.
+	AttachmentSignature string `json:"-"`
 	// UseImageRecognition 让上传图片绕过主模型；当前轮先识别，后续轮次可按 upload_id 回看。
 	// UseImageRecognition keeps uploaded images out of the main model.
 	// Current-turn image attachments are recognized before the main model call
@@ -2414,6 +2421,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// persistStart 位于保留历史之后，附件在其后展开。
 			// The new user message and every attachment row still persist.
 			pinnedUserID := req.ClientMsgID
+			attachmentParentID := req.ClientMsgID
 			for i, m := range msgs {
 				if m.Role == llm.RoleSystem {
 					continue
@@ -2428,6 +2436,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// They drive the retry and image preflight, but already
 					// exist in the database and must not be duplicated.
 					continue
+				}
+				if i == persistStart && req.AttachmentSignature != "" {
+					if m.Meta == nil {
+						m.Meta = make(map[string]any)
+					}
+					m.Meta["attachment_signature"] = req.AttachmentSignature
+				}
+				if i > persistStart && attachmentParentID > 0 && (m.Type == llm.TypeImage || m.Type == llm.TypeAudio || m.Type == llm.TypeVideo || m.Type == llm.TypeFile) {
+					if m.Meta == nil {
+						m.Meta = make(map[string]any)
+					}
+					m.Meta["attachment_parent_user_id"] = attachmentParentID
 				}
 				// Images uploaded via the SPA are persisted as a
 				// "upl://<id>" reference instead of base64: the
@@ -2455,8 +2475,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if currentTurnImageRecognition {
 			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, req.SessionID, req.RegenGroupID, latestUserText(newMessages), ch, nextSeq)
 		}
+		contextAttachments := append([]Attachment(nil), req.Attachments...)
+		contextAttachments = append(contextAttachments, req.DocumentContextAttachments...)
+		documentContext := CurrentDocumentContextForMessages(contextAttachments, msgs[persistStart:], a.attach)
 		msgs = replaceAttachmentReferences(msgs, persistStart, imageRecognitionToolAvailable, attachmentReadAvailable, toolRecognitionCapabilities)
 		msgs = dropDisplayOnlyMediaMessages(msgs)
+		// Current-turn readable documents need a bounded preview before the
+		// first model request. A tool-only reference made the first answer
+		// unaware of every uploaded PDF/DOCX unless the model happened to call
+		// read_attachment first.
+		if documentContext != "" {
+			msgs = append(msgs, llm.ChatMessage{Role: llm.RoleSystem, Type: llm.TypeText, Content: documentContext, SubmitToLLM: 1})
+		}
 		if useImageRecognition {
 			if currentTurnImageRecognition {
 				msgs = replaceImagesWithHeldRefs(msgs)

@@ -697,6 +697,22 @@ func StringProp(description string) map[string]any {
 	}
 }
 
+func IntProp(description string) map[string]any {
+	return map[string]any{
+		"type":        "integer",
+		"description": description,
+		"minimum":     0,
+	}
+}
+
+func StringArrayProp(description string) map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": description,
+		"items":       map[string]any{"type": "string"},
+	}
+}
+
 // BoolProp is a small JSON-Schema fragment for a boolean
 // parameter. Used by the P2-4 dry-run flag on
 // exec_command / read_file / write_file. Default is
@@ -783,10 +799,13 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "read_attachment",
-		Description: "Extract text from a user-uploaded text, PDF, Word, Excel, or PowerPoint attachment. Pass only an upload_id explicitly shown in this conversation; arbitrary file paths are not accepted.",
+		Description: "Read a bounded page from one or more user-uploaded text, PDF, Word, Excel, or PowerPoint attachments. Pass only upload_id or upload_ids explicitly shown in this conversation; arbitrary file paths are not accepted. Use offset and limit to continue from the returned next offset.",
 		Parameters: ObjectSchema(map[string]any{
-			"upload_id": StringProp("The upload_id of an attachment in this conversation"),
-		}, []string{"upload_id"}),
+			"upload_id":  StringProp("One upload_id of an attachment in this conversation (legacy-compatible)"),
+			"upload_ids": StringArrayProp("One or more upload_ids of attachments in this conversation"),
+			"offset":     IntProp("Zero-based extracted-text byte offset to begin reading"),
+			"limit":      IntProp("Maximum extracted-text bytes per attachment page"),
+		}, nil),
 	}, handleReadAttachment)
 
 	r.Register(Tool{
@@ -829,23 +848,23 @@ func RegisterBuiltin(r *Registry) {
 		}, []string{"url"}),
 	}, handleWebFetch)
 
-		r.Register(Tool{
-			Name:        "media_recognize",
-			Description: "Analyze one or more conversation-owned images, videos, or audio assets through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Assets in one call must share the same media type. Use context_refs/context_mode only when the user asks to continue, merge, or verify earlier media results. Prefer opaque input_ref values explicitly shown in this chat; never pass bytes, URLs, or file paths.",
-			Parameters: ObjectSchema(withMediaContextSchema(map[string]any{
-				"input_ref": StringProp("One opaque upload or tool-asset id from this conversation (preferred)"),
-				"input_refs": map[string]any{
-					"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
+	r.Register(Tool{
+		Name:        "media_recognize",
+		Description: "Analyze one or more conversation-owned images, videos, or audio assets through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Assets in one call must share the same media type. Use context_refs/context_mode only when the user asks to continue, merge, or verify earlier media results. Prefer opaque input_ref values explicitly shown in this chat; never pass bytes, URLs, or file paths.",
+		Parameters: ObjectSchema(withMediaContextSchema(map[string]any{
+			"input_ref": StringProp("One opaque upload or tool-asset id from this conversation (preferred)"),
+			"input_refs": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
 				"description": "Opaque ids of same-type media assets to analyze together (preferred)",
 			},
 			"upload_id": StringProp("Backward-compatible alias for one uploaded attachment id"),
 			"upload_ids": map[string]any{
 				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
 				"description": "Backward-compatible aliases for uploaded attachment ids",
-				},
-				"question": StringProp("Optional focused question for the configured recognition model"),
-			}), nil),
-		}, handleMediaRecognize)
+			},
+			"question": StringProp("Optional focused question for the configured recognition model"),
+		}), nil),
+	}, handleMediaRecognize)
 	// 旧工具调用和白名单继续生效，但模型只学习一个 canonical 媒体入口。
 	// Keep old tool calls and allowlists working without teaching the model two
 	// names for the same capability. The alias is callable but absent from

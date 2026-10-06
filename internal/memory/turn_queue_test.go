@@ -26,6 +26,25 @@ func TestMigration_TurnQueue_Schema(t *testing.T) {
 	assertColumnExists(t, s, "turn_queue", "attachment_count")
 }
 
+func TestCountPendingTurnQueueUploadRefs(t *testing.T) {
+	s, err := OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	convID, err := s.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte(`{"message":"queued","client_msg_id":1730000000001001,"attachments":[{"upload_id":"abcd1234567890ab"}]}`)
+	if _, err := s.CreateTurnQueueItem(convID, payload, "queued", 1730000000001001, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.CountPendingTurnQueueUploadRefs("abcd1234567890ab"); got != 1 {
+		t.Fatalf("pending upload refs = %d, want 1", got)
+	}
+}
+
 func TestMigration_TurnQueue_Rollback(t *testing.T) {
 	s, err := OpenAt(filepath.Join(t.TempDir(), "test.db"), 50)
 	if err != nil {

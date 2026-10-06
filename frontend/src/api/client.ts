@@ -939,9 +939,11 @@ export const forkSession = (sessionId: string, beforeId: number) =>
   )
 
 // --- Uploads ---
-export async function uploadFile(file: File): Promise<UploadMeta> {
+export async function uploadFile(file: File, sessionID: string): Promise<UploadMeta> {
+  if (!sessionID) throw new Error('upload requires a session id')
   const fd = new FormData()
   fd.append('file', file)
+  fd.append('session_id', sessionID)
   const backend = await waitForDirectBackend()
   const res = await fetch(`${backend}/api/v1/uploads`, { method: 'POST', body: fd, credentials: 'omit' })
   if (!res.ok) {
@@ -955,8 +957,8 @@ export async function uploadFile(file: File): Promise<UploadMeta> {
   return meta
 }
 
-export function uploadURL(id: string): string {
-  return `${BASE}/api/v1/uploads/${encodeURIComponent(id)}`
+export function uploadURL(id: string, sessionID: string): string {
+	return `${BASE}/api/v1/uploads/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionID)}`
 }
 
 // --- Providers / Models ---

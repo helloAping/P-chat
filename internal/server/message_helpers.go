@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -111,7 +112,7 @@ func (h *Handler) ListMessages(c *gin.Context) {
 	// rowIDs is in DESC order (matches the row order), so
 	// rowIDs[len-1] is the smallest id (oldest returned row).
 	for i, m := range msgs {
-		resp := buildMessageResponse(m, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
+		resp := buildMessageResponseForSession(id, m, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i])
 		if resp != nil {
 			out = append(out, *resp)
 		}
@@ -213,6 +214,14 @@ func shouldMergeUserAttachmentRow(prev, curr MessageResponse) bool {
 	if len(curr.Attachments) == 0 {
 		return false
 	}
+	if curr.AttachmentParentUserID > 0 {
+		for _, id := range prev.SourceMessageIDs {
+			if id == curr.AttachmentParentUserID {
+				return strings.TrimSpace(curr.Content) == ""
+			}
+		}
+		return false
+	}
 	return strings.TrimSpace(curr.Content) == ""
 }
 
@@ -266,7 +275,7 @@ func (h *Handler) SnapshotRecovery(c *gin.Context) {
 		// query) — the recovery flow doesn't need the
 		// SQLite row id, only the seq cursor. The created
 		// time comes from createds[i] (parallel to msgs).
-		resp := buildMessageResponse(m, metas, createds, i, 0, seqs[i], "", false)
+		resp := buildMessageResponseForSession(id, m, metas, createds, i, 0, seqs[i], "", false)
 		if resp != nil {
 			out = append(out, *resp)
 		}
@@ -750,6 +759,10 @@ func normalizeTaskOrderKey(s string) string {
 // (groupID, true) rows.
 
 func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64, seq int64, regenGroupID string, isArchived bool) *MessageResponse {
+	return buildMessageResponseForSession("", m, metas, createds, i, rowID, seq, regenGroupID, isArchived)
+}
+
+func buildMessageResponseForSession(sessionID string, m llm.ChatMessage, metas []string, createds []int64, i int, rowID int64, seq int64, regenGroupID string, isArchived bool) *MessageResponse {
 	if i < len(metas) && isUIHiddenMessageMeta(metas[i]) {
 		return nil
 	}
@@ -773,6 +786,17 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 		RegenGroupID:     regenGroupID,
 		IsArchived:       isArchived,
 	}
+	if i < len(metas) && metas[i] != "" {
+		var meta map[string]any
+		if json.Unmarshal([]byte(metas[i]), &meta) == nil {
+			switch value := meta["attachment_parent_user_id"].(type) {
+			case float64:
+				resp.AttachmentParentUserID = int64(value)
+			case string:
+				resp.AttachmentParentUserID, _ = strconv.ParseInt(value, 10, 64)
+			}
+		}
+	}
 
 	// Attachment messages (image / audio / video / file): compute a data
 	// URL for the frontend. The frontend's MessageBubble
@@ -793,9 +817,13 @@ func buildMessageResponse(m llm.ChatMessage, metas []string, createds []int64, i
 			mime = defaultMIMEForType(m.Type)
 		}
 		if uploadID, ok := uploadIDFromContent(m.Content); ok {
+			uploadURL := "/api/v1/uploads/" + uploadID
+			if sessionID != "" {
+				uploadURL += "?session_id=" + url.QueryEscape(sessionID)
+			}
 			resp.Attachments = append(resp.Attachments, AttachmentPart{
 				Type: typeURLFor(m.Type),
-				URL:  "/api/v1/uploads/" + uploadID,
+				URL:  uploadURL,
 				Name: m.Name,
 				Kind: kindFor(m.Type),
 				MIME: mime,
@@ -952,6 +980,16 @@ func resolveHistoryUploads(msgs []llm.ChatMessage, r *agent.DiskAttachmentResolv
 		return msgs
 	}
 	for i, m := range msgs {
+		// Documents remain opaque upload references. Their extractor reads the
+		// on-disk file on demand; base64 rehydration here wastes memory and
+		// prevents the document reader from retaining the upload identity.
+		if m.Type == llm.TypeFile {
+			if id, ok := uploadIDFromContent(m.Content); ok {
+				m.UploadID = id
+				msgs[i] = m
+			}
+			continue
+		}
 		id, ok := uploadIDFromContent(m.Content)
 		if !ok {
 			continue
@@ -1256,11 +1294,11 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		ProjectPath:                    m.ProjectPath,
 		ConversationState:              state,
 		HasUserMessages:                cv.UserMessageCount > 0,
-			UserMessageCount:               cv.UserMessageCount,
-			PendingTurnCount:               cv.PendingTurnCount,
-			PlanMode:                       m.PlanMode,
-			TurnModePolicy:                 string(agent.NormalizeTurnModePolicy(m.TurnModePolicy, m.PlanMode)),
-			PermissionLevel:                m.PermissionLevel,
+		UserMessageCount:               cv.UserMessageCount,
+		PendingTurnCount:               cv.PendingTurnCount,
+		PlanMode:                       m.PlanMode,
+		TurnModePolicy:                 string(agent.NormalizeTurnModePolicy(m.TurnModePolicy, m.PlanMode)),
+		PermissionLevel:                m.PermissionLevel,
 		ReasoningEffort:                m.ReasoningEffort,
 		VectorStore:                    cv.VectorStore,
 		KnowledgeBase:                  m.KnowledgeBase,

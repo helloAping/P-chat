@@ -83,6 +83,34 @@ func TestRun_Idempotent(t *testing.T) {
 	}
 }
 
+func TestRun_V16ToV17CreatesUploadOwnerDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V16); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run V16→V17: %v", err)
+	}
+	if v := readUserVersion(); v != V17 {
+		t.Fatalf("version = %d, want V17", v)
+	}
+	if info, err := os.Stat(filepath.Join(dir, ".p-chat", "uploads")); err != nil || !info.IsDir() {
+		t.Fatalf("uploads dir missing: info=%v err=%v", info, err)
+	}
+	if err := stepV16toV17(db); err != nil {
+		t.Fatalf("V17 step should be idempotent: %v", err)
+	}
+}
+
 func TestRun_V7ToV8CreatesTurnQueue(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)

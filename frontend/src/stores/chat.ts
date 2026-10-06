@@ -47,6 +47,9 @@ export interface PendingAttachment {
   _rollbackSource?: string
 }
 
+const MAX_PENDING_ATTACHMENTS = 16
+const ATTACHMENT_PREPARE_CONCURRENCY = 4
+
 type RollbackDraft = {
   source: string
   text: string
@@ -1625,35 +1628,90 @@ function rollbackDraftAttachments(target: Message, deletedMessages: Message[]): 
 }
 
 export function addAttachment(file: File): Promise<void> {
+  return addAttachments([file])
+}
+
+// addAttachments synchronously reserves ordered preview slots, then prepares no
+// more than four files concurrently. This prevents a large paste from racing
+// the attachment strip or overwhelming the upload endpoint.
+export function addAttachments(files: Iterable<File>): Promise<void> {
   const id = state.currentID
   if (!id) return Promise.resolve()
   if (!state.pendingAttachments[id]) state.pendingAttachments[id] = []
-  const guessedKind = guessKind(file.name, file.type || '')
-  const blobURL = URL.createObjectURL(file)
-  const placeholder: PendingAttachment = {
-    id: '', name: file.name, size: file.size, mime: file.type || '',
-    kind: guessedKind,
-    _file: file, _blobURL: blobURL, _uploading: true, _error: false,
-    _previewURL: blobURL,
+  const selected = Array.from(files)
+  const capacity = Math.max(0, MAX_PENDING_ATTACHMENTS - state.pendingAttachments[id].length)
+  const accepted = selected.slice(0, capacity)
+  const dropped = selected.length - accepted.length
+  const jobs: Array<{
+    placeholder: PendingAttachment
+    file: File
+    guessedKind: string
+    resolve: () => void
+    reject: (error: unknown) => void
+  }> = []
+
+  for (const file of accepted) {
+    const guessedKind = guessKind(file.name, file.type || '')
+    const blobURL = URL.createObjectURL(file)
+    const placeholder: PendingAttachment = {
+      id: '', name: file.name, size: file.size, mime: file.type || '',
+      kind: guessedKind,
+      _file: file, _blobURL: blobURL, _uploading: true, _error: false,
+      _previewURL: blobURL,
+    }
+    const ready = new Promise<void>((resolve, reject) => {
+      jobs.push({ placeholder, file, guessedKind, resolve, reject })
+    })
+    // The send path observes _ready later. Attach a passive rejection handler
+    // now so an upload failure before Send does not become an unhandled promise.
+    void ready.catch(() => {})
+    placeholder._ready = ready
+    state.pendingAttachments[id].push(placeholder)
   }
-  state.pendingAttachments[id].push(placeholder)
-  const ready = prepareAttachment(placeholder, file, guessedKind)
-  placeholder._ready = ready
-  return ready
+
+  void runAttachmentPreparationQueue(jobs, id)
+  return Promise.all(jobs.map(job => job.placeholder._ready)).then(() => {
+    if (dropped) throw new Error(`最多只能添加 ${MAX_PENDING_ATTACHMENTS} 个附件`)
+  })
 }
 
-async function prepareAttachment(placeholder: PendingAttachment, file: File, guessedKind: string): Promise<void> {
+async function runAttachmentPreparationQueue(
+  jobs: Array<{ placeholder: PendingAttachment; file: File; guessedKind: string; resolve: () => void; reject: (error: unknown) => void }>,
+  sessionID: string,
+): Promise<void> {
+  let cursor = 0
+  const worker = async () => {
+    while (cursor < jobs.length) {
+      const job = jobs[cursor++]
+      try {
+        await prepareAttachment(job.placeholder, job.file, job.guessedKind, sessionID)
+        job.resolve()
+      } catch (error) {
+        job.reject(error)
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(ATTACHMENT_PREPARE_CONCURRENCY, jobs.length) }, worker))
+}
+
+function canInlineAttachmentFallback(kind: string): boolean {
+  return kind === 'image' || kind === 'audio' || kind === 'video' || kind === 'text'
+}
+
+async function prepareAttachment(placeholder: PendingAttachment, file: File, guessedKind: string, sessionID: string): Promise<void> {
   // Cache a base64 data URL up-front so the message can be
   // displayed + sent without re-reading the file from disk.
   // For text attachments this is just the utf-8 text; for binary
   // (images/audio/video) it's the data: URL the LLM wants anyway.
-  try {
-    placeholder._dataURL = await readAsDataURL(file, guessedKind)
-  } catch {
-    // Non-fatal: the upload fallback still gives us a server URL.
+  if (canInlineAttachmentFallback(guessedKind)) {
+    try {
+      placeholder._dataURL = await readAsDataURL(file, guessedKind)
+    } catch {
+      // Non-fatal: the upload fallback still gives us a server URL.
+    }
   }
   try {
-    const meta = await api.uploadFile(file)
+    const meta = await api.uploadFile(file, sessionID)
     placeholder.id = meta.id
     placeholder.kind = meta.kind || guessedKind
     placeholder.mime = meta.mime
@@ -1665,7 +1723,7 @@ async function prepareAttachment(placeholder: PendingAttachment, file: File, gue
     // server URL after upload completed.)
   } catch (e: any) {
     placeholder._uploading = false
-    if (placeholder._dataURL) {
+    if (placeholder._dataURL && canInlineAttachmentFallback(guessedKind)) {
       return
     }
     placeholder._error = true

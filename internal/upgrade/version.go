@@ -85,7 +85,11 @@ const (
 	// Missing model.protocol remains backward compatible and means inheritance.
 	V16 AppVersion = 16
 
+	// V17 — uploads gain per-file owner sidecars. New files are bound to a
+	// conversation before their first message is submitted.
+	V17 AppVersion = 17
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V16
+	Current AppVersion = V17
 )
