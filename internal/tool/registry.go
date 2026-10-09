@@ -784,8 +784,8 @@ func RegisterBuiltin(r *Registry) {
 			"DO NOT call read_file on images, audio, video, archives, or other unsupported binary files - " +
 			"those will return a binary error. " +
 			"For a user-uploaded attachment, use read_attachment with its upload_id instead of an on-disk path. " +
-			"Images uploaded by the user are ALREADY available as vision input (image_url) in the user message; " +
-			"just look at them directly, do NOT call read_file on the on-disk copy.",
+			"User-uploaded images may be provided as vision input or recognition text; " +
+			"do NOT call read_file on the on-disk copy.",
 		Parameters: ObjectSchema(map[string]any{
 			"path":    StringProp("Absolute or relative path to the file"),
 			"dry_run": BoolProp("If true, return file size + first 200 chars without reading the full body."),
@@ -799,7 +799,7 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "read_attachment",
-		Description: "Read a bounded page from one or more user-uploaded text, PDF, Word, Excel, or PowerPoint attachments. Pass only upload_id or upload_ids explicitly shown in this conversation; arbitrary file paths are not accepted. Use offset and limit to continue from the returned next offset.",
+		Description: "Read a bounded page from user-uploaded text, PDF, Word, Excel, or PowerPoint attachments. Pass only upload_id or upload_ids explicitly shown in this conversation; arbitrary file paths are not accepted. At most 8 distinct upload_ids per call; split larger sets into batches. Use offset and limit to continue from the returned next offset.",
 		Parameters: ObjectSchema(map[string]any{
 			"upload_id":  StringProp("One upload_id of an attachment in this conversation (legacy-compatible)"),
 			"upload_ids": StringArrayProp("One or more upload_ids of attachments in this conversation"),

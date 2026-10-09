@@ -29,6 +29,7 @@ export interface PendingAttachment {
   _blobURL?: string
   _uploading: boolean
   _error: boolean
+  _errorMessage?: string
   // Local URL for immediate preview (blob: during upload,
   // server URL after).
   _previewURL: string
@@ -1727,6 +1728,7 @@ async function prepareAttachment(placeholder: PendingAttachment, file: File, gue
       return
     }
     placeholder._error = true
+    placeholder._errorMessage = e?.message || '上传失败'
     throw e
   }
 }

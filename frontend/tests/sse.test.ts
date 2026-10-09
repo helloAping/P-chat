@@ -10,6 +10,8 @@ import {
   nextStreamIdleTimeoutMs,
   parseSSEFrame,
   shouldRetryStreamError,
+  StreamHTTPError,
+  isRejectedMessageRequest,
   streamErrorStatus,
   STREAM_IDLE_AFTER_LLM_MS,
   STREAM_IDLE_AFTER_TOOL_MS,
@@ -77,6 +79,21 @@ test('HTTP 409 stream conflicts are non-retryable', () => {
   assert.equal(shouldRetryStreamError(badGateway), true)
   assert.equal(streamErrorStatus(network), null)
   assert.equal(shouldRetryStreamError(network), true)
+})
+
+test('an attachment validation 400 is a rejected request, not a dropped stream', () => {
+  const invalidAttachment = new StreamHTTPError('stream', 400, '{"code":"invalid_attachment","error":"broken.pdf PDF 文件不完整"}', 'Bad Request')
+  assert.equal(streamErrorStatus(invalidAttachment), 400)
+  assert.equal(shouldRetryStreamError(invalidAttachment), false)
+  assert.equal(isRejectedMessageRequest(invalidAttachment), true)
+  assert.equal(invalidAttachment.code, 'invalid_attachment')
+  assert.match(invalidAttachment.detail, /broken\.pdf/)
+  assert.doesNotMatch(invalidAttachment.detail, /\{"code"/)
+  assert.equal(shouldRetryStreamError(new Error('stream: HTTP 422: unprocessable')), false)
+  assert.equal(shouldRetryStreamError(new Error('stream: HTTP 429: busy')), true)
+  assert.equal(isRejectedMessageRequest(new StreamHTTPError('stream', 409, '{"code":"session_busy","error":"busy"}', 'Conflict')), true)
+  assert.equal(isRejectedMessageRequest(new StreamHTTPError('stream', 409, '{"code":"duplicate_client_message"}', 'Conflict')), false)
+  assert.equal(isRejectedMessageRequest(new StreamHTTPError('stream', 500, '{"error":"server error"}', 'Server Error')), false)
 })
 
 test('consumeSSEStream handles split frames and skips DONE', async () => {

@@ -16,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/paths"
 )
 
@@ -210,6 +211,11 @@ func (h *Handler) Upload(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("file too large: max %d bytes", maxUploadSize)})
 		return
 	}
+	if err := validateDocumentUpload(fh.Filename, stored); err != nil {
+		_ = os.Remove(stored)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_attachment"})
+		return
+	}
 	if err := writeUploadOwner(id, sessionID); err != nil {
 		_ = os.Remove(stored)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "record upload owner: " + err.Error()})
@@ -225,6 +231,20 @@ func (h *Handler) Upload(c *gin.Context) {
 		StoredAs: stored,
 	}
 	c.JSON(http.StatusCreated, meta)
+}
+
+func validateDocumentUpload(name, path string) error {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".pdf":
+		if err := knowledge.ValidatePDF(path); err != nil {
+			return fmt.Errorf("PDF 文件不完整或格式无效，请重新下载后上传: %w", err)
+		}
+	case ".docx", ".docm":
+		if err := knowledge.ValidateDOCX(path); err != nil {
+			return fmt.Errorf("Word 文件不完整或格式无效，请重新下载后上传: %w", err)
+		}
+	}
+	return nil
 }
 
 func uploadOwnerPath(id string) string {
@@ -264,6 +284,11 @@ func (h *Handler) validateAttachmentOwnership(sessionID string, atts []agent.Att
 	for _, id := range h.store.UploadRefsForConversation(sessionID) {
 		legacyRefs[id] = struct{}{}
 	}
+	type ownedDocument struct {
+		name string
+		path string
+	}
+	ownedDocuments := make([]ownedDocument, 0, len(atts))
 	for _, att := range atts {
 		id := strings.TrimSpace(att.UploadID)
 		if id == "" {
@@ -287,9 +312,22 @@ func (h *Handler) validateAttachmentOwnership(sessionID string, atts []agent.Att
 				return fmt.Errorf("attachment %q is not available in this session; upload it again", att.Name)
 			}
 		}
-		if path, _ := (&agent.DiskAttachmentResolver{BaseDir: UploadDir()}).Resolve(agent.Attachment{ID: id}); path == "" {
+		path, _ := (&agent.DiskAttachmentResolver{BaseDir: UploadDir()}).Resolve(agent.Attachment{ID: id})
+		if path == "" {
 			return fmt.Errorf("attachment %q bytes are missing; upload it again", att.Name)
 		}
+		ownedDocuments = append(ownedDocuments, ownedDocument{name: att.Name, path: path})
+	}
+	// 先确认全部附件属于本会话，再汇总格式错误，避免跨会话请求窥探文件状态。
+	// Check every attachment's ownership before reporting document errors to avoid cross-session disclosure.
+	invalid := make([]string, 0)
+	for _, document := range ownedDocuments {
+		if err := validateDocumentUpload(document.path, document.path); err != nil {
+			invalid = append(invalid, fmt.Sprintf("%q：%v", document.name, err))
+		}
+	}
+	if len(invalid) > 0 {
+		return fmt.Errorf("以下附件无效：%s", strings.Join(invalid, "；"))
 	}
 	return nil
 }
@@ -353,6 +391,10 @@ func (h *Handler) materializeInlineFileAttachments(sessionID string, atts []agen
 		stored := filepath.Join(UploadDir(), id+"-"+name)
 		if err := os.WriteFile(stored, data, 0o600); err != nil {
 			return fmt.Errorf("write attachment %q: %w", name, err)
+		}
+		if err := validateDocumentUpload(name, stored); err != nil {
+			_ = os.Remove(stored)
+			return fmt.Errorf("attachment %q: %w", name, err)
 		}
 		if err := writeUploadOwner(id, sessionID); err != nil {
 			_ = os.Remove(stored)

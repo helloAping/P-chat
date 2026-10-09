@@ -58,9 +58,24 @@ test('input requires durable document uploads before it creates a user turn', ()
   assert.doesNotMatch(sendSource, /await api\.uploadFile\(/, 'send must not upload a selected file a second time')
   assert.match(source, /upload_id: a\.id \|\| undefined/, 'media should reuse the upload id created during selection')
   assert.match(source, /type: 'text',[\s\S]*?upload_id: a\.id \|\| undefined/, 'documents should reuse the upload id created during selection')
-  assert.match(sendSource, /assertRequiredAttachmentsUploaded\(stagedAttachments\)/, 'document upload failures should abort before a send')
+  assert.match(sendSource, /planAttachmentSend\(stagedAttachments, !!text, confirmSendWithoutFailedDocuments\)/, 'failed documents require an explicit send decision')
+  assert.match(sendSource, /if \(plan\.status !== 'ready'\)/, 'a blocked or cancelled document send must stop before creating a turn')
   assert.doesNotMatch(sendSource, /data: a\.id \? undefined : data/, 'documents must not silently fall back to inline bytes')
   assert.match(source, /\.docx,\.docm,\.pptx,\.pptm,\.xlsx,\.xlsm/, 'the file picker should expose supported Office attachments')
+})
+
+test('an initial HTTP attachment rejection rolls back the local send and keeps its draft', () => {
+  const input = readFileSync(new URL('../src/components/InputArea.vue', import.meta.url), 'utf8')
+  const sendStart = input.indexOf('async function send()')
+  const sendEnd = input.indexOf('\nfunction stop()', sendStart)
+  const sendSource = input.slice(sendStart, sendEnd)
+  assert.match(sendSource, /if \(isRejectedMessageRequest\(e\)\) \{[\s\S]*?removeUnacceptedLocalTurn\(messages, clientMsgId\)/)
+  assert.match(sendSource, /restoreRejectedAttachments\([\s\S]*?sendAttachments/)
+  assert.match(sendSource, /mergeRejectedDraft\(text, inputText\.value\)/)
+  assert.match(sendSource, /附件无效，消息未发送/)
+
+  const turnSource = readTurnSource()
+  assert.match(turnSource, /if \(isRejectedMessageRequest\(e\)\) \{[\s\S]*?removeUnacceptedLocalTurn\(state\.sessionMessages\[sessionId\]/)
 })
 
 test('attachment selection batches placeholders, limits concurrency, and binds uploads to its session', () => {

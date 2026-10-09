@@ -37,6 +37,9 @@ import { drainQueuedConversationTurns, stopConversationTurn, submitConversationT
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
 import { dataURLToBlobURL } from '../utils/mediaPreview'
+import { isRejectedMessageRequest } from '../api/sse'
+import { mergeRejectedDraft, removeUnacceptedLocalTurn, restoreRejectedAttachments } from '../utils/rejectedTurn'
+import { planAttachmentSend } from '../utils/attachmentSend'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
@@ -94,6 +97,7 @@ async function onUndoRollback() {
 onMounted(() => nextTick(resizeTextarea))
 const sending = ref(false)
 const sendPreflightSessions = new Set<string>()
+const attachmentSendPreflightSessions = new Set<string>()
 const showSessionConfig = ref(false)
 const showSubAgentModelPicker = ref(false)
 const message = useMessage()
@@ -982,10 +986,28 @@ function buildInlineAttachments(attachments: PendingAttachment[]): api.InlineAtt
   return result
 }
 
-function assertRequiredAttachmentsUploaded(attachments: PendingAttachment[]): void {
-  const failed = attachments.filter(a => a.kind === 'file' && (a._error || !a.id))
-  if (!failed.length) return
-  throw new Error(`文档上传失败，未发送消息：${failed.map(a => a.name).join('、')}`)
+function confirmSendWithoutFailedDocuments(failed: PendingAttachment[]): Promise<boolean> {
+  return new Promise(resolve => {
+    let settled = false
+    let dialogRef: { destroy: () => void } | null = null
+    const finish = (confirmed: boolean) => {
+      if (settled) return
+      settled = true
+      resolve(confirmed)
+      dialogRef?.destroy()
+    }
+    const names = failed.slice(0, 2).map(a => a.name).join('、')
+    const more = failed.length > 2 ? ` 等 ${failed.length} 个` : ''
+    dialogRef = dialog.warning({
+      title: '文档上传失败',
+      content: `${names}${more} 未能上传。仅发送文字和其他成功附件时，模型无法读取这些文档。你也可以取消，重新选择文档。`,
+      action: () => h(NSpace, { justify: 'end', size: 8 }, () => [
+        h(NButton, { size: 'small', onClick: () => finish(false) }, { default: () => '取消发送' }),
+        h(NButton, { size: 'small', type: 'warning', onClick: () => finish(true) }, { default: () => '不带失败文档发送' }),
+      ]),
+      onClose: () => finish(false),
+    })
+  })
 }
 
 async function send() {
@@ -1024,6 +1046,7 @@ async function send() {
   }
 
   const preflightSessionID = state.currentID
+  if (preflightSessionID && attachmentSendPreflightSessions.has(preflightSessionID)) return
   let todoMode: TodoSendMode = 'auto'
   const shouldQueueBeforePreflight = currentConversationBusy.value || currentTurnQueue.value.length > 0
   if (preflightSessionID && !shouldQueueBeforePreflight) {
@@ -1059,12 +1082,28 @@ async function send() {
   // Snapshot this session's staged files. Selection owns the single upload;
   // sending only waits for that work and reuses its upload id.
   const stagedAttachments = [...currentAttachments.value]
+  let sendAttachments: PendingAttachment[]
+  if (attachmentSendPreflightSessions.has(id)) return
+  attachmentSendPreflightSessions.add(id)
   try {
     await waitForPendingAttachments(stagedAttachments)
-    assertRequiredAttachmentsUploaded(stagedAttachments)
+    const plan = await planAttachmentSend(stagedAttachments, !!text, confirmSendWithoutFailedDocuments)
+    if (plan.status !== 'ready') {
+      if (plan.status === 'blocked') {
+        message.error(`文档上传失败，未发送消息：${plan.failed.map(a => a.name).join('、')}。请重新选择文件，或移除失败附件后发送。`)
+      }
+      return
+    }
+    if (state.currentID !== id || inputText.value.trim() !== text ||
+        currentAttachments.value.length !== stagedAttachments.length ||
+        currentAttachments.value.some((a, i) => a !== stagedAttachments[i])) return
+    sendAttachments = plan.attachments
+    if (plan.omitted.length) message.warning(`已跳过 ${plan.omitted.length} 个上传失败的文档，本次消息不包含这些文档`)
   } catch (e: any) {
     message.error(e?.message || '附件上传失败，消息未发送')
     return
+  } finally {
+    attachmentSendPreflightSessions.delete(id)
   }
   inputText.value = ''
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
@@ -1084,7 +1123,7 @@ async function send() {
   if (!shouldQueue) {
     // The bubble is optimistic: local object URLs render immediately while a
     // just-selected attachment finishes its existing read/upload task.
-		const bubbleAttachments = buildLocalBubbleAttachments(stagedAttachments, id)
+		const bubbleAttachments = buildLocalBubbleAttachments(sendAttachments, id)
     optimisticUserMessage = {
       id: clientMsgId,
       role: 'user',
@@ -1104,10 +1143,10 @@ async function send() {
   // on the GUI message so an immediate rollback can restore the same files
   // without reading or uploading them again.
   optimisticUserMessage?.attachments?.forEach((attachment, index) => {
-    const uploadID = stagedAttachments[index]?.id
+    const uploadID = sendAttachments[index]?.id
     if (uploadID) attachment.upload_id = uploadID
   })
-  const inlineAttachments = buildInlineAttachments(stagedAttachments)
+  const inlineAttachments = buildInlineAttachments(sendAttachments)
   const activeSkills = pendingActiveSkills.length ? [...pendingActiveSkills] : undefined
   const turnPayload = api.sendPayloadFromOptions({
     message: text,
@@ -1183,7 +1222,22 @@ async function send() {
     }
   } catch (e: any) {
     if (e.name !== 'AbortError') {
-      message.error(`发送失败: ${e.message}`)
+      if (isRejectedMessageRequest(e)) {
+        const messages = state.sessionMessages[id] || []
+        if (removeUnacceptedLocalTurn(messages, clientMsgId)) {
+          state.pendingAttachments[id] = restoreRejectedAttachments(
+            sendAttachments,
+            state.pendingAttachments[id] || [],
+            e.code === 'invalid_attachment' ? e.detail : '',
+          )
+          if (state.currentID === id) inputText.value = mergeRejectedDraft(text, inputText.value)
+        }
+        message.error(e.code === 'invalid_attachment'
+          ? `附件无效，消息未发送：${e.detail}`
+          : `消息未被接受：${e.detail}`)
+      } else {
+        message.error(`发送失败: ${e.message}`)
+      }
     }
   } finally {
     sending.value = false
@@ -2088,7 +2142,7 @@ watch([() => state.currentID, queueSignature], () => {
             <FileText v-else-if="a.kind === 'text'" :size="18" />
             <File v-else :size="18" />
           </div>
-          <span class="name" :title="a.name">{{ a.name }}</span>
+          <span class="name" :title="a._errorMessage || a.name">{{ a.name }}</span>
           <button class="rm" @click="removeAttachment(i)" title="移除" aria-label="移除附件">×</button>
         </div>
       </div>

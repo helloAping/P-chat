@@ -61,9 +61,9 @@ func TestAppendWorkingDirectoryBlock_MatchesBuild(t *testing.T) {
 
 func TestBuildLanguageBlock(t *testing.T) {
 	cases := []struct {
-		lang      string
-		mustHave  []string
-		mustNot   []string
+		lang     string
+		mustHave []string
+		mustNot  []string
 	}{
 		{"zh", []string{"简体中文"}, nil},
 		{"en", []string{"English"}, []string{"简体中文"}},
@@ -152,6 +152,11 @@ func TestBuildAttachmentsSection(t *testing.T) {
 	}
 	if !strings.Contains(got, "read_file") {
 		t.Errorf("missing read_file warning: %q", got)
+	}
+	for _, want := range []string{"bounded preview", "read_attachment", "at most 8 upload_ids", "account for every attachment", "do not claim to have memorized"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing document handling guidance %q: %q", want, got)
+		}
 	}
 }
 

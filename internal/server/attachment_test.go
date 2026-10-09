@@ -8,9 +8,11 @@
 package server
 
 import (
+	"archive/zip"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -22,8 +24,51 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/llm"
 )
+
+func validTestPDF() []byte {
+	var b bytes.Buffer
+	b.WriteString("%PDF-1.4\n")
+	offsets := []int{0}
+	for i, body := range []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+	} {
+		offsets = append(offsets, b.Len())
+		fmt.Fprintf(&b, "%d 0 obj\n%s\nendobj\n", i+1, body)
+	}
+	xref := b.Len()
+	b.WriteString("xref\n0 4\n0000000000 65535 f \n")
+	for _, offset := range offsets[1:] {
+		fmt.Fprintf(&b, "%010d 00000 n \n", offset)
+	}
+	fmt.Fprintf(&b, "trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n", xref)
+	return b.Bytes()
+}
+
+func testDOCX(t *testing.T, documentXML string) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	zw := zip.NewWriter(&b)
+	w, err := zw.Create("word/document.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, documentXML); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+func validTestDOCX(t *testing.T) []byte {
+	return testDOCX(t, `<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>hello</w:t></w:r></w:p></w:body></w:document>`)
+}
 
 // TestSendMessageRequest_AcceptsUploadID verifies the SPA wire
 // field: an attachment posted with "upload_id" (no inline bytes)
@@ -306,6 +351,78 @@ func TestUploadRequiresKnownSession(t *testing.T) {
 	}
 }
 
+func TestUploadRejectsMalformedDocumentsBeforeSavingOwner(t *testing.T) {
+	s, _ := newTestServerWithConfig(t, richTestConfigJSON)
+	sessionID, _ := s.handler.store.NewConversation()
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	validPDF := validTestPDF()
+	brokenPDF := append([]byte{}, bytes.TrimSuffix(validPDF, []byte("%%EOF\n"))...)
+	brokenPDF = append(brokenPDF, []byte("<HTML><form>gateway error</form></HTML>")...)
+	for _, tc := range []struct {
+		name string
+		data []byte
+		want int
+	}{
+		{"valid.pdf", validPDF, http.StatusCreated},
+		{"pdf-with-trailing-html.pdf", append(append([]byte{}, validPDF...), []byte("<!DOCTYPE HTML>"+strings.Repeat("x", 800))...), http.StatusCreated},
+		{"pdf-with-excessive-trailer.pdf", append(append([]byte{}, validPDF...), bytes.Repeat([]byte("x"), (64<<10)+1)...), http.StatusBadRequest},
+		{"broken.pdf", brokenPDF, http.StatusBadRequest},
+		{"fake-eof.pdf", []byte("%PDF-1.4\n<HTML>%%EOF</HTML>"), http.StatusBadRequest},
+		{"valid.docx", validTestDOCX(t), http.StatusCreated},
+		{"broken.docx", []byte("not a zip"), http.StatusBadRequest},
+		{"wrong-root.docx", testDOCX(t, `<html/>`), http.StatusBadRequest},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before, err := os.ReadDir(UploadDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			body := &bytes.Buffer{}
+			mw := multipart.NewWriter(body)
+			if err := mw.WriteField("session_id", sessionID); err != nil {
+				t.Fatal(err)
+			}
+			fw, err := mw.CreateFormFile("file", tc.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fw.Write(tc.data); err != nil {
+				t.Fatal(err)
+			}
+			if err := mw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/uploads", body)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			w := httptest.NewRecorder()
+			s.engine.ServeHTTP(w, req)
+			if w.Code != tc.want {
+				t.Fatalf("status=%d body=%s, want %d", w.Code, w.Body.String(), tc.want)
+			}
+			after, err := os.ReadDir(UploadDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.want == http.StatusBadRequest {
+				if !strings.Contains(w.Body.String(), `"code":"invalid_attachment"`) || len(after) != len(before) {
+					t.Fatalf("invalid upload left files or unclear response: before=%d after=%d body=%s", len(before), len(after), w.Body.String())
+				}
+			} else if tc.name == "pdf-with-trailing-html.pdf" {
+				var uploaded UploadMeta
+				if err := json.Unmarshal(w.Body.Bytes(), &uploaded); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(UploadDir(), uploaded.ID+"-"+uploaded.Name)
+				if _, err := knowledge.ExtractPDFText(path); err != nil {
+					t.Fatalf("accepted PDF must also be readable by read_attachment: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestValidateAttachmentOwnershipRejectsOtherSession(t *testing.T) {
 	s, _ := newTestServer(t)
 	owner, _ := s.handler.store.NewConversation()
@@ -314,7 +431,7 @@ func TestValidateAttachmentOwnershipRejectsOtherSession(t *testing.T) {
 	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(UploadDir(), id+"-report.pdf"), []byte("pdf"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(UploadDir(), id+"-report.pdf"), validTestPDF(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := writeUploadOwner(id, owner); err != nil {
@@ -328,12 +445,119 @@ func TestValidateAttachmentOwnershipRejectsOtherSession(t *testing.T) {
 	}
 }
 
+func TestValidateAttachmentOwnershipRejectsExistingBrokenPDF(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	id := "abcd1234567890ac"
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(UploadDir(), id+"-broken.pdf"), []byte("%PDF-1.5\n<HTML>error</HTML>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUploadOwner(id, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.handler.validateAttachmentOwnership(sessionID, []agent.Attachment{{UploadID: id, Name: "broken.pdf", Kind: "file"}}); err == nil || !strings.Contains(err.Error(), "PDF 文件不完整") {
+		t.Fatalf("broken historical PDF was accepted: %v", err)
+	}
+}
+
+func TestValidateAttachmentOwnershipReportsAllBrokenOwnedDocuments(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	attachments := []agent.Attachment{
+		{UploadID: "abcd1234567890ad", Name: "first.pdf", Kind: "file"},
+		{UploadID: "abcd1234567890ae", Name: "second.pdf", Kind: "file"},
+	}
+	for _, att := range attachments {
+		if err := os.WriteFile(filepath.Join(UploadDir(), att.UploadID+"-"+att.Name), []byte("%PDF-1.5\n<HTML>error</HTML>"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeUploadOwner(att.UploadID, sessionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := s.handler.validateAttachmentOwnership(sessionID, attachments)
+	if err == nil || !strings.Contains(err.Error(), "first.pdf") || !strings.Contains(err.Error(), "second.pdf") {
+		t.Fatalf("want both invalid document names in one error, got: %v", err)
+	}
+}
+
+func TestValidateAttachmentOwnershipChecksOwnersBeforeReportingDocumentErrors(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	otherID, _ := s.handler.store.NewConversation()
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ownedID := "abcd1234567890af"
+	foreignID := "abcd1234567890b0"
+	if err := os.WriteFile(filepath.Join(UploadDir(), ownedID+"-broken.pdf"), []byte("%PDF-1.5\n<HTML>error</HTML>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUploadOwner(ownedID, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(UploadDir(), foreignID+"-foreign.pdf"), validTestPDF(), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUploadOwner(foreignID, otherID); err != nil {
+		t.Fatal(err)
+	}
+	err := s.handler.validateAttachmentOwnership(sessionID, []agent.Attachment{
+		{UploadID: ownedID, Name: "broken.pdf", Kind: "file"},
+		{UploadID: foreignID, Name: "foreign.pdf", Kind: "file"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "another session") || strings.Contains(err.Error(), "broken.pdf") {
+		t.Fatalf("ownership error must take priority over document details, got: %v", err)
+	}
+}
+
+func TestSendMessageRejectsAllBrokenHistoricalPDFsBeforePersisting(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct{ id, name string }{
+		{"abcd1234567890b1", "first.pdf"},
+		{"abcd1234567890b2", "second.pdf"},
+	} {
+		if err := os.WriteFile(filepath.Join(UploadDir(), item.id+"-"+item.name), []byte("%PDF-1.5\n<HTML>error</HTML>"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := writeUploadOwner(item.id, sessionID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := `{"message":"记住这些文档内容","client_msg_id":123456789,"attachments":[` +
+		`{"upload_id":"abcd1234567890b1","name":"first.pdf","kind":"file"},` +
+		`{"upload_id":"abcd1234567890b2","name":"second.pdf","kind":"file"}]}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+sessionID+"/messages", strings.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, r)
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), `"code":"invalid_attachment"`) {
+		t.Fatalf("status=%d body=%s, want invalid_attachment 400", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "first.pdf") || !strings.Contains(w.Body.String(), "second.pdf") {
+		t.Fatalf("response did not name both invalid PDFs: %s", w.Body.String())
+	}
+	if got := s.handler.store.GetChatMessagesFor(sessionID, 0); len(got) != 0 {
+		t.Fatalf("rejected send persisted %d messages", len(got))
+	}
+}
+
 func TestMaterializeInlineFileAttachmentBindsOwner(t *testing.T) {
 	s, _ := newTestServer(t)
 	sessionID, _ := s.handler.store.NewConversation()
 	atts := []agent.Attachment{{
 		Name: "report.pdf", Kind: "file", MIME: "application/pdf",
-		Data: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString([]byte("pdf bytes")),
+		Data: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString(validTestPDF()),
 	}}
 	if err := s.handler.materializeInlineFileAttachments(sessionID, atts); err != nil {
 		t.Fatal(err)
@@ -344,6 +568,32 @@ func TestMaterializeInlineFileAttachmentBindsOwner(t *testing.T) {
 	owner, found, err := readUploadOwner(atts[0].UploadID)
 	if err != nil || !found || owner != sessionID {
 		t.Fatalf("owner = %q found=%v err=%v", owner, found, err)
+	}
+}
+
+func TestMaterializeInlineBrokenPDFRollsBackBatch(t *testing.T) {
+	s, _ := newTestServer(t)
+	sessionID, _ := s.handler.store.NewConversation()
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadDir(UploadDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	atts := []agent.Attachment{
+		{Name: "notes.txt", Kind: "text", MIME: "text/plain", Data: "first file"},
+		{Name: "broken.pdf", Kind: "file", MIME: "application/pdf", Data: "data:application/pdf;base64," + base64.StdEncoding.EncodeToString([]byte("%PDF-1.5\n<HTML>error</HTML>"))},
+	}
+	if err := s.handler.materializeInlineFileAttachments(sessionID, atts); err == nil {
+		t.Fatal("invalid inline PDF was accepted")
+	}
+	after, err := os.ReadDir(UploadDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) != len(before) || atts[0].UploadID != "" {
+		t.Fatalf("inline batch was not rolled back: before=%d after=%d attachments=%+v", len(before), len(after), atts)
 	}
 }
 

@@ -3,7 +3,7 @@
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
-import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
+import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, StreamHTTPError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
 
 const BASE = (import.meta.env?.VITE_PCHAT_BACKEND || '').replace(/\/$/, '')
 
@@ -947,8 +947,15 @@ export async function uploadFile(file: File, sessionID: string): Promise<UploadM
   const backend = await waitForDirectBackend()
   const res = await fetch(`${backend}/api/v1/uploads`, { method: 'POST', body: fd, credentials: 'omit' })
   if (!res.ok) {
-    const t = await res.text()
-    throw new Error(`HTTP ${res.status}: ${t}`)
+    const body = await res.text()
+    let detail = ''
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown }
+      if (typeof parsed.error === 'string') detail = parsed.error
+    } catch {
+      // Some proxies return plain text or HTML instead of JSON.
+    }
+    throw new Error(detail || `HTTP ${res.status}: ${body.slice(0, 200)}`)
   }
   const meta = await res.json() as UploadMeta
   if (!meta || meta.size <= 0) {
@@ -1846,9 +1853,9 @@ async function consumeStreamRequest(request: StreamRequest): Promise<void> {
     body: request.body,
     signal: request.signal,
   })
-  if (!resp.ok || !resp.body) {
+  if (!resp.ok) {
     const bodyText = await resp.text().catch(() => '')
-    const err = new Error(`${request.label}: HTTP ${resp.status}: ${bodyText || resp.statusText}`)
+    const err = new StreamHTTPError(request.label, resp.status, bodyText, resp.statusText)
     // Special-case `duplicate_client_message` (HTTP 409, server's
     // idempotency check found the user row already persisted). The
     // request was accepted the first time; the SSE connection was
@@ -1876,6 +1883,16 @@ async function consumeStreamRequest(request: StreamRequest): Promise<void> {
     if (!request.signal?.aborted && request.onStreamDrop && shouldRetryStreamError(err)) {
       try {
         request.onStreamDrop({ lastSeq: -1, reason: `HTTP ${resp.status}` })
+      } catch { /* Drop reporting must not mask the transport error. */ }
+    }
+    throw err
+  }
+
+  if (!resp.body) {
+    const err = new Error(`${request.label}: response body missing`)
+    if (!request.signal?.aborted && request.onStreamDrop) {
+      try {
+        request.onStreamDrop({ lastSeq: -1, reason: 'response body missing' })
       } catch { /* Drop reporting must not mask the transport error. */ }
     }
     throw err

@@ -1,5 +1,7 @@
 import * as api from '../api/client'
 import { dataURLToBlobURL } from '../utils/mediaPreview'
+import { isRejectedMessageRequest } from '../api/sse'
+import { removeUnacceptedLocalTurn } from '../utils/rejectedTurn'
 import {
   appendLocalUserMessage,
   appendStreamEvent,
@@ -249,6 +251,9 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           void generateSessionTitle(sessionId, payload.message).catch(() => {})
         }
       } catch (e: any) {
+        if (isRejectedMessageRequest(e)) {
+          removeUnacceptedLocalTurn(state.sessionMessages[sessionId] || [], payload.client_msg_id)
+        }
         await failQueuedTurn(sessionId, item.id, e?.message || String(e))
         break
       }

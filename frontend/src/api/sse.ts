@@ -115,6 +115,7 @@ export function emitStreamEvent<T extends StreamEventLike>(
 }
 
 export function streamErrorStatus(error: unknown): number | null {
+  if (error instanceof StreamHTTPError) return error.status
   const message = String((error as any)?.message ?? error ?? '')
   const match = message.match(/\bHTTP\s+(\d{3})\b/)
   if (!match) return null
@@ -123,7 +124,41 @@ export function streamErrorStatus(error: unknown): number | null {
 }
 
 export function shouldRetryStreamError(error: unknown): boolean {
-  return streamErrorStatus(error) !== 409
+  const status = streamErrorStatus(error)
+  return status === null || status === 408 || status === 429 || status >= 500
+}
+
+// 非 2xx 的首个 HTTP 响应尚未进入 SSE；保留状态和服务端错误码以区别断流。
+// A non-2xx initial response has not entered SSE; preserve its status and server code separately from stream drops.
+export class StreamHTTPError extends Error {
+  readonly status: number
+  readonly code: string
+  readonly detail: string
+
+  constructor(label: string, status: number, body: string, statusText: string) {
+    let code = ''
+    let detail = body || statusText || `HTTP ${status}`
+    try {
+      const parsed: unknown = JSON.parse(body)
+      if (parsed && typeof parsed === 'object') {
+        const response = parsed as Record<string, unknown>
+        if (typeof response.code === 'string') code = response.code
+        if (typeof response.error === 'string' && response.error) detail = response.error
+      }
+    } catch { /* A proxy may return plain text instead of JSON. */ }
+    super(`${label}: HTTP ${status}: ${detail}`)
+    this.name = 'StreamHTTPError'
+    this.status = status
+    this.code = code
+    this.detail = detail
+  }
+}
+
+export function isRejectedMessageRequest(error: unknown): error is StreamHTTPError {
+  return error instanceof StreamHTTPError
+    && error.status >= 300 && error.status < 500
+    && error.status !== 408 && error.status !== 429
+    && !(error.status === 409 && error.code === 'duplicate_client_message')
 }
 
 // isDuplicateClientMessageError reports whether `error` is the
@@ -144,6 +179,7 @@ export function shouldRetryStreamError(error: unknown): boolean {
 export function isDuplicateClientMessageError(error: unknown): boolean {
   const status = streamErrorStatus(error)
   if (status !== 409) return false
+  if (error instanceof StreamHTTPError) return error.code === 'duplicate_client_message'
   const message = String((error as any)?.message ?? error ?? '')
   return message.includes('"duplicate_client_message"')
 }

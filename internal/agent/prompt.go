@@ -423,21 +423,17 @@ func buildConversationContinuitySection() string {
 	return sb.String()
 }
 
-// buildAttachmentsSection reminds the LLM that uploaded images
-// arrive as vision input in the user message (image_url content
-// parts), NOT as files on disk. The phrasing is deliberately
-// positive and language-neutral — earlier versions literally
-// primed the LLM with "ERROR: ... Inform the user" by name and
-// the model echoed that exact phrasing back to users.
+// buildAttachmentsSection 区分图片输入和文档引用，避免模型误认为已收到全文。
+// buildAttachmentsSection distinguishes image input from document references and bounded previews.
 func buildAttachmentsSection() string {
 	return "\n\n---\n\n## Uploaded Attachments\n\n" +
-		"User-uploaded images and files are sent directly inside the user message — " +
-		"images as image_url content parts (data URLs), text files as inline blocks. " +
-		"You can see them. Just answer based on their content.\n\n" +
-		"Do not call read_file on an uploaded image: it lives on disk as a temporary " +
-		"file, and read_file only handles text. If read_file returns a binary error, " +
-		"that is read_file's limitation, not a problem with the attachment — the image " +
-		"was already delivered to you through the user message. " +
+		"Uploaded images may arrive as image_url input or as recognition text, depending on the active model and session settings. " +
+		"Do not call read_file on an uploaded image.\n\n" +
+		"Uploaded text files, PDFs, and Office documents are identified by upload_id. " +
+		"The current turn includes a bounded preview of each readable document, not necessarily its full contents. " +
+		"Use read_attachment with the shown upload_id to read more; send at most 8 upload_ids per call and split larger sets into batches. " +
+		"When asked to remember or summarize multiple documents, account for every attachment separately and read beyond the preview as needed before claiming completion. " +
+		"If extraction failed or no text is available, say which document could not be read; do not claim to have memorized its contents or that no attachment was provided. " +
 		"Respond in the same language as the conversation.\n"
 }
 
