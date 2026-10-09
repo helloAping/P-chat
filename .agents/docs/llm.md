@@ -142,9 +142,11 @@ trace、UUID、雪花 ID 与时间戳展开 `ProviderConfig.CustomHeaders`。`Ch
 #### LLM 日志与 `PC_LLM_DEBUG`
 
 - 默认日志只记录 provider/model、token/字节计数、解析失败次数，以及异常 SSE 的长度和短 SHA-256 指纹；不记录请求消息、响应正文或原始 SSE payload。
+- Responses 流式请求额外记录 `[llm/responses/shape]` 结构摘要：`input` 项目数及消息／reasoning／函数调用／结果数量、原生与合成调用数量、`call_id` 配对计数、工具数量、安全的顶层参数存在性和短请求体指纹；不记录正文、参数／结果、调用 ID、工具名或模型名。此行与相邻请求共用 trace id，可用于区分多工具续轮的请求形状，不代表网关已接受请求。
 - 只有环境变量严格等于 `PC_LLM_DEBUG=1` 时，才记录前三个 SSE 事件和上游错误体的**有界预览**。预览仍统一脱敏 `api_key`、`Authorization`、`x-api-key`、Bearer/Basic 凭据、token、cookie、password、secret 与实例 capability；任何模式都不输出这些值。
 - malformed SSE 默认只写解析错误、长度和指纹；debug 模式额外写脱敏预览。脱敏覆盖 JSON 递归字段和文本 `Header: value` / `key=value` 形式：包括带厂商前缀且以 `api-key` / `api_key` / `token` / `secret` / `password` / `cookie` / `authorization` 结尾的名称（如 `X-Goog-Api-Key`）。proxy error 默认同样只写元数据，返回给调用方的错误文本不携带上游正文。
 - HTTP 非 2xx 错误保留状态码和响应体长度/指纹用于分类，默认错误链不携带上游正文；显式 debug 才把脱敏预览写入日志。
+- 网关把明确的 `Provider request failed: status=<上游状态码>` 包进 Responses SSE `server_error` 或 HTTP 5xx 时，分类器按该上游状态码处理：400 等永久错误停止阶梯重试，429/5xx 仍可重试；未知包装仍按原错误类型处理，错误正文继续省略。
 - debug 预览在凭据脱敏后仍可能含用户消息或模型回复，仅应在可信本机临时开启；复现结束后移除该环境变量，并在分享日志前再次人工检查。
 
 ### 5. 错误分类

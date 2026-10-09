@@ -48,3 +48,25 @@ func TestUpstreamHTTPErrorOmitsBody(t *testing.T) {
 		t.Fatalf("HTTP error lost classification metadata: %s", got)
 	}
 }
+
+func TestUpstreamHTTPErrorUsesExplicitNestedStatus(t *testing.T) {
+	t.Setenv("PC_LLM_DEBUG", "0")
+	for _, tc := range []struct {
+		body string
+		want ErrorKind
+	}{
+		{`{"error":{"message":"Provider request failed: status=400, body={\"model\":\"gpt-test\"}","api_key":"sk-secret"}}`, KindBadRequest},
+		{`{"error":"Provider request failed: status=429, body={}"}`, KindRateLimit},
+		{`{"error":"temporary gateway failure"}`, KindServer},
+	} {
+		err := upstreamHTTPError("openai", 502, []byte(tc.body))
+		if strings.Contains(err.Error(), "sk-secret") || strings.Contains(err.Error(), "gpt-test") {
+			t.Fatalf("error leaked gateway body: %s", err)
+		}
+		got := ClassifyAPIError("proxy", err)
+		apiErr, ok := got.(*APIError)
+		if !ok || apiErr.Kind != tc.want {
+			t.Fatalf("ClassifyAPIError(%q) = %v, want %v", tc.body, got, tc.want)
+		}
+	}
+}

@@ -467,6 +467,11 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		normalizedContextWindow(c.ContextWindow(p.name, model)),
 		len(req.Body),
 	)
+	if config.ProtocolIsOpenAIResponses(p.protocolForModel(model)) {
+		if shape, ok := responsesRequestShapeSummary(req.Body); ok {
+			log.Printf("%s[llm/responses/shape] %s", trace.LogPrefix(ctx), shape)
+		}
+	}
 
 	// Give this round its own cancellation path. The idle watchdog cancels the
 	// transport while the caller's context stays available to receive the

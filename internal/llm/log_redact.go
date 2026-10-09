@@ -136,6 +136,14 @@ func upstreamHTTPError(protocol string, status int, body []byte) error {
 			protocol, status, len(body), payloadFingerprint(body), redactedPayloadPreview(body, 2048))
 	}
 	summary := fmt.Sprintf("response body omitted (bytes=%d sha256=%s)", len(body), payloadFingerprint(body))
+	// 网关的 HTTP 5xx 可能只是上游 4xx 的包装；保留真实状态用于重试分类。
+	// A gateway HTTP 5xx may wrap an upstream 4xx; classify by the explicit inner status.
+	if status >= 500 {
+		if inner, ok := nestedProviderRequestStatus(string(body)); ok {
+			summary += fmt.Sprintf("; gateway_http_status=%d", status)
+			status = inner
+		}
+	}
 	if IsVisionUnsupportedError(fmt.Errorf("%s", string(body))) {
 		// 保留无正文的稳定标记，让既有分类器仍能识别视觉能力错误。
 		// Keep a body-free marker so the existing classifier still detects vision capability errors.

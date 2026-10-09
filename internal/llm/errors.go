@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -250,6 +251,16 @@ func newResponsesAPIError(providerName, errorType, code, message string) error {
 	if message == "" {
 		message = "OpenAI Responses request failed"
 	}
+	// 网关可能把上游的永久性 4xx 包装成可重试的 SSE server_error。
+	// A gateway may wrap a permanent upstream 4xx in a retryable SSE server_error.
+	if status, ok := nestedProviderRequestStatus(message); ok {
+		return ClassifyAPIError(providerName, &openai.APIError{
+			HTTPStatusCode: status,
+			Message:        "provider request failed",
+			Type:           errorType,
+			Code:           code,
+		})
+	}
 	if strings.TrimSpace(errorType) == "" {
 		errorType = code
 	}
@@ -258,6 +269,19 @@ func newResponsesAPIError(providerName, errorType, code, message string) error {
 		Type:    errorType,
 		Code:    code,
 	})
+}
+
+var providerRequestStatusRe = regexp.MustCompile(`(?i)provider request failed:\s*status=([45][0-9]{2})(?:\b|,)`)
+
+// nestedProviderRequestStatus 仅识别网关明确报告的上游 HTTP 状态。
+// nestedProviderRequestStatus accepts only an explicit upstream HTTP status from a gateway error.
+func nestedProviderRequestStatus(message string) (int, bool) {
+	match := providerRequestStatusRe.FindStringSubmatch(message)
+	if len(match) != 2 {
+		return 0, false
+	}
+	status, err := strconv.Atoi(match[1])
+	return status, err == nil
 }
 
 func isTransientProviderUnavailable(msg string) bool {

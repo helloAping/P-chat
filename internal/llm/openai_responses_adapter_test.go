@@ -268,6 +268,15 @@ func TestOpenAIResponsesParseStreamClassifiesProxyErrorEnvelope(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesParseStreamStopsRetryForNestedBadRequest(t *testing.T) {
+	stream := `data: {"error":{"message":"Provider request failed: status=400, body={\"model\":\"gpt-test\"}","type":"server_error","code":"PROVIDER_BAD_RESPONSE"}}` + "\n\n"
+	terminal := terminalResponsesChunk(t, collectResponsesChunks(t, stream))
+	var apiErr *APIError
+	if !errors.As(terminal.Err, &apiErr) || apiErr.Kind != KindBadRequest || apiErr.StatusCode != 400 || terminal.Done {
+		t.Fatalf("terminal = %#v, want non-retryable upstream 400", terminal)
+	}
+}
+
 func TestOpenAIResponsesParseStreamRejectsMalformedEvent(t *testing.T) {
 	stream := strings.Join([]string{
 		`data: {not-json}`,
