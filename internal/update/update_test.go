@@ -1,14 +1,29 @@
-package update
+﻿package update
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"testing"
 )
+
+// newTestService disables publisher-signature enforcement unless the test
+// explicitly sets RequireSignature. Production NewService still requires it.
+func newTestService(opts Options) *Service {
+	if opts.RequireSignature == nil {
+		v := false
+		opts.RequireSignature = &v
+	}
+	return NewService(opts)
+}
+
+func boolPtr(v bool) *bool { return &v }
 
 func TestCompareVersions(t *testing.T) {
 	tests := []struct {
@@ -77,7 +92,7 @@ func TestCheckSelectsInstallableFullZip(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := NewService(Options{
+	svc := newTestService(Options{
 		LatestURL: srv.URL + "/latest.json",
 		Platform:  "windows",
 		Arch:      "amd64",
@@ -138,7 +153,7 @@ func TestCheckPrefersPatchZipWhenAvailable(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := NewService(Options{
+	svc := newTestService(Options{
 		LatestURL: srv.URL + "/latest.json",
 		Platform:  "windows",
 		Arch:      "amd64",
@@ -161,13 +176,117 @@ func TestCheckPrefersPatchZipWhenAvailable(t *testing.T) {
 func TestCheck404MeansNoUpdate(t *testing.T) {
 	srv := httptest.NewServer(http.NotFoundHandler())
 	defer srv.Close()
-	svc := NewService(Options{LatestURL: srv.URL, Platform: "windows", Arch: "amd64"})
+	svc := newTestService(Options{LatestURL: srv.URL, Platform: "windows", Arch: "amd64"})
 	res, err := svc.Check(t.Context(), "1.0.12")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if res.HasUpdate {
 		t.Fatal("HasUpdate = true, want false")
+	}
+}
+
+func TestCheckRejectsPrereleaseFromStableChannel(t *testing.T) {
+	var sawIncludePrerelease bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawIncludePrerelease = r.URL.Query().Get("include_prerelease") == "1"
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"version":"1.0.13.beta","channel":"beta","full":{"kind":"full","url":"https://example.test/pchat-update.zip","sha256":"abc"}}`)
+	}))
+	defer srv.Close()
+
+	stable := newTestService(Options{LatestURL: srv.URL, Platform: "windows", Arch: "amd64"})
+	res, err := stable.Check(t.Context(), "1.0.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.HasUpdate || res.Latest != "" {
+		t.Fatalf("stable check exposed prerelease: %#v", res)
+	}
+	if sawIncludePrerelease {
+		t.Fatal("stable check unexpectedly requested prereleases")
+	}
+}
+
+func TestCheckIncludesOnlyBetaPrerelease(t *testing.T) {
+	var sawIncludePrerelease bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawIncludePrerelease = r.URL.Query().Get("include_prerelease") == "1"
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"version":"1.0.13.beta","channel":"beta","full":{"kind":"full","url":"https://example.test/pchat-update.zip","sha256":"abc"}}`)
+	}))
+	defer srv.Close()
+
+	svc := newTestService(Options{LatestURL: srv.URL, Platform: "windows", Arch: "amd64", IncludePrerelease: true})
+	res, err := svc.Check(t.Context(), "1.0.12")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sawIncludePrerelease {
+		t.Fatal("prerelease check did not request prereleases upstream")
+	}
+	if !res.HasUpdate || res.Latest != "1.0.13.beta" {
+		t.Fatalf("beta check result = %#v", res)
+	}
+}
+
+func TestAllowsLatestRejectsAlphaAndRC(t *testing.T) {
+	for _, latest := range []Latest{
+		{Version: "1.0.13.alpha", Channel: "alpha"},
+		{Version: "1.0.13.rc.1", Channel: "rc"},
+		{Version: "1.0.13.beta", Channel: "rc"},
+		{Version: "1.0.13.beta", Channel: "stable"},
+		{Version: "1.0.13.beta"},
+		{Version: "1.0.13", Channel: "beta"},
+		{Version: "1.0.13.preview", Channel: "stable"},
+	} {
+		if allowsLatest(latest, true) {
+			t.Fatalf("allowsLatest(%#v, true) = true, want false", latest)
+		}
+	}
+}
+
+func TestDownloadRejectsChangedExpectedVersion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"version":"1.0.14","channel":"stable","full":{"kind":"full","url":"https://example.test/pchat-update.zip","sha256":"abc"}}`)
+	}))
+	defer srv.Close()
+
+	svc := newTestService(Options{LatestURL: srv.URL, Platform: "windows", Arch: "amd64"})
+	_, err := svc.Download(t.Context(), "1.0.12", "1.0.13")
+	if !errors.Is(err, ErrExpectedVersionChanged) {
+		t.Fatalf("Download error = %v, want ErrExpectedVersionChanged", err)
+	}
+}
+
+func TestDownloadBetaWithExpectedVersion(t *testing.T) {
+	pkg := []byte("beta zip payload")
+	sum := sha256Hex(pkg)
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest.json":
+			if r.URL.Query().Get("include_prerelease") != "1" {
+				t.Error("beta download did not request prerelease metadata")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"version":"1.0.13.beta","channel":"beta","full":{"kind":"full","size":%d,"sha256":%q,"url":%q}}`, len(pkg), sum, srv.URL+"/pchat-update-windows-amd64-v1.0.13.beta.zip")
+		case "/pchat-update-windows-amd64-v1.0.13.beta.zip":
+			_, _ = w.Write(pkg)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64", DownloadDir: t.TempDir(), IncludePrerelease: true})
+	got, err := svc.Download(t.Context(), "1.0.12", "1.0.13.beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Latest != "1.0.13.beta" || got.Channel != "beta" || got.SHA256 != sum || got.DownloadPath == "" {
+		t.Fatalf("beta download = %#v", got)
 	}
 }
 
@@ -199,8 +318,8 @@ func TestDownloadVerifiesSHAAndWritesFile(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64", DownloadDir: dir})
-	got, err := svc.Download(t.Context(), "1.0.12")
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64", DownloadDir: dir})
+	got, err := svc.Download(t.Context(), "1.0.12", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,8 +359,8 @@ func TestDownloadRejectsHashMismatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64", DownloadDir: t.TempDir()})
-	if _, err := svc.Download(t.Context(), "1.0.12"); err == nil {
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64", DownloadDir: t.TempDir()})
+	if _, err := svc.Download(t.Context(), "1.0.12", ""); err == nil {
 		t.Fatal("expected hash mismatch error")
 	}
 }
@@ -274,7 +393,7 @@ func checkWithPatchFloor(t *testing.T, currentVersion, patchFrom string) *CheckR
 		fmt.Fprint(w, latestJSONFixture(srv, patchFrom))
 	}))
 	t.Cleanup(srv.Close)
-	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
 	res, err := svc.Check(t.Context(), currentVersion)
 	if err != nil {
 		t.Fatal(err)
@@ -287,7 +406,7 @@ func checkWithPatchFloor(t *testing.T, currentVersion, patchFrom string) *CheckR
 
 // TestCheckPatchFromVersionCoversBeta is the regression test for the
 // 2026-09-25 report: a beta build (1.0.13-beta.1) must be allowed to use
-// a patch whose floor is from_version=1.0.0 — pre-release ordering still
+// a patch whose floor is from_version=1.0.0 鈥?pre-release ordering still
 // sorts 1.0.13-beta.1 above 1.0.0.
 func TestCheckPatchFromVersionCoversBeta(t *testing.T) {
 	res := checkWithPatchFloor(t, "1.0.13-beta.1", "1.0.0")
@@ -343,7 +462,7 @@ func TestCheckRetriesTransientServerError(t *testing.T) {
 		fmt.Fprint(w, latestJSONFixture(srv, "1.0.0"))
 	}))
 	defer srv.Close()
-	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
 	res, err := svc.Check(t.Context(), "1.0.12")
 	if err != nil {
 		t.Fatal(err)
@@ -365,7 +484,7 @@ func TestCheckDoesNotRetryClientError(t *testing.T) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 	}))
 	defer srv.Close()
-	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
 	if _, err := svc.Check(t.Context(), "1.0.12"); err == nil {
 		t.Fatal("expected error for 400 response")
 	}
@@ -383,7 +502,7 @@ func TestCheck404DoesNotRetry(t *testing.T) {
 		http.NotFound(w, r)
 	}))
 	defer srv.Close()
-	svc := NewService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
 	res, err := svc.Check(t.Context(), "1.0.12")
 	if err != nil {
 		t.Fatal(err)
@@ -393,5 +512,94 @@ func TestCheck404DoesNotRetry(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("calls = %d, want 1 (no retry on 404)", calls)
+	}
+}
+
+func TestRequireSecureURL(t *testing.T) {
+	if err := requireSecureURL("https://www.08ms.cn/software/p-chat/latest.json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireSecureURL("http://127.0.0.1:9/latest.json"); err != nil {
+		t.Fatal(err)
+	}
+	if err := requireSecureURL("http://www.08ms.cn/software/p-chat/latest.json"); err == nil {
+		t.Fatal("expected non-loopback http to fail")
+	}
+}
+
+func TestDownloadRequiresPublisherSignature(t *testing.T) {
+	pkg := []byte("signed zip")
+	sum := sha256Hex(pkg)
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig, err := SignArtifact(priv, sum, "1.0.13", "full")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest.json":
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"version":"1.0.13","channel":"stable","full":{"kind":"full","size":%d,"sha256":%q,"url":%q,"signature":%q}}`,
+				len(pkg), sum, srv.URL+"/pchat-update.zip", sig)
+		case "/pchat-update.zip":
+			_, _ = w.Write(pkg)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	unsigned := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/latest.json":
+			fmt.Fprintf(w, `{"version":"1.0.13","channel":"stable","full":{"kind":"full","size":%d,"sha256":%q,"url":%q}}`,
+				len(pkg), sum, srv.URL+"/pchat-update.zip")
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer unsigned.Close()
+	bad := NewService(Options{
+		LatestURL:        unsigned.URL + "/latest.json",
+		Platform:         "windows",
+		Arch:             "amd64",
+		DownloadDir:      t.TempDir(),
+		PublicKey:        pub,
+		RequireSignature: boolPtr(true),
+	})
+	if _, err := bad.Download(t.Context(), "1.0.12", ""); !errors.Is(err, ErrMissingSignature) {
+		t.Fatalf("unsigned download err = %v, want ErrMissingSignature", err)
+	}
+
+	ok := NewService(Options{
+		LatestURL:        srv.URL + "/latest.json",
+		Platform:         "windows",
+		Arch:             "amd64",
+		DownloadDir:      t.TempDir(),
+		PublicKey:        pub,
+		RequireSignature: boolPtr(true),
+	})
+	got, err := ok.Download(t.Context(), "1.0.12", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SHA256 != sum {
+		t.Fatalf("sha256 = %q", got.SHA256)
+	}
+}
+
+func TestCheckRejectsNonHTTPSLatestURL(t *testing.T) {
+	svc := NewService(Options{
+		LatestURL:        "http://example.com/latest.json",
+		Platform:         "windows",
+		Arch:             "amd64",
+		RequireSignature: boolPtr(false),
+	})
+	if _, err := svc.Check(t.Context(), "1.0.12"); err == nil {
+		t.Fatal("expected https enforcement error")
 	}
 }

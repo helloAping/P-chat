@@ -53,7 +53,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | **前端样式 / 设计 token / 主界面视觉** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md)（**已锁定 Project-Aware Calm Workbench，见 §0.5**） |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
 | 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
-| **IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [`.agents/docs/im.md`](docs/im.md) + [实现计划 `docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
 | 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](../README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
 
@@ -100,7 +99,6 @@ D:\develop\project\P-chat\
 │   │   ├── frontend-design.md  #   设计 token + Calm Workbench 视觉规范（§0.5 已锁定）
 │   │   ├── infrastructure.md   #   基础设施模块
 │   │   ├── knowledge.md        #   知识库 / RAG
-│   │   ├── im.md               #   IM 桥接
 │   │   ├── versioning.md       #   版本与 SQLite schema 迁移
 │   │   └── upgrade.md          #   用户数据目录结构升级
 │   └── scripts/
@@ -126,7 +124,6 @@ D:\develop\project\P-chat\
 │   ├── cli/                    # 终端 REPL + ChatUI
 │   ├── browser/                # 浏览器扩展连接 + browser_* 工具
 │   ├── export/                 # 会话导出 HTML/PDF/text
-│   ├── im/                     # IM Gateway / adapter / renderer
 │   ├── search/                 # web_search provider
 │   ├── recall/                 # 知识库多 query 召回与重排
 │   ├── sandbox/                # 命令/文件安全检查
@@ -389,8 +386,6 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 数据库 CRUD | `internal/memory/memory.go` |
 | `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
 | **Skill 发现/安装/加载** | `internal/skill/manager.go`（唯一 Manager 边界）+ `internal/tool/skill_tools.go`（`skill` / `skill_manage`）+ `internal/agent/skills.go`（显式生命周期） |
-| **IM Gateway 入口** | [`.agents/docs/im.md`](docs/im.md) + [`docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
-| **IM 配置文件 schema** | `internal/config/im_config.go`（落地后）`IMConfig` |
 | sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |
 | 大 tool 结果截断 + 有界缓存 | `internal/agent/agent.go`（`MaxToolResultFullBytes`）+ `internal/agent/tool_result_cache.go` |
 | cancel-stream / tool-result 端点 | `internal/server/messages.go` + `server.go` |

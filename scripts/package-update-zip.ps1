@@ -129,21 +129,54 @@ function Get-SHA256Hex {
     }
 }
 
+function Get-UpdateSignature {
+    param(
+        [Parameter(Mandatory = $true)][string]$Sha256,
+        [Parameter(Mandatory = $true)][string]$Kind
+    )
+    $key = [string]$env:PCHAT_UPDATE_SIGNING_KEY
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        return ""
+    }
+    $signTool = Join-Path $root "bin\pchat-updatesign.exe"
+    $args = @("--sha256", $Sha256, "--version", $version, "--kind", $Kind)
+    if (Test-Path -LiteralPath $signTool) {
+        $sig = (& $signTool @args 2>$null | Out-String).Trim()
+    } else {
+        Push-Location $root
+        try {
+            $sig = (& go run ./cmd/pchat-updatesign @args 2>$null | Out-String).Trim()
+        } finally {
+            Pop-Location
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($sig)) {
+        throw "Failed to sign update artifact (kind=$Kind). Check PCHAT_UPDATE_SIGNING_KEY."
+    }
+    return $sig
+}
+
 function New-ArtifactEntry {
     param(
         [Parameter(Mandatory = $true)][string]$Kind,
         [Parameter(Mandatory = $true)][string]$Path
     )
     $file = Get-Item -LiteralPath $Path
-    return [ordered]@{
+    $sha = Get-SHA256Hex -Path $file.FullName
+    $entry = [ordered]@{
         kind     = $Kind
         platform = $packagePlatform
         arch     = $Arch
         version  = $version
         file     = $file.Name
         size     = $file.Length
-        sha256   = Get-SHA256Hex -Path $file.FullName
+        sha256   = $sha
     }
+    $sig = Get-UpdateSignature -Sha256 $sha -Kind $Kind
+    if ($sig) {
+        $entry["signature"] = $sig
+    }
+    return $entry
 }
 
 function Find-FirstExisting {
@@ -323,6 +356,17 @@ $createdAtUTC = (Get-Date).ToUniversalTime().ToString("s") + "Z"
 $updateURL = "<upload-url>/" + $updateArtifact.file
 $primaryArtifact = if ($setupArtifact) { $setupArtifact } else { $updateArtifact }
 $primaryURL = "<upload-url>/" + $primaryArtifact.file
+$patchEntry = [ordered]@{
+    kind     = "patch"
+    platform = $packagePlatform
+    arch     = $Arch
+    size     = $updateArtifact.size
+    sha256   = $updateArtifact.sha256
+    url      = $updateURL
+}
+if ($updateArtifact.signature) {
+    $patchEntry["signature"] = $updateArtifact.signature
+}
 $latestJson = [ordered]@{
     name          = "P-Chat"
     slug          = "p-chat"
@@ -335,17 +379,13 @@ $latestJson = [ordered]@{
     size          = $primaryArtifact.size
     sha256        = $primaryArtifact.sha256
     url           = $primaryURL
-    patch         = [ordered]@{
-        kind     = "patch"
-        platform = $packagePlatform
-        arch     = $Arch
-        size     = $updateArtifact.size
-        sha256   = $updateArtifact.sha256
-        url      = $updateURL
-    }
+    patch         = $patchEntry
+}
+if ($primaryArtifact.signature) {
+    $latestJson["signature"] = $primaryArtifact.signature
 }
 if ($setupArtifact) {
-    $latestJson["full"] = [ordered]@{
+    $fullEntry = [ordered]@{
         kind     = "full"
         platform = $packagePlatform
         arch     = $Arch
@@ -353,6 +393,13 @@ if ($setupArtifact) {
         sha256   = $setupArtifact.sha256
         url      = "<upload-url>/" + $setupArtifact.file
     }
+    if ($setupArtifact.signature) {
+        $fullEntry["signature"] = $setupArtifact.signature
+    }
+    $latestJson["full"] = $fullEntry
+}
+if (-not $env:PCHAT_UPDATE_SIGNING_KEY) {
+    Write-Host "[package-update-zip] WARNING: PCHAT_UPDATE_SIGNING_KEY unset; latest.json has no signatures and clients will reject downloads" -ForegroundColor Yellow
 }
 Write-JsonNoBom -Value $latestJson -Path $latestJsonPath
 

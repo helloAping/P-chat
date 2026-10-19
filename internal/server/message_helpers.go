@@ -1286,7 +1286,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 	}
 	return SessionResponse{
 		ID:                             cv.ID,
-		Title:                          imConversationResponseTitle(cv.ID, cv.Title),
+		Title:                          legacyIMConversationResponseTitle(cv.ID, cv.Title),
 		Provider:                       provider,
 		Model:                          model,
 		Style:                          m.Style,

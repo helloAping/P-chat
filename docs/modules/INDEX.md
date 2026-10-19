@@ -19,7 +19,6 @@
 | 修改配置管理（providers/models） | [config.md](config.md) | llm.md |
 | 修改知识库系统（扫描/搜索/三层索引） | [../../.agents/docs/knowledge.md](../../.agents/docs/knowledge.md) | server.md, tool.md, frontend.md |
 | 修改浏览器控制（扩展/标签页/截图/权限策略） | [server.md](server.md) | frontend.md, tool.md, [结构总览](../project-structure.md) |
-| 修改 IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway） | [../../.agents/docs/im.md](../../.agents/docs/im.md) | server.md, config.md, [实现计划](../plans/im-bridge-plan.md) |
 | 修改 CLI 终端界面 (REPL) | [cli.md](cli.md) | server.md, agent.md |
 | 修改沙箱/安全检查 | [sandbox.md](infrastructure.md#沙箱-sandbox) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
@@ -50,7 +49,6 @@ P-Chat 项目
 │   ├── config/       → 请读 [config.md](config.md)
 │   ├── cli/          → 请读 [cli.md](cli.md)
 │   ├── browser/      → 浏览器控制，先读 [server.md](server.md)
-│   ├── im/           → IM 桥接，先读 [../../.agents/docs/im.md](../../.agents/docs/im.md)
 │   ├── export/       → 会话导出，先读 [server.md](server.md)
 │   ├── update/       → 自动更新，先读 [server.md](server.md)
 │   ├── repair/       → 修复命令，先读对应 cmd 入口和源码

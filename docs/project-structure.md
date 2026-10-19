@@ -10,7 +10,7 @@
 | --- | --- | --- | --- |
 | `cmd/` | Go 入口 | CLI、HTTP server、Wails GUI、安装器、更新器等可执行入口 | 只放启动编排和平台壳逻辑，业务逻辑下沉到 `internal/` |
 | `frontend/` | Vue SPA | GUI / 浏览器模式共用前端源码 | Wails 配置通过 `cmd/pchat-gui/wails.json` 指向这里 |
-| `internal/` | Go 业务包 | Agent、LLM、server、工具、记忆、知识库、IM、浏览器控制等核心实现 | 新功能默认先在这里找归属模块 |
+| `internal/` | Go 业务包 | Agent、LLM、server、工具、记忆、知识库、浏览器控制等核心实现 | 新功能默认先在这里找归属模块 |
 | `browser-extension/` | 浏览器扩展源码 | Chrome / Edge 扩展桥接真实浏览器 | 打包后复制到 `cmd/pchat-server/browser-extension.zip` 和 `bin/` |
 | `configs/` | 默认配置模板 | 首次运行或迁移时参考的配置样例 | 用户运行时配置在数据目录，不在这里直接写密钥 |
 | `scripts/` | 构建/打包脚本 | 前端同步、Wails 构建、安装包、更新包、冒烟测试 | Taskfile 多数任务调用这里的脚本 |
@@ -29,7 +29,7 @@
 | 入口 | 输出 | 职责 |
 | --- | --- | --- |
 | `cmd/pchat/` | `pchat.exe` | CLI REPL 和只读命令入口；启动时可拉起同目录 server |
-| `cmd/pchat-server/` | `pchat-server.exe` | Gin HTTP API、SSE、静态 web、browser WS、IM webhook |
+| `cmd/pchat-server/` | `pchat-server.exe` | Gin HTTP API、SSE、静态 web、browser WS |
 | `cmd/pchat-gui/` | `pchat-gui.exe` | Wails 桌面壳；启动/托管 `pchat-server.exe` 子进程 |
 | `cmd/pchat-installer/` | `pchat-setup-v*.exe` | Windows 单文件安装器，释放 GUI/server/CLI/updater/web |
 | `cmd/pchat-updater/` | `pchat-updater.exe` | 自动更新时重启后替换文件 |
@@ -43,7 +43,7 @@
 | --- | --- | --- | --- |
 | Agent 循环 | `internal/agent/` | ReAct 轮次、工具派发、auto-continue、parts 累加、图片附件上下文 | `.agents/docs/agent.md` |
 | LLM 适配 | `internal/llm/` | OpenAI 兼容 / Anthropic 协议、SSE parser、错误分类、token 估算、统一日志脱敏 | `.agents/docs/llm.md` |
-| HTTP Server | `internal/server/` | REST API、SSE 写循环、会话、上传、配置、browser/IM/MCP 与 diagnostics 路由 | `.agents/docs/server.md` |
+| HTTP Server | `internal/server/` | REST API、SSE 写循环、会话、上传、配置、browser/MCP 与 diagnostics 路由 | `.agents/docs/server.md` |
 | 持久化 | `internal/memory/` | SQLite 会话、消息、metadata、摘要、todo、subagent job、schema 迁移 | `.agents/docs/memory.md` |
 | 工具系统 | `internal/tool/` | 内置工具、确认、问题、图片识别、PDF/DOCX、动态工具桥接 | `.agents/docs/tool.md` |
 | 子代理 | `internal/subagent/` | `task` 工具、同步/异步子代理、工具隔离、后台 job | `.agents/docs/subagent.md` |
@@ -56,7 +56,6 @@
 | Recall | `internal/recall/` | 多库召回、查询分解、合并重排、注入 Agent 上下文 | `.agents/docs/knowledge.md` |
 | 搜索 | `internal/search/` | `web_search` provider、配额、Tavily / OpenAI 兼容接口 | `.agents/docs/tool.md` |
 | 浏览器控制 | `internal/browser/` + `browser-extension/` | 扩展连接、标签页、截图、页面操作、域名权限策略、evaluate 三态只读闸门 | `README.md` 浏览器控制章节 |
-| IM 桥接 | `internal/im/` | Gateway、Adapter、飞书、微信 QR/长轮询、出站切分 | `.agents/docs/im.md` |
 | MCP | `internal/mcp/` | MCP server 管理、stdio/SSE transport、工具发现基础 | `.agents/docs/infrastructure.md` |
 | 导出 | `internal/export/` | 会话导出 HTML/PDF/text 与清洗 | `internal/server/export.go` |
 | 风格生成 | `internal/stylegen/` | 根据当前对话生成/优化人格风格 | `docs/plans/stylegen-plan.md` |
@@ -67,7 +66,7 @@
 
 | 模块 | 位置 | 职责 |
 | --- | --- | --- |
-| 配置 | `internal/config/` | `config.json` 加载、迁移、系统配置、IM/知识库/search 子配置 |
+| 配置 | `internal/config/` | `config.json` 加载、迁移、系统配置、知识库/search 子配置 |
 | CLI | `internal/cli/` | REPL、斜杠命令、HTTP+SSE 客户端交互 |
 | HTTP CLI | `internal/httpcli/` | CLI 到 server 的 REST/SSE client |
 | 项目 | `internal/project/` | 项目注册、项目级配置/AGENTS/rules/skills 根路径 |
@@ -91,8 +90,8 @@
 | `frontend/src/api/sse.ts` | SSE frame parser |
 | `frontend/src/api/update.ts` | 自动更新 API client |
 | `frontend/src/stores/chat.ts` | Pinia 主 store：会话、消息、parts、流状态、todo、工具确认 |
-| `frontend/src/components/` | 聊天窗口、输入区、设置、工具卡、子代理卡、知识库、IM、浏览器等组件 |
-| `frontend/src/im/` | IM 设置页辅助逻辑，如 session source、微信 QR 状态 |
+| `frontend/src/components/` | 聊天窗口、输入区、设置、工具卡、子代理卡、知识库、浏览器等组件 |
+| `frontend/src/im/` | 旧 IM 会话来源标识与标题兼容显示 |
 | `frontend/src/composables/` | Vue composable |
 | `frontend/src/utils/` | Markdown cache、通知、格式化等通用工具 |
 | `frontend/src/assets/` | 字体和静态资源 |
@@ -135,16 +134,6 @@ Chrome/Edge 扩展连接 /api/v1/browser/ws
   -> 截图走 CallResultImage 双通道：给 LLM 看，也给 GUI 渲染
 ```
 
-### 5.4 IM 桥接流
-
-```
-平台 webhook / adapter
-  -> internal/im PlanInbound 做鉴权、mention、session、persona、工具白名单
-  -> Gateway 调用 agent.ChatWithTools
-  -> outbound renderer 按平台方言发送文本或流式更新
-  -> GUI IMSettings 读取健康状态、配置和事件流
-```
-
 ## 6. 功能状态口径
 
 | 能力 | 当前状态 | 说明 |
@@ -157,7 +146,6 @@ Chrome/Edge 扩展连接 /api/v1/browser/ws
 | 子代理 | 已落地 / 持续增强 | 同步/异步 `task`、后台 job、父级授权隔离、部分结果返回 |
 | 知识库 | 已落地 | 三层索引、混合检索、多库重排、引用解释、增量扫描 |
 | 浏览器控制 | 已落地 | 扩展连接、15 个工具、多 tab、权限策略、evaluate 三态 fail-closed、E2E 测试 |
-| IM 桥接 | 实验中 / 部分可用 | Gateway、飞书、微信 QR/长轮询、出站切分和 GUI 设置入口已有，跨平台完善仍在推进 |
 | MCP | 基础可用 / 待增强 | 管理入口已有，统一工具确认和诊断体验仍需收口 |
 | 导出与更新 | 已落地一部分 | 会话导出、版本检查、下载、安装器/更新器脚本已有 |
 | 沙箱 | 基础可用 / 待增强 | 命令/写文件/浏览器域名与 evaluate 硬闸门已接入，Docker runner 和策略可视化待推进 |

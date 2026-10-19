@@ -87,12 +87,13 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 
 // UpdateProviderRequest is the body of PATCH /api/v1/providers/:name.
 //
-// Every field is optional. To set a field, include it with a
-// non-zero / non-empty value. Fields you omit are left
-// untouched on disk. To explicitly clear the API key, send
-// `{"api_key": ""}` and the server will write ""; the regular
-// "omit means leave alone" rule still applies to the other
-// fields.
+// Every field is optional. Fields you omit are left untouched on
+// disk. API key follows the Secret Redaction Contract (same as
+// web_search): omit = keep, clear_api_key=true = clear, non-empty
+// api_key = replace. An empty api_key without clear_api_key is
+// ignored (keep). custom_headers: nil = keep, empty map = clear
+// all, non-empty map replaces the key set; empty values keep the
+// previously stored value for that header name when present.
 type UpdateProviderRequest struct {
 	Name            string             `json:"name,omitempty"`
 	ProviderID      string             `json:"provider_id,omitempty"`
@@ -101,6 +102,7 @@ type UpdateProviderRequest struct {
 	BaseURL         string             `json:"base_url,omitempty"`
 	APIURL          string             `json:"api_url,omitempty"` // pre-V12 compatibility
 	APIKey          *string            `json:"api_key,omitempty"`
+	ClearAPIKey     bool               `json:"clear_api_key,omitempty"`
 	CustomHeaders   *map[string]string `json:"custom_headers,omitempty"`
 	// SetDefault, when true, makes this provider the global
 	// default. False is a no-op (the UI can always include
@@ -130,10 +132,8 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		return
 	}
 	apiKey := ""
-	clearAPIKey := false
 	if req.APIKey != nil {
-		apiKey = *req.APIKey
-		clearAPIKey = apiKey == ""
+		apiKey = strings.TrimSpace(*req.APIKey)
 	}
 	updated, err := config.UpdateProviderAt(h.configPath, oldName, config.ProviderPatch{
 		Name:            req.Name,
@@ -143,7 +143,7 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		APIURL:          req.APIURL,
 		BaseURL:         req.BaseURL,
 		APIKey:          apiKey,
-		ClearAPIKey:     clearAPIKey,
+		ClearAPIKey:     req.ClearAPIKey,
 		CustomHeaders:   req.CustomHeaders,
 		IsDefault:       req.SetDefault,
 	})
@@ -165,21 +165,10 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		return
 	}
 	h.reloadAfterConfigChange()
-	// Return the full ProviderFull shape so the UI can re-render
-	// without a follow-up GET. Use the *new* name (which may
-	// differ from oldName when the user renamed the provider).
-	c.JSON(http.StatusOK, ProviderFull{
-		Name:            updated.Name,
-		ProviderID:      updated.GetProviderID(),
-		StrategyVariant: updated.GetStrategyVariant(),
-		Protocol:        updated.GetProtocol(),
-		BaseURL:         updated.EffectiveBaseURL(),
-		APIKey:          updated.APIKey,
-		CustomHeaders:   updated.CustomHeaders,
-		IsDefault:       updated.Name == h.getCfg().LLM.Default,
-		Models:          updated.AllModels(),
-		Model:           updated.EffectiveModel(),
-	})
+	// Return the redacted ProviderFull shape so the UI can
+	// re-render without a follow-up GET. Use the *new* name
+	// (which may differ from oldName on rename).
+	c.JSON(http.StatusOK, providerFullFrom(*updated, updated.Name == h.getCfg().LLM.Default))
 }
 
 // SetDefaultProviderRequest is the body of POST /api/v1/providers/:name/default.

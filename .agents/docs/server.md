@@ -15,10 +15,10 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 `GET /api/v1/health` 成功响应包含 `status`、`profile_id`、`profile_name`、`instance_id`、`pid`。新增启动器或客户端不得只检查 `status=ok` 就认领一个动态端口。
 
 若以 `pchat-server --config <path>` 启动，构造器将该 path 保存在 `Server` 与 `Handler`。
-Provider/Model、系统配置、Web Search、IM、Browser、MCP 与知识库的写入及热重载都使用这条
+Provider/Model、系统配置、Web Search、Browser、MCP 与知识库的写入及热重载都使用这条
 活动路径，避免错误写回 `~/.p-chat/config.json`。custom 文件通过 raw JSON overlay 编辑器只写
 显式修改字段；数组型集合在增删时写入完整有效数组，集合外未修改及未知字段继续继承。
-完整替换的集合按当前 schema 重写；`im.personas.default` 缺失时会由配置归一化补回。
+完整替换的集合按当前 schema 重写。
 
 ## 文件结构
 
@@ -31,11 +31,12 @@ Provider/Model、系统配置、Web Search、IM、Browser、MCP 与知识库的�
 | `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
 | `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
-| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe / 连接测试 | `FetchUpstreamModels`, `ProbeUpstreamModels`, `TestProvider` |
+| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe / 连接测试；读侧 Secret 脱敏（`has_api_key`，headers 值清空） | `FetchUpstreamModels`, `ProbeUpstreamModels`, `TestProvider`, `providerFullFrom` |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
 | `command_api.go` | Web 斜杠命令与会话规则/AGENTS.md 诊断接口 | `RunCommand()`, `ListSessionRules()`, `GetSessionAgents()` |
 | `tool_api.go` | P3-2 工具列表端点 | `ListTools()` |
+| `update_api.go` | 更新检查与下载；稳定版/Beta 渠道和预期版本校验 | `CheckUpdate()`, `DownloadUpdate()` |
 | `upload.go` | 文件上传/下载 | |
 | `dialog.go` | 本地文件选择对话框 | |
 | `helpers.go` | 辅助函数 | |
@@ -43,6 +44,12 @@ Provider/Model、系统配置、Web Search、IM、Browser、MCP 与知识库的�
 ## 核心 API 路由
 
 详见 `server.go:86-167`，所有路由以 `/api/v1` 为前缀。
+
+### 稳定版与 Beta 更新
+
+`GET /updates/check` 默认只接受稳定版；传 `include_prerelease=1` 时允许稳定版和 `.beta`。`POST /updates/download` 的 JSON body 可传 `include_prerelease` 与 `expected_version`，后端在同一渠道重查；若最新版本与界面展示的不一致，返回 409。`internal/update` 同时校验 `latest.json` 的版本后缀和 `channel`，拒绝不一致的元数据。发布站需对 `include_prerelease=1` 返回稳定版/Beta 中最高的可用版本，客户端无法从单份稳定版元数据推断未返回的 Beta。
+
+SEC-05：默认元数据地址为 `https://www.08ms.cn/software/p-chat/latest.json`；非 loopback 的 `http://` 元数据/产物 URL 一律拒绝。下载前校验 artifact `sha256` 与 ed25519 `signature`（载荷 `pchat-update-v1\n{sha256}\n{version}\n{kind}\n`，公钥见 `internal/update.DefaultUpdatePublicKeyBase64`）。打包时设置 `PCHAT_UPDATE_SIGNING_KEY` 并由 `cmd/pchat-updatesign` / `scripts/package-update-zip.ps1` 写入签名；`pchat-updater` 无 `--expected-sha256` 时拒绝安装（仅 `--allow-insecure` 可跳过）。本地排障可设 `PCHAT_UPDATE_REQUIRE_SIGNATURE=0`。
 
 ### Provider / Model 连接测试
 

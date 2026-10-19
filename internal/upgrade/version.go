@@ -89,7 +89,10 @@ const (
 	// conversation before their first message is submitted.
 	V17 AppVersion = 17
 
+	// V18 — retire IM configuration from the managed global config file.
+	V18 AppVersion = 18
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V17
+	Current AppVersion = V18
 )

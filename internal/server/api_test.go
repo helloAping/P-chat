@@ -674,9 +674,10 @@ func TestUpdateProvider_PatchBaseURL(t *testing.T) {
 		t.Fatalf("status = %d, want 200", r.StatusCode)
 	}
 	var body struct {
-		Name    string `json:"name"`
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
+		Name      string `json:"name"`
+		BaseURL   string `json:"base_url"`
+		HasAPIKey bool   `json:"has_api_key"`
+		APIKey    string `json:"api_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		t.Fatal(err)
@@ -684,8 +685,11 @@ func TestUpdateProvider_PatchBaseURL(t *testing.T) {
 	if body.BaseURL != "http://new.example.com/v1" {
 		t.Errorf("base_url = %q", body.BaseURL)
 	}
-	if body.APIKey == "" {
-		t.Error("api_key must be preserved on partial patch")
+	if !body.HasAPIKey {
+		t.Error("has_api_key must remain true on partial patch")
+	}
+	if body.APIKey != "" {
+		t.Error("api_key plaintext must not appear in PATCH response")
 	}
 }
 
@@ -714,8 +718,12 @@ func TestProviderCustomHeadersCRUD(t *testing.T) {
 	if err := json.NewDecoder(get.Body).Decode(&provider); err != nil {
 		t.Fatal(err)
 	}
-	if provider.CustomHeaders["x-opencode-session"] != "{{conversation_id}}" {
-		t.Fatalf("custom_headers = %#v", provider.CustomHeaders)
+	// Read side redacts values; names remain so the UI can list configured headers.
+	if _, ok := provider.CustomHeaders["x-opencode-session"]; !ok {
+		t.Fatalf("custom_headers missing name: %#v", provider.CustomHeaders)
+	}
+	if provider.CustomHeaders["x-opencode-session"] != "" {
+		t.Fatalf("custom_headers value must be redacted: %#v", provider.CustomHeaders)
 	}
 
 	clearReq, _ := http.NewRequest(http.MethodPatch, srv.URL+"/api/v1/providers/headers", strings.NewReader(`{"custom_headers":{}}`))

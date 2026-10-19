@@ -431,7 +431,7 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 
 ### 3.3b `.settings-collapse` — 设置页收缩面板
 
-**用途**：应用设置里所有 `NCollapse`（系统 / 网络搜索 / 知识库 / IM / 诊断）。
+**用途**：应用设置里所有 `NCollapse`（系统 / 网络搜索 / 知识库 / 诊断）。
 
 **结构**：
 ```html

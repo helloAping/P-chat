@@ -30,6 +30,7 @@ type options struct {
 	launch         string
 	logPath        string
 	expectedSHA256 string
+	allowInsecure  bool
 	parentPID      int
 	waitTimeout    time.Duration
 }
@@ -64,6 +65,7 @@ func parseFlags(args []string) (options, error) {
 	fs.StringVar(&opts.launch, "launch", "", "binary to launch after update")
 	fs.StringVar(&opts.logPath, "log", "", "update log path")
 	fs.StringVar(&opts.expectedSHA256, "expected-sha256", "", "expected update zip SHA-256")
+	fs.BoolVar(&opts.allowInsecure, "allow-insecure", false, "allow applying a package without expected SHA-256 (dangerous)")
 	fs.IntVar(&opts.parentPID, "parent-pid", 0, "parent GUI process id")
 	if err := fs.Parse(args); err != nil {
 		return options{}, err
@@ -111,7 +113,7 @@ func run(opts options, logger *log.Logger) error {
 	if !strings.EqualFold(filepath.Ext(packagePath), ".zip") {
 		return fmt.Errorf("update package must be a zip file: %s", packagePath)
 	}
-	if err := verifyPackageHash(packagePath, opts.expectedSHA256); err != nil {
+	if err := verifyPackageHash(packagePath, opts.expectedSHA256, opts.allowInsecure); err != nil {
 		return err
 	}
 	if opts.parentPID > 0 {
@@ -131,10 +133,13 @@ func run(opts options, logger *log.Logger) error {
 	return nil
 }
 
-func verifyPackageHash(packagePath string, expected string) error {
+func verifyPackageHash(packagePath string, expected string, allowInsecure bool) error {
 	expected = strings.ToLower(strings.TrimSpace(expected))
 	if expected == "" {
-		return nil
+		if allowInsecure {
+			return nil
+		}
+		return errors.New("refusing to apply update without --expected-sha256 (pass --allow-insecure to override)")
 	}
 	f, err := os.Open(packagePath)
 	if err != nil {

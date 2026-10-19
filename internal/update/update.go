@@ -4,6 +4,7 @@ package update
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,12 +26,16 @@ import (
 
 const (
 	// DefaultLatestURL is the 08ms update metadata endpoint documented for
-	// P-Chat clients.
-	DefaultLatestURL = "http://www.08ms.cn/software/p-chat/latest.json"
+	// P-Chat clients. SEC-05 requires HTTPS.
+	DefaultLatestURL = "https://www.08ms.cn/software/p-chat/latest.json"
 	defaultTimeout   = 10 * time.Minute
 )
 
 var errNoArtifact = errors.New("no update artifact available")
+
+// ErrExpectedVersionChanged 表示检查与下载之间的最新版本发生了变化。
+// ErrExpectedVersionChanged reports a version change between check and download.
+var ErrExpectedVersionChanged = errors.New("latest update version changed")
 
 // Artifact describes one downloadable update artifact from latest.json.
 type Artifact struct {
@@ -42,6 +47,8 @@ type Artifact struct {
 	Size        int64  `json:"size,omitempty"`
 	SHA256      string `json:"sha256,omitempty"`
 	URL         string `json:"url,omitempty"`
+	// Signature is a base64 ed25519 signature over ArtifactSignPayload.
+	Signature string `json:"signature,omitempty"`
 }
 
 // Latest describes the 08ms latest.json response.
@@ -57,8 +64,11 @@ type Latest struct {
 	Size         int64     `json:"size,omitempty"`
 	SHA256       string    `json:"sha256,omitempty"`
 	URL          string    `json:"url,omitempty"`
-	Full         *Artifact `json:"full,omitempty"`
-	Patch        *Artifact `json:"patch,omitempty"`
+	// Signature covers the top-level full artifact when nested full/patch
+	// omit their own signature (legacy single-artifact manifests).
+	Signature string    `json:"signature,omitempty"`
+	Full      *Artifact `json:"full,omitempty"`
+	Patch     *Artifact `json:"patch,omitempty"`
 }
 
 // CheckResult is returned to the GUI after an update check.
@@ -92,20 +102,30 @@ type DownloadResult struct {
 
 // Options customizes update checks. Zero values use production defaults.
 type Options struct {
-	LatestURL   string
-	Platform    string
-	Arch        string
-	DownloadDir string
-	HTTPClient  *http.Client
+	LatestURL         string
+	Platform          string
+	Arch              string
+	DownloadDir       string
+	HTTPClient        *http.Client
+	IncludePrerelease bool
+	// PublicKey overrides the embedded production public key. Tests pass a
+	// generated key. A non-nil empty slice disables signature verification
+	// (only for unit tests that set RequireSignature=false).
+	PublicKey ed25519.PublicKey
+	// RequireSignature overrides signatureRequired(). Nil means follow env/default.
+	RequireSignature *bool
 }
 
 // Service performs update checks and downloads.
 type Service struct {
-	latestURL   string
-	platform    string
-	arch        string
-	downloadDir string
-	httpClient  *http.Client
+	latestURL         string
+	platform          string
+	arch              string
+	downloadDir       string
+	httpClient        *http.Client
+	includePrerelease bool
+	publicKey         ed25519.PublicKey
+	requireSignature  bool
 }
 
 // NewService creates an update service.
@@ -133,12 +153,23 @@ func NewService(opts Options) *Service {
 	if client == nil {
 		client = &http.Client{Timeout: defaultTimeout}
 	}
+	pub := opts.PublicKey
+	if pub == nil {
+		pub = defaultPublicKey()
+	}
+	requireSig := signatureRequired()
+	if opts.RequireSignature != nil {
+		requireSig = *opts.RequireSignature
+	}
 	return &Service{
-		latestURL:   latestURL,
-		platform:    platform,
-		arch:        arch,
-		downloadDir: downloadDir,
-		httpClient:  client,
+		latestURL:         latestURL,
+		platform:          platform,
+		arch:              arch,
+		downloadDir:       downloadDir,
+		httpClient:        client,
+		includePrerelease: opts.IncludePrerelease,
+		publicKey:         pub,
+		requireSignature:  requireSig,
 	}
 }
 
@@ -167,6 +198,9 @@ func Arch() string {
 // Check requests latest.json and decides whether the current binary needs an
 // update.
 func (s *Service) Check(ctx context.Context, currentVersion string) (*CheckResult, error) {
+	if err := requireSecureURL(s.latestURL); err != nil {
+		return nil, err
+	}
 	currentVersion = strings.TrimSpace(currentVersion)
 	latest, status, err := s.fetchLatest(ctx, currentVersion)
 	if err != nil {
@@ -181,13 +215,22 @@ func (s *Service) Check(ctx context.Context, currentVersion string) (*CheckResul
 			Installable: false,
 		}, nil
 	}
+	if !allowsLatest(latest, s.includePrerelease) {
+		return &CheckResult{
+			Current:     currentVersion,
+			Platform:    s.platform,
+			Arch:        s.arch,
+			HasUpdate:   false,
+			Installable: false,
+		}, nil
+	}
 
 	res := &CheckResult{
 		Name:         latest.Name,
 		Slug:         latest.Slug,
 		Current:      currentVersion,
 		Latest:       latest.Version,
-		Channel:      latest.Channel,
+		Channel:      versionChannel(latest.Version),
 		ReleaseNotes: latest.ReleaseNotes,
 		PublishedAt:  latest.PublishedAt,
 		Platform:     nonEmpty(latest.Platform, s.platform),
@@ -201,7 +244,7 @@ func (s *Service) Check(ctx context.Context, currentVersion string) (*CheckResul
 		res.Artifact = artifact
 		if artifact != nil {
 			res.URL = artifact.URL
-			res.Installable = isZipURL(artifact.URL)
+			res.Installable = isZipURL(artifact.URL) && requireSecureURL(artifact.URL) == nil
 		}
 	}
 	if res.URL == "" {
@@ -212,13 +255,16 @@ func (s *Service) Check(ctx context.Context, currentVersion string) (*CheckResul
 
 // Download checks for an update, downloads the selected zip update package,
 // verifies SHA-256, and returns the local file path.
-func (s *Service) Download(ctx context.Context, currentVersion string) (*DownloadResult, error) {
+func (s *Service) Download(ctx context.Context, currentVersion string, expectedVersion string) (*DownloadResult, error) {
 	check, err := s.Check(ctx, currentVersion)
 	if err != nil {
 		return nil, err
 	}
 	if !check.HasUpdate {
 		return nil, fmt.Errorf("no update available")
+	}
+	if expected := strings.TrimSpace(expectedVersion); expected != "" && check.Latest != expected {
+		return nil, fmt.Errorf("%w: expected %s, got %s", ErrExpectedVersionChanged, expected, check.Latest)
 	}
 	artifact := check.Artifact
 	if artifact == nil || artifact.URL == "" {
@@ -227,8 +273,14 @@ func (s *Service) Download(ctx context.Context, currentVersion string) (*Downloa
 	if !isZipURL(artifact.URL) {
 		return nil, fmt.Errorf("selected artifact is not an update zip: %s", artifact.URL)
 	}
+	if err := requireSecureURL(artifact.URL); err != nil {
+		return nil, err
+	}
 	if strings.TrimSpace(artifact.SHA256) == "" {
 		return nil, fmt.Errorf("selected artifact has no sha256")
+	}
+	if err := s.verifyPublisherSignature(artifact, check.Latest); err != nil {
+		return nil, err
 	}
 	downloadPath, size, sum, err := s.downloadArtifact(ctx, artifact, check.Latest)
 	if err != nil {
@@ -241,6 +293,21 @@ func (s *Service) Download(ctx context.Context, currentVersion string) (*Downloa
 		Size:         size,
 		SHA256:       sum,
 	}, nil
+}
+
+func (s *Service) verifyPublisherSignature(artifact *Artifact, version string) error {
+	if !s.requireSignature {
+		return nil
+	}
+	if len(s.publicKey) == 0 {
+		return fmt.Errorf("update public key not configured")
+	}
+	sig := strings.TrimSpace(artifact.Signature)
+	kind := strings.TrimSpace(artifact.Kind)
+	if kind == "" {
+		kind = "full"
+	}
+	return VerifyArtifactSignature(s.publicKey, artifact.SHA256, version, kind, sig)
 }
 
 // fetchLatest queries the update metadata endpoint with a bounded retry
@@ -289,6 +356,9 @@ func (s *Service) fetchLatestOnce(ctx context.Context, currentVersion string) (L
 	if currentVersion != "" {
 		q.Set("current_version", currentVersion)
 	}
+	if s.includePrerelease {
+		q.Set("include_prerelease", "1")
+	}
 	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
@@ -315,6 +385,65 @@ func (s *Service) fetchLatestOnce(ctx context.Context, currentVersion string) (L
 	return latest, resp.StatusCode, nil
 }
 
+// allowsLatest 默认只接收稳定版，并校验版本后缀与元数据渠道一致。
+// allowsLatest accepts stable releases by default and checks channel consistency.
+func allowsLatest(latest Latest, includePrerelease bool) bool {
+	versionChannel := versionChannel(latest.Version)
+	metadataChannel := strings.ToLower(strings.TrimSpace(latest.Channel))
+	if metadataChannel == "" {
+		metadataChannel = "stable"
+	}
+	if metadataChannel != versionChannel {
+		return false
+	}
+	if includePrerelease {
+		return versionChannel == "stable" || versionChannel == "beta"
+	}
+	return versionChannel == "stable"
+}
+
+func versionChannel(v string) string {
+	v = strings.TrimSpace(strings.TrimPrefix(v, "v"))
+	parts := strings.Split(v, ".")
+	if len(parts) < 3 {
+		return "unknown"
+	}
+	for _, numeric := range parts[:2] {
+		if numeric == "" || strings.Trim(numeric, "0123456789") != "" {
+			return "unknown"
+		}
+	}
+	patch := parts[2]
+	patchDigits := 0
+	for patchDigits < len(patch) && patch[patchDigits] >= '0' && patch[patchDigits] <= '9' {
+		patchDigits++
+	}
+	if patchDigits == 0 {
+		return "unknown"
+	}
+	label := ""
+	if patchDigits < len(patch) {
+		if patch[patchDigits] == '+' {
+			return "stable"
+		}
+		if patch[patchDigits] != '-' {
+			return "unknown"
+		}
+		label = patch[patchDigits+1:]
+	} else if len(parts) > 3 {
+		label = parts[3]
+	}
+	label = strings.ToLower(strings.TrimSpace(label))
+	switch label {
+	case "":
+		return "stable"
+	case "alpha", "beta", "rc":
+		return label
+	default:
+		return "unknown"
+	}
+}
+
 func (s *Service) downloadArtifact(ctx context.Context, artifact *Artifact, latestVersion string) (string, int64, string, error) {
 	if err := os.MkdirAll(s.downloadDir, 0o755); err != nil {
 		return "", 0, "", fmt.Errorf("create updates dir: %w", err)
@@ -329,12 +458,8 @@ func (s *Service) downloadArtifact(ctx context.Context, artifact *Artifact, late
 		return finalPath, size, sum, nil
 	}
 
-	u, err := url.Parse(artifact.URL)
-	if err != nil {
-		return "", 0, "", fmt.Errorf("parse artifact url: %w", err)
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", 0, "", fmt.Errorf("unsupported artifact url scheme: %s", u.Scheme)
+	if err := requireSecureURL(artifact.URL); err != nil {
+		return "", 0, "", err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, artifact.URL, nil)
 	if err != nil {
@@ -405,12 +530,13 @@ func normalizeArtifact(a *Artifact, defaultKind string, latest Latest) *Artifact
 			return nil
 		}
 		a = &Artifact{
-			Kind:     "full",
-			Platform: latest.Platform,
-			Arch:     latest.Arch,
-			Size:     latest.Size,
-			SHA256:   latest.SHA256,
-			URL:      latest.URL,
+			Kind:      "full",
+			Platform:  latest.Platform,
+			Arch:      latest.Arch,
+			Size:      latest.Size,
+			SHA256:    latest.SHA256,
+			URL:       latest.URL,
+			Signature: latest.Signature,
 		}
 	} else {
 		cp := *a
@@ -433,6 +559,9 @@ func normalizeArtifact(a *Artifact, defaultKind string, latest Latest) *Artifact
 	}
 	if a.URL == "" && defaultKind == "full" {
 		a.URL = latest.URL
+	}
+	if a.Signature == "" && defaultKind == "full" {
+		a.Signature = latest.Signature
 	}
 	return a
 }

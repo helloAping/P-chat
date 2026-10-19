@@ -18,7 +18,6 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
-	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
@@ -69,12 +68,6 @@ func (s *Server) Handler() *Handler { return s.handler }
 // server. Call this after New() and before Run().
 func (s *Server) SetBrowserManager(bm *browser.Manager) {
 	s.handler.SetBrowserManager(bm)
-}
-
-// SetIMGateway 挂载 IM Gateway。
-// SetIMGateway wires the IM Gateway into server handlers.
-func (s *Server) SetIMGateway(gateway *im.Gateway) {
-	s.handler.SetIMGateway(gateway)
 }
 
 // SetSubagentRunner wires the sub-agent runner for config hot reloads.
@@ -396,16 +389,6 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		api.GET("/browser/extension", h.BrowserExtensionDownload)
 		api.GET("/browser/ws", h.BrowserWebSocket)
 
-		// IM bridge
-		api.GET("/im/health", h.IMHealth)
-		api.GET("/im/config", h.GetIMConfig)
-		api.PATCH("/im/config", h.UpdateIMConfig)
-		api.POST("/im/test", h.TestIMConnection)
-		api.POST("/im/:type/test", h.TestIMConnection)
-		api.POST("/im/wechat/qr", h.StartWeChatQR)
-		api.GET("/im/wechat/qr/:id", h.PollWeChatQR)
-		api.GET("/im/events", h.IMEvents)
-		api.POST("/im/feishu/webhook", h.FeishuWebhook)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the

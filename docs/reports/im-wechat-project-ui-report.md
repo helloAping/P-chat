@@ -1,5 +1,7 @@
 # IM 微信接入与项目 UI 优化梳理报告
 
+> 历史归档：IM / 微信接入已退役；本文的项目 UI 部分保留作历史记录。
+
 日期：2026-07-29
 
 ## 1. 背景
@@ -414,7 +416,7 @@ C:\Users\admin\桌面\中文项目
 - Hermes Gateway Internals：https://hermes-agent.nousresearch.com/docs/developer-guide/gateway-internals/
 - Hermes Adding Platform Adapter：https://hermes-agent.nousresearch.com/docs/developer-guide/adding-platform-adapters
 - Tencent OpenClaw WeChat：https://github.com/Tencent/openclaw-weixin
-- P-Chat IM 方案：`docs/plans/im-bridge-plan.md`
+- 原 IM 实现计划已随功能退役移除。
 - P-Chat IM 模块文档：`.agents/docs/im.md`
 - P-Chat 前端模块文档：`.agents/docs/frontend.md`
 - P-Chat 基础设施模块文档：`.agents/docs/infrastructure.md`

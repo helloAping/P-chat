@@ -13,7 +13,6 @@ import (
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/generation"
-	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -53,8 +52,6 @@ type Handler struct {
 	subagentRunner    *subagent.Default
 	mcpMgr            *mcp.Manager
 	browserMgr        *browser.Manager
-	imGateway         *im.Gateway
-	wechatQR          *im.WeChatQRManager
 	// attachResolver reads upload files by id. Used to re-hydrate
 	// "upl://<id>" media rows from disk when building the LLM
 	// context (the agent holds the same resolver for the current
@@ -178,7 +175,6 @@ func NewHandlerWithConfigPath(a *agent.Agent, cfg *config.Config, store *memory.
 		styleMgr:   styleMgr,
 		toolReg:    toolReg,
 		mcpMgr:     mcpMgr,
-		wechatQR:   im.NewWeChatQRManager(im.WeChatQRClient{}),
 		meta:       make(map[string]sessionMeta),
 	}
 	h.cfg.Store(cfg)
@@ -1299,12 +1295,6 @@ func (h *Handler) SetMemoryMonitor(m *memoryMonitor) {
 // and REST endpoints. Pass nil to disable browser control endpoints.
 func (h *Handler) SetBrowserManager(bm *browser.Manager) {
 	h.browserMgr = bm
-}
-
-// SetIMGateway 挂载 IM Gateway，供 IM REST/SSE 端点使用。
-// SetIMGateway wires the IM Gateway for REST/SSE endpoints.
-func (h *Handler) SetIMGateway(gateway *im.Gateway) {
-	h.imGateway = gateway
 }
 
 // SetSubagentRunner wires the production sub-agent runner so runtime config

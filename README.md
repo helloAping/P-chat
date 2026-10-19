@@ -38,10 +38,9 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 | 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略、evaluate 三态 fail-closed 闸门 |
 | 媒体能力 | 已落地 / 持续扩展 | 图片/视频/音频独立识别路由；图片、视频、语音、音乐、音效等生成能力按模型和会话启用 |
 | 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断；pprof 与快照下载默认关闭 |
-| IM 桥接 | 实验中 / 部分可用 | Gateway/adapter 抽象、飞书 webhook、微信 QR/长轮询、出站切分、GUI 设置入口和事件流已有；跨平台 adapter、鉴权与运行体验仍需继续收口 |
 | MCP 集成 | 基础可用 / 待增强 | 已有 MCP 管理模块和设置入口，工具协议、权限和诊断体验仍在 backlog |
 | 沙箱增强 | 基础已落地 / 待增强 | 命令/写文件确认与浏览器域名策略已接入；Docker 隔离、策略可视化仍未完成 |
-| 导出与自动更新 | 已落地一部分 | 会话导出 HTML/PDF/text、更新检查/下载、updater、安装器和 release manifest 脚本已有 |
+| 导出与自动更新 | 已落地一部分 | 会话导出 HTML/PDF/text、稳定版更新检查/下载、可选 Beta 渠道、updater、安装器和 release manifest 脚本已有；Beta 发现依赖发布站按渠道返回元数据 |
 | 发布体验 | 已落地一部分 | Windows 安装器、Linux/macOS 打包脚本、浏览器扩展打包、版本注入已有；跨平台 GUI 构建仍受 Wails/宿主环境限制 |
 
 完整的安装、配置与 GUI 使用流程见 [`docs/p-chat-article-2026-09.md`](docs/p-chat-article-2026-09.md)。项目目录、模块职责和运行流总览见 [`docs/project-structure.md`](docs/project-structure.md)。更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
@@ -274,7 +273,6 @@ setup.exe
 | **知识库** | 启用 RAG、添加知识库目录、扫描 Wiki/FTS5 索引；媒体扫描可选配置模型 |
 | **网络搜索** | 切换 web_search 提供商（Tavily / OpenAI 兼容）、配置 API key、每日配额、测试连接 |
 | **浏览器** | 启用 Chrome 扩展控制、查看已连接浏览器、选择控制目标 tab、域名策略 |
-| **IM 桥接** | 配置实验性的飞书、微信等消息入口并查看连接状态 |
 | **诊断** | 查看运行信息与诊断入口，配合 Trace ID 和日志排查问题 |
 
 #### LLM 提供商
@@ -361,6 +359,7 @@ MCP 当前提供基础的服务器管理入口，可配置本地 Stdio 或远程
 | 启用浏览器控制 | 「设置」→「浏览器」→ 开开关 → 下载扩展 → chrome://extensions 加载；详见 [浏览器控制](#浏览器控制) |
 | 复制 trace id | 展开右侧 Inspector →「会话」→「复制 Trace」，或点击错误气泡上的 Trace ID |
 | 重新生成 | assistant 消息底部「重答」按钮，旧版会作为历史版本保留 |
+| 检查或下载 Beta 预览版 | 「关于 P-Chat」→ 勾选「接收预览版本（Beta）」→「重新检查」→ 确认版本后下载；默认只检查稳定版 |
 
 更完整的第一次对话、项目工作流、附件、知识库、媒体、Skill、MCP 和 CLI 操作见 [仓库内图文指南](docs/p-chat-article-2026-09.md)；官网同步版见 [P-Chat 使用说明](http://www.08ms.cn/article/p-chat)。
 
@@ -677,7 +676,6 @@ CLI 可用 `/skills` 查看，用 `/skill docs-tool 创建一份周报` 显式�
 | POST | `/uploads` | 上传 |
 | POST | `/mcp/servers` | MCP 服务器 |
 | GET/POST/PATCH | `/browser/*` | 浏览器连接、标签页、扩展下载、域名策略 |
-| GET/PATCH/POST | `/im/*` | IM 健康状态、配置、测试、微信 QR、飞书 webhook、事件流 |
 | GET/PATCH | `/diagnostics/*` | 内存、配置、heap/goroutine 快照；快照下载默认关闭且仅限 loopback |
 | GET/POST | `/updates/*` | 版本检查与更新下载 |
 
@@ -751,6 +749,9 @@ assistant 消息底部「重答」会保留所有历史版本，消息下方出�
 
 **12. 为什么诊断页的快照按钮不可用？**
 快照下载因敏感性默认关闭。退出 server，在可信本机环境设置 `PC_DIAGNOSTICS_SNAPSHOTS=1` 后重启即可启用；即使开启也只接受 loopback 请求。pprof 使用独立开关 `PC_PPROF=1`。
+
+**13. 怎么下载 Beta 预览版？**
+打开「关于 P-Chat」，勾选「接收预览版本（Beta）」并点击「重新检查」。出现较新的 `.beta` 版本后，确认版本号再下载；下载完成后可在同一窗口重启更新。勾选状态保存在当前浏览器或桌面 WebView；取消勾选会清除当前显示的预览版和已下载状态。若勾选后仍未发现 Beta，先确认[软件发布页](http://www.08ms.cn/software/p-chat/)有适合当前系统的较新版本；自动检查还需要发布站的 `latest.json?include_prerelease=1` 返回对应的 `channel=beta` 元数据。
 
 ---
 

@@ -12,23 +12,21 @@
 | P1 | 静态资产 | Web UI 与扩展安装包；只含静态内容，不含用户数据 |
 | IO | 普通会话读写 | 会话/消息/内容状态的读取与变更，**不触发** LLM 调用、工具执行或沙箱批准 |
 | X | 工具执行 | 触发 agent 循环、LLM 调用、工具/斜杠命令执行、沙箱批准应答的端点 |
-| M | 配置与 secret | 修改持久化配置、管理凭据、管理外部连接（provider/MCP/IM/知识库/技能仓库）的端点 |
+| M | 配置与 secret | 修改持久化配置、管理凭据、管理外部连接（provider/MCP/知识库/技能仓库）的端点 |
 | D | 诊断 | 内存/goroutine 快照与 pprof；快照可能含进程内存内容 |
 | B | 浏览器桥接 | Browser Extension 的 WebSocket 通道（配对见 #3） |
-| S | 平台签名 webhook | IM 平台入站回调，只经平台签名 adapter 验证 |
 
 ## 主体 → 能力映射
 
-| 能力类 | Local Operator | Paired Extension | Remote Operator（操作级） | Remote Operator（管理级） | Signed Webhook |
-| --- | --- | --- | --- | --- | --- |
-| P0 公开探测 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| P1 静态资产 | ✓ | ✓ | ✓ | ✓ | ✓ |
-| IO 会话读写 | ✓ | ✗ | ✓ | ✓ | ✗ |
-| X 工具执行 | ✓ | ✗ | ✓ | ✓ | ✗ |
-| M 配置与 secret | ✓ | ✗ | ✗ | ✓ | ✗ |
-| D 诊断 | ✓ | ✗ | ✗ | ✓ | ✗ |
-| B 浏览器桥接 | ✗ | ✓（配对后） | ✗ | ✗ | ✗ |
-| S 签名 webhook | ✗ | ✗ | ✗ | ✗ | ✓ |
+| 能力类 | Local Operator | Paired Extension | Remote Operator（操作级） | Remote Operator（管理级） |
+| --- | --- | --- | --- | --- |
+| P0 公开探测 | ✓ | ✓ | ✓ | ✓ |
+| P1 静态资产 | ✓ | ✓ | ✓ | ✓ |
+| IO 会话读写 | ✓ | ✗ | ✓ | ✓ |
+| X 工具执行 | ✓ | ✗ | ✓ | ✓ |
+| M 配置与 secret | ✓ | ✗ | ✗ | ✓ |
+| D 诊断 | ✓ | ✗ | ✗ | ✓ |
+| B 浏览器桥接 | ✗ | ✓（配对后） | ✗ | ✗ |
 
 - Local Operator = 全能力（本机持票进程即"机主"）。
 - 管理级凭据包含操作级能力（层级包含，非正交）。
@@ -44,11 +42,10 @@
 | IO / X | 401 `auth_required` | 401 `auth_invalid` | — |
 | M / D | 401 `auth_required` | 401 `auth_invalid` | 403 `auth_forbidden` |
 | B | 进入待配对（#3），不注册 | WS 关闭 4002 | — |
-| S | 401（验签失败） | 401 | — |
 
 - 错误形态统一为 `{error, error_kind}`，`error_kind ∈ {auth_required, auth_invalid, auth_forbidden}`，沿用现有 error_kind 规范。
 - SSE 端点在流开始前失败（401），流中不做权限降级。
-- B 类永不要求 Operator 凭据；S 类永不要求 Operator 凭据，也绝不因缺少普通 token 被误拒。
+- B 类永不要求 Operator 凭据。
 - 能力类与沙箱（sandbox Decision）、BR-04 浏览器策略、work_mode 工具白名单**正交**：凭据回答"你是谁、能进哪扇门"，沙箱回答"这次操作要不要确认"。
 
 ## 全量路由分类
@@ -72,12 +69,6 @@
 | 路由 | 说明 |
 | --- | --- |
 | `GET /api/v1/browser/ws` | WS 升级 + #3 配对握手；未配对不注册进 Hub |
-
-### S 平台签名 webhook（仅平台签名验证）
-
-| 路由 | 说明 |
-| --- | --- |
-| `POST /api/v1/im/feishu/webhook` | 飞书 verification token（加密回调待补）；未来各平台 webhook 同归此类 |
 
 ### IO 普通会话读写（Local Operator / 操作级）
 
@@ -106,7 +97,6 @@
 | `GET /api/v1/knowledge/models|bases|bases/:name/nodes|nodes/:id/content|scan/status`、`POST /api/v1/knowledge/search` | 知识库读取与搜索 |
 | `GET /api/v1/updates/check`、`GET /api/v1/migrations` | 更新检查与迁移状态读取 |
 | `GET /api/v1/browser/status` | 浏览器控制开关状态 |
-| `GET /api/v1/im/health`、`GET /api/v1/im/events` | IM 网关状态与事件流 |
 
 ### X 工具执行（Local Operator / 操作级；触发真实副作用）
 
@@ -136,7 +126,6 @@
 | `POST /api/v1/updates/download`、`POST /api/v1/migrations/rollback` | 二进制下载（供应链）/ 迁移回滚（破坏性） |
 | `POST /api/v1/dialog/folder` | 宿主机原生对话框；**仅 Local Operator 有意义** |
 | `GET /api/v1/browser/list`、`.../tabs`、`POST .../active-tab`、`POST /api/v1/browser/config` | 浏览器控制面管理（标签页 URL 属浏览隐私） |
-| `GET/PATCH /api/v1/im/config`、`POST /api/v1/im/test*`、`POST/GET /api/v1/im/wechat/qr*` | ⚠ IM 配置含平台 token（#5）；QR 发起平台登录 |
 | 未来：配对管理端点（pending 列表/批准/撤销） | 凭据管理，归 M |
 
 ### D 诊断（Local Operator / 管理级）

@@ -283,15 +283,45 @@ type ProviderPatch struct {
 	// ClearAPIKey, if true, forces the key to be emptied
 	// even when the user-supplied APIKey is "".
 	ClearAPIKey bool
-	// CustomHeaders 非 nil 时替换完整的请求头模板；显式空映射会清空配置。
-	// CustomHeaders, when non-nil, replaces the complete header template map;
-	// an explicitly supplied empty map clears all custom headers.
+	// CustomHeaders 非 nil 时替换请求头键集合；显式空映射清空全部。
+	// 值为空字符串时保留该键的旧值（配合读侧脱敏：前端无法回传明文）。
+	// CustomHeaders, when non-nil, replaces the header key set; an empty map
+	// clears all. An empty value keeps the prior value for that name so the
+	// redacted read path can round-trip names without wiping secrets.
 	CustomHeaders *map[string]string
 	// IsDefault, if true, promotes this provider to be the
 	// global default. (False is a no-op so the UI can
 	// always include the field without unintended
 	// demotions.)
 	IsDefault bool
+}
+
+// mergeProviderCustomHeaders applies a custom_headers patch under the
+// Secret Redaction Contract: empty map clears; otherwise the incoming
+// key set wins, and blank values keep the previously stored value.
+// mergeProviderCustomHeaders merges a redaction-aware headers patch.
+func mergeProviderCustomHeaders(existing, incoming map[string]string) (map[string]string, error) {
+	if len(incoming) == 0 {
+		return nil, nil
+	}
+	next := make(map[string]string, len(incoming))
+	for name, value := range incoming {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if strings.TrimSpace(value) == "" {
+			if old, ok := existing[name]; ok {
+				next[name] = old
+			}
+			continue
+		}
+		next[name] = value
+	}
+	if err := requestheader.ValidateTemplates(next); err != nil {
+		return nil, fmt.Errorf("invalid custom_headers: %w", err)
+	}
+	return requestheader.CloneTemplates(next), nil
 }
 
 // UpdateProvider applies a ProviderPatch to an existing
@@ -413,10 +443,11 @@ func UpdateProviderAt(configPath, oldName string, patch ProviderPatch) (*Provide
 		p.APIKey = patch.APIKey
 	}
 	if patch.CustomHeaders != nil {
-		if err := requestheader.ValidateTemplates(*patch.CustomHeaders); err != nil {
-			return nil, fmt.Errorf("invalid custom_headers: %w", err)
+		merged, err := mergeProviderCustomHeaders(p.CustomHeaders, *patch.CustomHeaders)
+		if err != nil {
+			return nil, err
 		}
-		p.CustomHeaders = requestheader.CloneTemplates(*patch.CustomHeaders)
+		p.CustomHeaders = merged
 	}
 	if patch.IsDefault {
 		if p.EffectiveModel() == "" {

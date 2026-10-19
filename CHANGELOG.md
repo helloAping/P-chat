@@ -8,6 +8,10 @@
 
 ## 已完成 ✅
 
+### 未发布 — IM 功能退役
+- 移除 IM Gateway、平台 adapter、管理 API 和 GUI 设置入口；保留已有 IM 会话历史
+- 数据目录升级到 V18 时，从受管理的全局 `config.json` 移除顶层 `im` 配置及其中的凭据；项目级和显式 `--config` 覆盖文件不自动改写
+
 ### v1.0.14.beta — 安全与可靠性收口
 - LLM retry 开始前重置失败 attempt 的 partial output，避免续写内容重复叠加
 - 原始 SSE、malformed payload、proxy error 与非 2xx 响应正文不再进入默认日志；`PC_LLM_DEBUG=1` 仅输出有界、统一脱敏的诊断预览

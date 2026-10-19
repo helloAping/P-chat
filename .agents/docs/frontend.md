@@ -33,6 +33,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/SkillCallCard.vue` | Skill 调用生命周期卡片，明确显示实际 Skill 名称 | |
 | `components/SubAgentCard.vue` | 子代理嵌套卡片（header + inner parts） | |
 | `components/SessionSidebar.vue` | 会话列表 + 项目选择器 + 设置 | |
+| `api/update.ts` | 更新检查/下载、按渠道缓存、下载版本冲突提示 | `checkUpdate()`, `downloadUpdate()` |
 | `components/CommandPalette.vue` | `/` 斜杠命令内联自动补全 | |
 | `components/TodoPanel.vue` | 待办事项面板（交互式） | |
 | `components/QuestionModal.vue` | 多选问题对话框 | |
@@ -42,6 +43,8 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + provider/model 测试 + KB 三层树视图 + NCollapse |
 
 ## 核心概念
+
+「关于 P-Chat」中的“接收预览版本（Beta）”默认关闭，选择保存在当前 WebView/浏览器的 `localStorage`。切换后清空旧检查和下载状态；检查与下载使用同一渠道，下载带 `expected_version`，版本变化时重新检查并让用户确认。界面只展示服务端允许的版本；发布站渠道筛选契约见 [server.md](server.md)。
 
 ### 1. Parts 模型（MessagePart）
 

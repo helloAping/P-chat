@@ -21,6 +21,10 @@ import (
 // context/output, capabilities) plus the legacy single-model
 // fallback field, so a UI can render every model in one place.
 //
+// Secret Redaction Contract: api_key plaintext is never returned.
+// Callers see has_api_key only. custom_headers keeps header names
+// but always redacts values (empty string). Storage is unchanged.
+//
 // For the v0.9 "list all providers" view, see Handler.Providers —
 // it returns a slimmer shape (name/model/protocol only) suitable
 // for the model picker in the chat input.
@@ -30,13 +34,44 @@ type ProviderFull struct {
 	StrategyVariant string               `json:"strategy_variant"`
 	Protocol        string               `json:"protocol"`
 	BaseURL         string               `json:"base_url"`
-	APIKey          string               `json:"api_key"`
+	HasAPIKey       bool                 `json:"has_api_key"`
 	CustomHeaders   map[string]string    `json:"custom_headers,omitempty"`
 	IsDefault       bool                 `json:"is_default"`
 	Models          []config.ModelConfig `json:"models"`
 	// Legacy single-model form (kept for backward compat; equals
 	// the first entry of Models when populated).
 	Model string `json:"model,omitempty"`
+}
+
+// providerFullFrom builds the redacted ProviderFull response shape.
+// providerFullFrom builds the redacted rich provider response.
+func providerFullFrom(p config.ProviderConfig, isDefault bool) ProviderFull {
+	return ProviderFull{
+		Name:            p.Name,
+		ProviderID:      p.GetProviderID(),
+		StrategyVariant: p.GetStrategyVariant(),
+		Protocol:        p.GetProtocol(),
+		BaseURL:         p.EffectiveBaseURL(),
+		HasAPIKey:       strings.TrimSpace(p.APIKey) != "",
+		CustomHeaders:   redactCustomHeaderValues(p.CustomHeaders),
+		IsDefault:       isDefault,
+		Models:          p.AllModels(),
+		Model:           p.EffectiveModel(),
+	}
+}
+
+// redactCustomHeaderValues keeps header names and strips values so
+// secrets / tokens in custom headers never leave the server.
+// redactCustomHeaderValues preserves names and clears values.
+func redactCustomHeaderValues(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for name := range headers {
+		out[name] = ""
+	}
+	return out
 }
 
 const providerTestTimeout = 30 * time.Second
@@ -172,19 +207,7 @@ func (h *Handler) GetProvider(c *gin.Context) {
 		if p.Name != name {
 			continue
 		}
-		models := p.AllModels()
-		c.JSON(http.StatusOK, ProviderFull{
-			Name:            p.Name,
-			ProviderID:      p.GetProviderID(),
-			StrategyVariant: p.GetStrategyVariant(),
-			Protocol:        p.GetProtocol(),
-			BaseURL:         p.EffectiveBaseURL(),
-			APIKey:          p.APIKey,
-			CustomHeaders:   p.CustomHeaders,
-			IsDefault:       p.Name == h.getCfg().LLM.Default,
-			Models:          models,
-			Model:           p.EffectiveModel(),
-		})
+		c.JSON(http.StatusOK, providerFullFrom(p, p.Name == h.getCfg().LLM.Default))
 		return
 	}
 	c.JSON(http.StatusNotFound, gin.H{"error": "provider not found: " + name})

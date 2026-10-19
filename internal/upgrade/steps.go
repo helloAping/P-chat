@@ -44,6 +44,41 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V14: stepV14toV15,
 	V15: stepV15toV16,
 	V16: stepV16toV17,
+	V17: stepV17toV18,
+}
+
+// stepV17toV18 从全局配置移除不再使用的 IM 凭据。
+// stepV17toV18 removes retired IM credentials from the managed global config.
+func stepV17toV18(_ *sql.DB) error {
+	log.Print("[upgrade] V17 → V18: removing retired IM configuration")
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read global config: %w", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("decode global config: %w", err)
+	}
+	if _, exists := root["im"]; !exists {
+		return nil
+	}
+	delete(root, "im")
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode global config: %w", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return fmt.Errorf("stat global config: %w", err)
+	}
+	if err := writeUpgradeFileAtomic(configPath, append(out, '\n'), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write global config: %w", err)
+	}
+	return nil
 }
 
 // stepV16toV17 establishes the uploads directory used by the V17 owner

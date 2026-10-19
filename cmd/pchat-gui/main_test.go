@@ -145,6 +145,9 @@ func TestValidateUpdatePackageChecksSHA256(t *testing.T) {
 	if _, err := validateUpdatePackage(file, hex.EncodeToString(bad[:])); err == nil {
 		t.Fatal("expected sha mismatch error")
 	}
+	if _, err := validateUpdatePackage(file, ""); err == nil {
+		t.Fatal("expected empty sha256 to be rejected")
+	}
 }
 
 func TestStageUpdaterBinaryCopiesToDataRunnerDir(t *testing.T) {

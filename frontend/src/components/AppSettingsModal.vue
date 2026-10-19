@@ -30,13 +30,12 @@ import {
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash, Folder,
   Cpu, Activity, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
-  MessageSquare,
+  Check,
 } from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
 import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
-import IMSettings from './IMSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
 import KnowledgeRecallPreview from './KnowledgeRecallPreview.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
@@ -183,7 +182,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'im' | 'diagnostics'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'diagnostics'>('providers')
 
 // Modal visibility (v-model). The default is `true` so that
 // when App.vue mounts this component (it only mounts when
@@ -209,7 +208,6 @@ const settingsTabs = [
   { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索', group: '能力' },
   { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商', group: '能力' },
   { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制', group: '能力' },
-  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信', group: '能力' },
   { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话', group: '数据' },
   { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照', group: '数据' },
 ]
@@ -229,14 +227,16 @@ const editStrategyVariant = ref('')
 const editProtocol = ref<api.ProviderProtocol>('openai_chat')
 const editBaseURL = ref('')
 const editAPIKey = ref('')
+const editHasAPIKey = ref(false)
+const editClearAPIKey = ref(false)
 type ProviderHeaderRow = { id: string; name: string; value: string }
 const editCustomHeaders = ref<ProviderHeaderRow[]>([])
 const editIsDefault = ref(false)
 
 // Track which fields the user actually touched so we only PATCH
-// the dirty ones. The backend treats non-empty values as "set"
-// and empty values as "leave alone", so this list is the
-// source of truth for the request body.
+// the dirty ones. API key uses the Secret Redaction Contract
+// (omit / clear_api_key / non-empty replace); other fields still
+// treat non-empty as set.
 const dirty = ref<Set<string>>(new Set())
 
 // Add-provider form (shown in NModal)
@@ -1091,7 +1091,7 @@ async function selectProvider(name: string) {
     const idx = providers.value.findIndex(x => x.name === name)
     if (idx >= 0) providers.value[idx] = rich
     // Now re-hydrate the form with the rich view (which
-    // carries base_url + api_key).
+    // carries base_url + has_api_key).
     hydrateEditForm(name, rich)
   } catch (e: any) {
     message.error(`加载 provider "${name}" 失败: ${e.message}`)
@@ -1191,9 +1191,10 @@ function cancelAddProvider() {
 // hydrateEditForm copies the server-resolved fields into the
 // edit form. dirty is reset so an out-of-band server change
 // doesn't get clobbered. The second `p` argument lets the
-// caller pass the rich per-provider view (which has
-// base_url + api_key); if omitted, we fall back to whatever
-// is in the providers cache.
+// caller pass the rich per-provider view (base_url +
+// has_api_key); if omitted, we fall back to the providers cache.
+// API key plaintext is never returned — the input stays empty
+// and has_api_key drives the "已配置" UX.
 function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   const src = p || providers.value.find(x => x.name === name)
   if (!src) return
@@ -1202,7 +1203,9 @@ function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   editStrategyVariant.value = normalizeStrategyVariant(src.strategy_variant)
   editProtocol.value = normalizeProviderProtocol(src.protocol)
   editBaseURL.value = src.base_url || src.api_url || ''
-  editAPIKey.value = src.api_key || ''
+  editAPIKey.value = ''
+  editHasAPIKey.value = !!src.has_api_key
+  editClearAPIKey.value = false
   editCustomHeaders.value = providerHeadersToRows(src.custom_headers)
   editIsDefault.value = !!src.is_default
   dirty.value = new Set()
@@ -1265,12 +1268,8 @@ async function onSaveProvider() {
     message.warning('Base URL 必须是完整的 http(s) URL')
     return
   }
-  // Build a PATCH body with only the dirty fields. The server
-  // treats empty strings as "leave alone" for every field
-  // except api_key, which we always send when the user
-  // touched the form (even if they only "re-typed" the same
-  // value — the user explicitly edited the field, so we
-  // honour that). The rename is a separate concern.
+  // Build a PATCH body with only the dirty fields.
+  // API key: clear_api_key / non-empty replace / omit to keep.
   const body: api.UpdateProviderRequest = {}
   if (dirty.value.has('name') && editName.value.trim() && editName.value.trim() !== name) {
     body.name = editName.value.trim()
@@ -1288,7 +1287,11 @@ async function onSaveProvider() {
     body.base_url = editBaseURL.value.trim()
   }
   if (dirty.value.has('api_key')) {
-    body.api_key = editAPIKey.value
+    if (editClearAPIKey.value) {
+      body.clear_api_key = true
+    } else if (editAPIKey.value.trim() !== '') {
+      body.api_key = editAPIKey.value.trim()
+    }
   }
   if (dirty.value.has('custom_headers')) {
     try {
@@ -1308,8 +1311,7 @@ async function onSaveProvider() {
     notifyGenerationConfigChanged()
     // If renamed, the new name is in the response; select it
     // so the user can keep editing. selectProvider also
-    // fetches the rich per-provider view, which re-hydrates
-    // the form with the up-to-date base_url / api_key.
+    // fetches the rich per-provider view and re-hydrates.
     await selectProvider(updated.name)
   } catch (e: any) {
     message.error(`保存失败: ${e.message}`)
@@ -2785,22 +2787,63 @@ function kbModelSupportsVision(scanModel: string) {
                     <span class="settings-form-hint">供应商公共网络地址；实际请求由 Base URL 与各模型的 API 端点后缀拼接。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
-                    <label class="settings-form-label">API Key</label>
-                    <NInput
-                      v-model:value="editAPIKey"
-                      size="small"
-                      type="password"
-                      show-password-on="click"
-                      placeholder="sk-...（留空保留原值）"
-                      @update:value="markDirty('api_key')"
-                    />
-                    <span class="settings-form-hint">点击眼睛图标可临时显示明文</span>
+                    <label class="settings-form-label">
+                      API Key
+                      <NTag
+                        v-if="editHasAPIKey && !editClearAPIKey"
+                        type="success"
+                        size="small"
+                        :bordered="false"
+                        style="margin-left: 8px"
+                      >已配置</NTag>
+                      <NTag
+                        v-else-if="editClearAPIKey"
+                        type="warning"
+                        size="small"
+                        :bordered="false"
+                        style="margin-left: 8px"
+                      >将删除</NTag>
+                      <NTag
+                        v-else
+                        type="warning"
+                        size="small"
+                        :bordered="false"
+                        style="margin-left: 8px"
+                      >未配置</NTag>
+                    </label>
+                    <div class="settings-form-inline">
+                      <NInput
+                        v-model:value="editAPIKey"
+                        size="small"
+                        type="password"
+                        show-password-on="click"
+                        :disabled="editClearAPIKey"
+                        :placeholder="editHasAPIKey ? '已配置 - 留空保留, 填写替换' : 'sk-...'"
+                        @update:value="markDirty('api_key')"
+                      />
+                      <NButton
+                        v-if="editHasAPIKey"
+                        size="tiny"
+                        quaternary
+                        type="warning"
+                        @click="editClearAPIKey = !editClearAPIKey; markDirty('api_key')"
+                      >
+                        <template v-if="editClearAPIKey">
+                          <Check :size="12" /> 将删除
+                        </template>
+                        <template v-else>
+                          删除 Key
+                        </template>
+                      </NButton>
+                    </div>
+                    <span class="settings-form-hint">密钥永不回传到界面；留空保留原值，填写后替换</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <ProviderHeadersEditor
                       :model-value="editCustomHeaders"
                       @update:model-value="(value: ProviderHeaderRow[]) => { editCustomHeaders = value; markDirty('custom_headers') }"
                     />
+                    <span class="settings-form-hint">请求头值不回显；留空保留原值，填写后替换对应项</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
                     <div class="settings-form-toggle">
@@ -4285,9 +4328,6 @@ function kbModelSupportsVision(scanModel: string) {
         </div>
       </NTabPane>
 
-      <NTabPane name="im" tab="IM 桥接" style="flex: 1; min-height: 0; overflow: auto">
-        <IMSettings />
-      </NTabPane>
       <NTabPane name="diagnostics" tab="诊断" style="flex: 1; min-height: 0; overflow: auto">
         <DiagnosticsSettings />
       </NTabPane>
@@ -4595,6 +4635,17 @@ function kbModelSupportsVision(scanModel: string) {
   display: inline-flex;
   align-items: center;
   gap: 8px;
+}
+
+.settings-form-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.settings-form-inline .n-input {
+  flex: 1;
+  min-width: 0;
 }
 
 /* --- Action row ---------------------------------------------------

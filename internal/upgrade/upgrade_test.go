@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -10,8 +11,85 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestRun_V17ToV18RemovesIMConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{"im":{"platforms":[{"token":"secret"}]},"llm":{"default":"local"},"future":{"enabled":true}}`)
+	if err := os.WriteFile(configPath, input, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUserVersion(V17); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(nil); err != nil {
+		t.Fatalf("Run from V17: %v", err)
+	}
+	if got := readUserVersion(); got != V18 {
+		t.Fatalf("version = %d, want V18", got)
+	}
+	output, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(output, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["im"]; exists {
+		t.Fatal("retired IM configuration remains")
+	}
+	var llm map[string]any
+	var future map[string]any
+	if err := json.Unmarshal(root["llm"], &llm); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(root["future"], &future); err != nil {
+		t.Fatal(err)
+	}
+	if llm["default"] != "local" || future["enabled"] != true {
+		t.Fatalf("unrelated config changed: %s", output)
+	}
+	if err := stepV17toV18(nil); err != nil {
+		t.Fatalf("repeat V18 step: %v", err)
+	}
+	repeated, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output, repeated) {
+		t.Fatal("repeat V18 step rewrote unchanged config")
+	}
+}
+
+func TestV18MigrationLeavesMalformedConfigUntouched(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{"im":`)
+	if err := os.WriteFile(configPath, input, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := stepV17toV18(nil); err == nil {
+		t.Fatal("expected malformed config error")
+	}
+	output, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(input, output) {
+		t.Fatal("malformed config was modified")
+	}
+}
+
 func TestRun_CurrentVersion(t *testing.T) {
-	// Simulate a fresh install at Current version: V0→V3 all at once.
+	// Simulate a fresh install upgraded from V0 to Current.
 	orig := versionFilePath()
 
 	dir := t.TempDir()
@@ -98,10 +176,10 @@ func TestRun_V16ToV17CreatesUploadOwnerDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := Run(db); err != nil {
-		t.Fatalf("Run V16→V17: %v", err)
+		t.Fatalf("Run from V16: %v", err)
 	}
-	if v := readUserVersion(); v != V17 {
-		t.Fatalf("version = %d, want V17", v)
+	if v := readUserVersion(); v != Current {
+		t.Fatalf("version = %d, want Current", v)
 	}
 	if info, err := os.Stat(filepath.Join(dir, ".p-chat", "uploads")); err != nil || !info.IsDir() {
 		t.Fatalf("uploads dir missing: info=%v err=%v", info, err)

@@ -42,7 +42,6 @@ type Config struct {
 	Recognition RecognitionConfig `json:"recognition,omitempty"`
 	// Vision is retained for pre-V9 configuration compatibility.
 	Vision VisionRecognitionConfig `json:"vision_recognition,omitempty"`
-	IM     IMConfig                `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -1486,7 +1485,6 @@ func Default() *Config {
 		},
 		Recognition: RecognitionConfig{Routes: map[MediaKind]RecognitionRoute{}},
 		Generation:  GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{}},
-		IM:          DefaultIMConfig(),
 	}
 }
 

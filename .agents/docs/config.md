@@ -78,16 +78,15 @@ LLMConfig 核心字段：
 
 显式 `--config <path>` 是最高优先级 overlay。CLI `KBManager` 及 `pchat-server` 的所有配置
 写端点都必须保留这条活动路径，并调用对应的 `*At(path, ...)` API。当前覆盖 Provider/Model、
-系统配置、Web Search、IM、Browser、MCP 与知识库：
+系统配置、Web Search、Browser、MCP 与知识库：
 
 - `path == ""`：沿用全局配置写入；
 - custom path：原始 JSON overlay 编辑器只更新显式提交的字段；
 - 未提交的顶层、普通子对象与未知字段保持原样或继续继承，不能把
   `Load(path)` 得到的完整合并结果整体写回 custom 文件；
-- Provider、Model、MCP server、IM platform 等数组发生增删时写入完整有效数组，确保覆盖继承值；
+- Provider、Model、MCP server 等数组发生增删时写入完整有效数组，确保覆盖继承值；
   这些显式替换的集合按当前 schema 重写，集合元素内部的未知字段不承诺保留；
-- `generation.defaults` 与 `im.personas` 在 custom 层具有完整替换语义，支持删除继承的 map key；
-  `im.personas.default` 是运行时必备兜底项，缺失时 `Normalize()` 会补回默认值；
+- `generation.defaults` 在 custom 层具有完整替换语义，支持删除继承的 map key；
 - PATCH 的指针字段区分“未提交”和显式零值/空数组；例如删除最后一个知识库会写入
   `bases: []`，清空 Provider API key 会写入 `api_key: ""`。
 

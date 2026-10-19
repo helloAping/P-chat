@@ -31,14 +31,14 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch, h, type Component } from 'vue'
-import { NButton, NInput, NScrollbar, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
+import { NButton, NCheckbox, NInput, NScrollbar, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
   loadProjects, setActiveProject, jumpToSearchResult,
 } from '../stores/chat'
 import * as api from '../api/client'
 import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
-import { checkUpdate, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE } from '../api/update'
+import { checkUpdate, clearUpdateCache, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE, UpdateVersionChangedError } from '../api/update'
 import type { UpdateArtifact, UpdateDownloadResult, UpdateInfo } from '../api/update'
 import type { SearchResult, Session } from '../api/client'
 import AppModal from './AppModal.vue'
@@ -85,6 +85,9 @@ const exportFormat = ref<ExportFormat>('pdf')
 const exportSaving = ref(false)
 const updateInfo = ref<UpdateInfo | null>(null)
 const downloadedUpdate = ref<UpdateDownloadResult | null>(null)
+let closeDownloadedUpdateNotice: (() => void) | null = null
+const updateChecking = ref(false)
+const updateCheckFailed = ref(false)
 const updateDownloading = ref(false)
 const updateInstalling = ref(false)
 const pendingDeleteSessionId = ref('')
@@ -103,7 +106,13 @@ const showOlderExpanded = ref(false)
 // ---------------------------------------------------------------------------
 const PINNED_KEY = 'pchat-pinned-sessions'
 const UPDATE_NOTIFY_KEY = 'pchat-update-notified-version'
+const PREVIEW_UPDATES_KEY = 'pchat-include-prerelease-updates'
 const pinnedIds = ref<Set<string>>(new Set())
+const includePrereleaseUpdates = ref(false)
+
+try {
+  includePrereleaseUpdates.value = localStorage.getItem(PREVIEW_UPDATES_KEY) === 'true'
+} catch { /* 本地存储不可用时使用稳定版 / Use stable releases when local storage is unavailable. */ }
 
 function loadPinned() {
   try {
@@ -861,6 +870,7 @@ function notifyUpdateAvailable(info: UpdateInfo) {
 }
 
 function notifyDownloadedUpdate(update: UpdateDownloadResult) {
+  closeDownloadedUpdateNotice?.()
   const packageLabel = updateArtifactLabel(update)
   let close: (() => void) | null = null
   const notice = notification.success({
@@ -876,7 +886,8 @@ function notifyDownloadedUpdate(update: UpdateDownloadResult) {
         disabled: updateInstalling.value,
         onClick: () => {
           close?.()
-          confirmRestartUpdate(update)
+          closeDownloadedUpdateNotice = null
+          if (downloadedUpdate.value?.downloadPath === update.downloadPath) confirmRestartUpdate(update)
         },
       },
       {
@@ -886,16 +897,45 @@ function notifyDownloadedUpdate(update: UpdateDownloadResult) {
     ),
   })
   close = () => notice.destroy()
+  closeDownloadedUpdateNotice = close
+}
+
+function clearDownloadedUpdate() {
+  downloadedUpdate.value = null
+  closeDownloadedUpdateNotice?.()
+  closeDownloadedUpdateNotice = null
 }
 
 async function refreshUpdate(force = false, notify = false) {
-  const info = await checkUpdate(force)
-  if (!info) return
+  const requestID = ++updateCheckRequestID
+  const includePrerelease = includePrereleaseUpdates.value
+  updateChecking.value = true
+  const info = await checkUpdate(force, includePrerelease)
+  if (requestID !== updateCheckRequestID || includePrerelease !== includePrereleaseUpdates.value) return
+  updateChecking.value = false
+  updateCheckFailed.value = !info
+  if (!info) {
+    updateInfo.value = null
+    clearDownloadedUpdate()
+    return
+  }
   updateInfo.value = info
   if (!info.hasUpdate || info.latest !== downloadedUpdate.value?.latest) {
-    downloadedUpdate.value = null
+    clearDownloadedUpdate()
   }
   if (notify) notifyUpdateAvailable(info)
+}
+
+let updateCheckRequestID = 0
+
+function onUpdateChannelChange(checked: boolean) {
+  includePrereleaseUpdates.value = checked
+  try { localStorage.setItem(PREVIEW_UPDATES_KEY, String(checked)) } catch { /* 本地存储不可用时仅当前窗口生效 / Keep this window's choice when storage is unavailable. */ }
+  clearUpdateCache()
+  updateInfo.value = null
+  clearDownloadedUpdate()
+  updateCheckFailed.value = false
+  void refreshUpdate(true)
 }
 
 async function openUpdateURL() {
@@ -944,19 +984,27 @@ async function onDownloadUpdate() {
 
   updateDownloading.value = true
   try {
-    const result = await downloadUpdate()
+    const result = await downloadUpdate(includePrereleaseUpdates.value, info.latest)
     downloadedUpdate.value = result
     updateInfo.value = result
     notifyDownloadedUpdate(result)
   } catch (err) {
-    message.error(`下载更新失败: ${updateErrorMessage(err)}`)
+    if (err instanceof UpdateVersionChangedError) {
+      clearUpdateCache()
+      updateInfo.value = null
+      clearDownloadedUpdate()
+      message.warning('更新版本已变化，正在重新检查，请确认后再下载')
+      await refreshUpdate(true)
+    } else {
+      message.error(`下载更新失败: ${updateErrorMessage(err)}`)
+    }
   } finally {
     updateDownloading.value = false
   }
 }
 
 function confirmRestartUpdate(update = downloadedUpdate.value) {
-  if (!update) return
+  if (!update || downloadedUpdate.value?.downloadPath !== update.downloadPath) return
   const busyText = hasUpdateBlockingWork.value
     ? '当前仍有会话或后台任务运行，重启会中断这些任务。'
     : ''
@@ -970,7 +1018,7 @@ function confirmRestartUpdate(update = downloadedUpdate.value) {
 }
 
 async function installUpdateNow(update = downloadedUpdate.value) {
-  if (!update) return
+  if (!update || downloadedUpdate.value?.downloadPath !== update.downloadPath) return
   updateInstalling.value = true
   try {
     await installDownloadedUpdate(update)
@@ -1351,9 +1399,20 @@ onMounted(() => {
         <p class="about-desc">Go + Vue 3 + Vite + SQLite · Wails v2</p>
         <p class="about-desc">OpenAI / Anthropic 双协议 · ReAct 工具调用循环</p>
 
+        <div class="update-channel">
+          <NCheckbox
+            v-model:checked="includePrereleaseUpdates"
+            :disabled="updateDownloading || updateInstalling"
+            @update:checked="onUpdateChannelChange"
+          >接收预览版本（Beta）</NCheckbox>
+          <NButton size="tiny" quaternary :loading="updateChecking" @click="refreshUpdate(true)">重新检查</NButton>
+        </div>
+        <p class="update-channel-hint">默认只检查稳定版；勾选后也会检查和下载较新的 Beta 版本。</p>
+
         <template v-if="updateInfo">
           <div v-if="updateInfo.hasUpdate" class="update-banner">
             <NTag type="warning" size="small">发现新版本</NTag>
+            <NTag v-if="updateInfo.channel === 'beta'" type="info" size="small">Beta 预览版</NTag>
             <p>最新版本 <strong>{{ versionLabel(updateInfo.latest) }}</strong></p>
             <p class="update-body" v-if="updateInfo.body">{{ updateInfo.body }}</p>
             <p class="update-meta">{{ updatePackageSummary(updateInfo) }}</p>
@@ -1414,8 +1473,9 @@ onMounted(() => {
               </NButton>
             </div>
           </div>
-          <p v-else class="update-ok">当前已是最新版本 {{ versionLabel(updateInfo.current || APP_VERSION) }}</p>
+          <p v-else class="update-ok">当前没有可用的{{ includePrereleaseUpdates ? '稳定版或 Beta' : '稳定版' }}更新（版本 {{ versionLabel(updateInfo.current || APP_VERSION) }}）</p>
         </template>
+        <p v-else-if="updateCheckFailed" class="update-ok">检查更新失败，请点击“重新检查”。</p>
         <p v-else class="update-ok">正在检查更新…</p>
 
         <button type="button" class="about-docs" @click="openDocs">
@@ -1948,6 +2008,16 @@ onMounted(() => {
 }
 .about-version { font-size: 12.5px; color: var(--text-tertiary); margin: 0 0 10px; }
 .about-desc { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 3px; line-height: 1.45; }
+.update-channel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.update-channel-hint { margin: var(--space-1) 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.45; }
 .update-banner {
   margin: var(--space-3) 0;
   padding: var(--space-3);

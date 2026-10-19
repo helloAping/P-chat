@@ -10,7 +10,7 @@
 
 ## 0. 当前快照
 
-> 快照日期：2026-09-26。
+> 快照日期：2026-10-19（SEC-02 Provider 密钥脱敏已落地；其余 backlog 仍以 2026-09-26 梳理为主）。
 
 | 文档 | 角色 | 使用方式 |
 |---|---|---|
@@ -22,7 +22,7 @@
 | `docs/plans/*.md` | 历史设计方案 | 做实现背景和设计追溯，不作为默认待办清单。 |
 | `.agents/docs/*.md` | agent 维护入口 | 改代码前按模块阅读，里面记录实现细节、关键文件和约束。 |
 
-当前代码侧的主线能力已经覆盖：三端运行形态、dev/prod 运行隔离与动态端口、结构化 SSE 消息流、ReAct + 子 agent、auto-continue、会话分叉/编辑重发、并行工具调用、项目级上下文、知识库三层索引、浏览器控制、动态工具、trace id、上下文检查器、会话导出、自动更新基础能力，以及实验中的 IM/MCP 集成。Runtime Trust 原型（instance capability + 扩展配对）代码与测试已齐但未接线生产。后续优先级应集中在“安全边界收口（§2.9）、可靠性修复（§2.14 REL 系列）、可解释性、外部集成完整度、发布/文档体验”，而不是重复排期已落地功能。
+当前代码侧的主线能力已经覆盖：三端运行形态、dev/prod 运行隔离与动态端口、结构化 SSE 消息流、ReAct + 子 agent、auto-continue、会话分叉/编辑重发、并行工具调用、项目级上下文、知识库三层索引、浏览器控制、动态工具、trace id、上下文检查器、会话导出、自动更新基础能力，以及 MCP 集成。Runtime Trust 原型（instance capability + 扩展配对）代码与测试已齐但未接线生产。后续优先级应集中在“安全边界收口（§2.9）、可靠性修复（§2.14 REL 系列）、可解释性、外部集成完整度、发布/文档体验”，而不是重复排期已落地功能。
 
 版本口径：仓库 `VERSION` 当前为 `1.0.14.beta`；正式分发版本以 `VERSION` 和 release tag 为准。
 
@@ -73,8 +73,7 @@
 
 ### 1.5 发布、导出与外部入口
 - 会话导出：`internal/export` 支持 HTML/PDF/text 导出，server 暴露 `/api/v1/sessions/:id/export`。
-- 自动更新：`internal/update`、`cmd/pchat-updater`、`frontend/src/api/update.ts` 和 `scripts/package-update-zip.ps1` 已形成检查/下载/替换的基础链路。
-- IM 桥接：`internal/im` 已有 Gateway、飞书、微信 QR/长轮询、出站切分和 GUI `IMSettings.vue` 入口，当前仍按实验能力维护。
+- 自动更新：`internal/update`、`cmd/pchat-updater`、`frontend/src/api/update.ts` 和 `scripts/package-update-zip.ps1` 已形成检查/下载/替换的基础链路；SEC-05 客户端侧已强制 HTTPS、SHA-256 与 ed25519 发布者签名（发布站需上传带 `signature` 的 latest.json）。
 - 浏览器扩展分发：`browser-extension/` 源码和 `scripts/package-browser-ext.ps1` 已接入 build 流程。
 - 诊断接口：`/api/v1/diagnostics/*` 提供内存、配置、heap/goroutine 快照等排查入口。
 - pprof 默认关闭（SEC-03）：`/debug/pprof*` 改为 opt-in，仅 `PC_PPROF=1` 时挂载，避免无鉴权堆快照默认暴露。
@@ -89,6 +88,7 @@
 ### 1.7 安全与信任原型（未接线生产）
 
 - Runtime Trust 原型：`internal/auth`（instance capability）+ `internal/browser/pairing.go`（bootstrap token / 扩展配对状态机）代码与约 29 个测试已齐，但 `internal/server` 尚未引用 `RequireCapability` / `NewPairer`，浏览器 WS 仍是连接即注册。生产接线见 SEC-01。
+- Secret 脱敏契约（SEC-02）：Provider `GET/PATCH` 读侧只返回 `has_api_key`，`custom_headers` 仅保留键名；写侧 `clear_api_key` / 非空 `api_key` / 省略三态；设置页不再回显明文密钥。
 - 动态工具权限字段（DT-04 部分）：YAML 已支持 `sandbox.exec/read/write`，`confirmTargetFor` 已读 `Sandbox.Exec`；GUI 风险展示与 read/write 按参数分流仍未做。
 
 ## 2. 可迭代任务明细
@@ -168,6 +168,7 @@
 | DOC-03 | 版本升级说明 | 整理“需要重启 GUI / server”的场景，形成发布检查清单。 | `README.md`、`.agents/docs/versioning.md`、`.agents/docs/upgrade.md`、打包脚本。 | 发布文档增加升级步骤、重启条件、兼容性注意事项。 | 每次版本发布前检查配置迁移、server/gui 重启、扩展升级、数据库 schema。 | 用户升级后知道是否需要重启；发布遗漏减少。 |
 | DOC-04 | 用户问题模板 | 为报错反馈提供 trace id、日志位置、复现步骤模板。 | `README.md` FAQ、错误恢复中心、`internal/trace`、日志文档。 | README 增加反馈模板；GUI 错误中心一键复制诊断信息。 | 报错时统一收集 trace id、时间、会话、操作步骤、日志位置，减少来回追问。 | 用户能复制一段完整反馈信息；开发者能按 trace id 定位日志。 |
 | DOC-05 | 项目结构总览（已落地） | 用单页文档梳理顶层目录、源码模块、可执行入口、运行流和功能状态口径。 | `docs/project-structure.md`、`README.md`、`.agents/docs/INDEX.md`、`docs/modules/INDEX.md`。 | 新增结构文档；README 和索引指向该文档。 | 让新维护者先按“目录 → 模块 → 运行流 → 文档真源”建立项目地图，减少从历史 plans 里反推现状。 | 新增或调整目录/功能时有明确同步位置；README 和 agent 索引都能跳到结构总览。 |
+| UPD-01（客户端已落地；发布站待接入） | 可选预览版本更新 | 在「关于 P-Chat」勾选“接收预览版本（Beta）”后，可检查、下载并安装版本号含 `.beta` 的更新；默认仅接收稳定版。 | `SessionSidebar.vue`、`frontend/src/api/update.ts`、`internal/server/update_api.go`、`internal/update/update.go`、发布站 `latest.json`。 | 勾选状态本地持久化；检查与下载传递同一渠道选择；客户端校验版本后缀与 `channel`，切换渠道时清除旧检查/下载状态。发布站仍需按渠道返回候选版本。 | 未勾选时只比较稳定版本；勾选后由发布站从稳定版与 beta 中选择版本号最高的可用版本；下载请求携带界面展示的 `expected_version`，在同一渠道重新检查；版本变化时拒绝下载并刷新提示，产物仍需校验哈希。单靠客户端无法发现未返回的 beta。 | 客户端默认不提示 beta；勾选后接受并下载更新的 `.beta`；取消勾选后 beta 不再提示；检查和下载结果版本一致。发布站接入 `include_prerelease=1` 后验证真实 Beta 可被发现。 |
 
 ### 2.9 安全与信任收口
 
@@ -176,10 +177,10 @@
 | 编号 | 任务点 | 功能描述 | 涉及点 | 修改点 | 逻辑梳理 | 验收点 |
 |---|---|---|---|---|---|---|
 | SEC-01 | Runtime Trust 生产接线 | 把 instance capability / 扩展配对接入生产路由，关闭“连接即信任”。 | `internal/auth/capability.go`、`internal/browser/pairing.go`、`internal/server/browser_handler.go:105-123`、`docs/plans/runtime-trust-decision-map.md` #7。 | spawn 下发 `PCHAT_INSTANCE_CAPABILITY`；路由挂 `RequireCapability`/`HostAllowlist`；Pairer 接入 `BrowserWebSocket` + GUI 批准 + 扩展 JS。 | 按 decision-map #7 七片落地；配对前 WS 不注册工具；capability 用常数时间比较。 | 无 capability 的 HTTP/WS 请求被拒；未配对扩展不出现在工具列表；GUI 可批准/撤销配对。 |
-| SEC-02 | Secret 脱敏契约 | Provider / IM 配置读侧不再回传明文密钥。 | `internal/server/provider_api.go:33`、`config_api.go:164-170`、`im_handler.go:41-49`；模板参照 `search_api.go` 的 `has_key` + `clear_api_key`。 | 读侧统一 `has_*` 布尔；写侧三态 patch（不改/清空/设置）；前端设置面板改为四态 UX。 | 任意能访问本地端口的客户端不应读到完整密钥；存储仍明文（OS credential store 另开迁移）。 | 列表/详情接口无密钥明文；前端编辑不回显旧 key；清空与修改路径可用。 |
+| SEC-02 | Secret 脱敏契约（已落地） | Provider 配置读侧不再回传明文密钥。 | `internal/server/provider_api.go`、`config_api.go`；模板参照 `search_api.go` 的 `has_key` + `clear_api_key`。 | 读侧统一 `has_*` 布尔；写侧三态 patch（不改/清空/设置）；前端设置面板改为四态 UX。 | 任意能访问本地端口的客户端不应读到完整密钥；存储仍明文（OS credential store 另开迁移）。 | 列表/详情接口无密钥明文；前端编辑不回显旧 key；清空与修改路径可用。 |
 | SEC-03 | pprof 默认关闭（已落地） | 诊断端点改为 opt-in。 | `internal/server/monitor.go:41-49`、`server.go:465-468`。 | 默认关，`PC_PPROF=1` 才挂 `/debug/pprof*`；SEC-01 后归入管理级凭据保护。 | 当前逻辑仅 `PC_PPROF=0` 才关，与路线图相反；无鉴权堆快照可能残留密钥。 | 默认访问 pprof 404；显式开启后可用。 |
 | SEC-04 | `allow_eval_write` fail-closed（已落地） | 配置开关真正拦截 `browser_evaluate`。 | `internal/browser/tools.go:364-367`（当前仅 `_ = cfg.AllowEvalWrite` 软注释）。 | `AllowEvalWrite=false` 时 Block 或强制 Confirm；补 policy 单测。 | 配置语义与执行行为对齐，避免“用户以为关了实际没关”。 | 关闭后 evaluate 被拦或触发确认；单测覆盖两种模式。 |
-| SEC-05 | 自动更新防伪 | 元数据/产物强制 HTTPS + 发布者签名。 | `internal/update/update.go:29`（`http://` 元数据）、`cmd/pchat-updater/main.go:134-137`（空 hash 跳过校验）、`scripts/package-update-zip.ps1`。 | 元数据改 HTTPS；引入 ed25519/minisign 或 Authenticode 验签；updater 拒绝空 expected hash（仅显式 `--allow-insecure` 跳过）。 | 当前 SHA-256 与 zip 同通道，MITM 可一起伪造；签名验证“谁发布的包”。 | 篡改的 latest.json/zip 被拒绝；release 产物带签名文件与校验文档。 |
+| SEC-05 | 自动更新防伪（客户端已落地；发布站需签包） | 元数据/产物强制 HTTPS + 发布者签名。 | `internal/update`、`cmd/pchat-updater`、`cmd/pchat-updatesign`、`scripts/package-update-zip.ps1`。 | 默认 latest URL 改 HTTPS；非 loopback 拒绝 http；artifact 需 `signature`（ed25519）；updater 拒绝空 `--expected-sha256`（仅 `--allow-insecure`）。 | SHA-256 防内容损坏，签名防假冒发布者；发布站上传带 `signature` 的 latest.json。 | 篡改的 latest.json/zip 被拒绝；打包脚本在设置 `PCHAT_UPDATE_SIGNING_KEY` 时写入签名。 |
 | SEC-06 | Windows 危险命令规则 | 默认危险模式覆盖 Windows shell。 | `internal/config/config.go:1490-1510`（`defaultDangerousPatterns` 几乎全 Unix）、`defaultWriteProtectedPaths`。 | 按 shell（cmd/pwsh）分层追加 `Remove-Item -Recurse`、`Format-Volume`、`del /s /q`、`iex (iwr ...)`、`reg delete` 等规则。 | 默认 shell 是 Windows，Unix 规则对 PowerShell/cmd 破坏面覆盖弱；与 SB-04 测试矩阵一起验收。 | Windows 高危命令触发拦截/确认；规则命中原因可读。 |
 | SEC-07 | 配对凭据与配置文件硬化 | pairing token 存哈希 + 常数时间比较；`config.json` 0600。 | `internal/browser/pairing.go:145-149`（`rec.Token == token`）、`internal/config/config.go:1323-1354`（原子写但无 Chmod）。 | token 存 SHA-256，校验改 `subtle.ConstantTimeCompare`；`writeConfigJSON` 落盘 0600 并启动时纠权限。 | 明文 token + 0644 配置在多用户机/备份泄露时可读；OS credential store 迁移另列。 | pairing.json/config.json 非所有者可读；错误 token 不泄漏时序。 |
 
@@ -276,21 +277,23 @@
 ## 4. 建议优先级
 
 1. ~~**低成本高价值修复先行**~~：第一批小步（REL-01 重试叠字、REL-03 日志门控、SEC-03 pprof 默认关、SEC-04 eval_write 拦截、CLI-01 /kb 挂载、SM-01 搜索跳转）已于 2026-09-26 全部落地。
-2. **安全主线**：SEC-02（secret 脱敏）→ SEC-05（更新 HTTPS/签名）→ SEC-01（Runtime Trust 接线，原型已就绪）→ SEC-06/07。
-3. **体验主线**：AE-01（流式工具参数）+ AE-03（cache 用量）→ PERF-01（SSE 帧合并）→ PERF-02（消息搜索 FTS5）→ SM-02/04/05（会话组织）。
-4. **成本主线**：AE-02（prompt cache 断点）+ AE-04（apply_patch），对 coding 场景 token 节省最直接。
-5. 知识库 KB-01 到 KB-05 已落地；KB-06~09 处理媒体接线、失败重试、缓存 TTL 与并发。
-6. 浏览器控制稳定性（BR-01～BR-05）已落地；REF-06 处理扩展 content script 健壮性。
-7. `DT-04` 剩余 GUI 风险展示与 `DT-05` 版本/禁用机制。
-8. `AG-01` 到 `AG-04` Agent 任务执行体验：提高长任务和多 agent 协作的可解释性，适合与 GUI 优化穿插推进。
-9. `MCP-01` 到 `MCP-03` MCP 完整集成：建议先补 REF-05 测试回归网，再在动态工具安全模型稳定后推进。
-10. `SB-01` 到 `SB-04` 沙箱与运行环境：价值高但改动面大，适合独立设计与分阶段交付。
-11. 结构债（REF-01~04）穿插在功能迭代中渐进拆分，不宜单独开大重构。
+2. **安全主线**：~~SEC-02~~ / ~~SEC-05 客户端~~ 已落地 → 发布站签包联调 → SEC-01（Runtime Trust 接线）→ SEC-06/07。
+3. **更新渠道**：UPD-01 客户端已接入；发布站需支持渠道筛选并做真实 Beta 联调。更新防伪仍由 SEC-05 跟进。
+4. **体验主线**：AE-01（流式工具参数）+ AE-03（cache 用量）→ PERF-01（SSE 帧合并）→ PERF-02（消息搜索 FTS5）→ SM-02/04/05（会话组织）。
+5. **成本主线**：AE-02（prompt cache 断点）+ AE-04（apply_patch），对 coding 场景 token 节省最直接。
+6. 知识库 KB-01 到 KB-05 已落地；KB-06~09 处理媒体接线、失败重试、缓存 TTL 与并发。
+7. 浏览器控制稳定性（BR-01～BR-05）已落地；REF-06 处理扩展 content script 健壮性。
+8. `DT-04` 剩余 GUI 风险展示与 `DT-05` 版本/禁用机制。
+9. `AG-01` 到 `AG-04` Agent 任务执行体验：提高长任务和多 agent 协作的可解释性，适合与 GUI 优化穿插推进。
+10. `MCP-01` 到 `MCP-03` MCP 完整集成：建议先补 REF-05 测试回归网，再在动态工具安全模型稳定后推进。
+11. `SB-01` 到 `SB-04` 沙箱与运行环境：价值高但改动面大，适合独立设计与分阶段交付。
+12. 结构债（REF-01~04）穿插在功能迭代中渐进拆分，不宜单独开大重构。
 
 ## 5. 任务拆分建议
 
 - 第一批小步（一天级）：`REL-01`、`REL-03`、`SEC-03`、`SEC-04`、`CLI-01`、`SM-01` —— ✅ 已于 2026-09-26 全部落地（含 stall watchdog 重试被吞的隐藏 bug 修复）。
-- 安全连续增强：`SEC-02` → `SEC-05` → `SEC-01`（七片接线按 decision-map）→ `SEC-06`/`SEC-07`。
+- 安全连续增强：`SEC-02` ✅ → `SEC-05` → `SEC-01`（七片接线按 decision-map）→ `SEC-06`/`SEC-07`。
+- 更新渠道：`UPD-01` 客户端勾选、检查、下载和版本锁定已接通；待发布站按 `include_prerelease=1` 返回稳定版/Beta 中的最高可用版本，并完成真实发布联调。
 - 文档结构：`DOC-05` 已落地，后续目录或模块职责变化时同步维护 `docs/project-structure.md`。
 - 第二批能力：`AE-01`、`AE-03`、`PERF-01`、`PERF-02`、`SM-02`，优先提升 agent 实际可用性与前端性能。
 - 第三批增强：`AE-02`、`AE-04`、`MCP-01`（先 REF-05）、`SB-01`，这些涉及跨模块协议或运行环境，建议单独写设计文档后再做。

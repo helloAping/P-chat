@@ -109,9 +109,6 @@ func prepareCustomOverlayLoad(data []byte, cfg *Config) ([]byte, error) {
 	if configOverlayHasField(root, "generation", "defaults") {
 		cfg.Generation.Defaults = nil
 	}
-	if configOverlayHasField(root, "im", "personas") {
-		cfg.IM.Personas = nil
-	}
 	return cleaned, nil
 }
 
