@@ -16,8 +16,9 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments } from '../stores/chat'
 import { EMPTY_GUIDES, sceneById, type SceneId } from '../utils/scenePresets'
+import { inspectDataTransfer } from '../utils/dropActions'
 import * as api from '../api/client'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
@@ -77,6 +78,52 @@ async function applyGuideScene(sceneId: SceneId) {
       session.turn_mode_policy = state.sessionMeta[id].turn_mode_policy
       session.plan_mode = state.sessionMeta[id].plan_mode
     }
+  }
+}
+
+const needsSetup = computed(() => (state.providers || []).length === 0)
+const dropOverChat = ref(false)
+
+function openFirstRun() {
+  ;(window as any).openFirstRunWizard?.()
+}
+
+function onChatDragOver(e: DragEvent) {
+  if (!e.dataTransfer?.types || !Array.from(e.dataTransfer.types).includes('Files')) return
+  e.preventDefault()
+  dropOverChat.value = true
+}
+
+function onChatDragLeave() {
+  dropOverChat.value = false
+}
+
+async function onChatDrop(e: DragEvent) {
+  e.preventDefault()
+  dropOverChat.value = false
+  const inspected = await inspectDataTransfer(e.dataTransfer)
+  if (inspected.kind === 'folder') {
+    if (!inspected.folderPath) {
+      message.info(`检测到文件夹「${inspected.folderName}」，请用侧栏添加项目并选取目录。`, { duration: 4500 })
+      ;(window as any).openAddProject?.()
+      return
+    }
+    try {
+      await registerProjectAndOpen(inspected.folderPath, inspected.folderName)
+      message.success(`已打开项目「${inspected.folderName || inspected.folderPath}」`)
+    } catch (err: any) {
+      message.error(`添加项目失败：${err?.message || err}`)
+    }
+    return
+  }
+  if (inspected.kind !== 'files' || inspected.files.length === 0) return
+  try {
+    await addAttachments(inspected.files)
+    const allImages = inspected.files.every(f => (f.type || '').startsWith('image/'))
+    prefillComposer(allImages ? '请看看这些图片，并简要说明内容。' : '请看看这些附件，并告诉我要点。')
+    message.success(`已添加 ${inspected.files.length} 个附件`)
+  } catch (err: any) {
+    message.error(`上传失败：${err?.message || err}`)
   }
 }
 
@@ -454,7 +501,13 @@ function messageKey(m: any, i: number): string | number {
 </script>
 
 <template>
-  <main class="chat-main">
+  <main
+    class="chat-main"
+    :class="{ 'chat-main--drop': dropOverChat }"
+    @dragover="onChatDragOver"
+    @dragleave="onChatDragLeave"
+    @drop="onChatDrop"
+  >
     <!-- Conversation-in-progress loading bar. Thin indeterminate
          strip at the top of the chat page; visible from the moment
          a turn starts until it ends (isStreaming || sessionWorking). -->
@@ -521,7 +574,15 @@ function messageKey(m: any, i: number): string | number {
             <MessageSquare :size="40" />
           </div>
           <div class="empty-title">开始一个新对话吧</div>
-          <div class="empty-hint">点一张卡片填入提示，确认后再发送 · 也可直接输入或拖入附件</div>
+          <div class="empty-hint">点一张卡片填入提示，确认后再发送 · 也可拖入文件夹开项目，或拖入附件</div>
+          <button
+            v-if="needsSetup"
+            type="button"
+            class="empty-setup"
+            @click="openFirstRun"
+          >
+            还没有模型，点此 60 秒完成配置
+          </button>
           <div class="empty-guides" role="list">
             <button
               v-for="guide in emptyGuides"
@@ -827,6 +888,24 @@ function messageKey(m: any, i: number): string | number {
 .empty-icon { color: var(--text-quaternary); display: inline-flex; }
 .empty-title { font-size: 15px; color: var(--text-2); }
 .empty-hint { font-size: 12px; color: var(--text-4); max-width: 28rem; }
+.empty-setup {
+  margin-top: var(--space-1);
+  padding: 6px 12px;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+}
+.empty-setup:hover {
+  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
+}
+.chat-main--drop {
+  outline: 1px dashed color-mix(in srgb, var(--brand-500) 40%, var(--border-default));
+  outline-offset: -6px;
+}
 .empty-guides {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 11.5rem));

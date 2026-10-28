@@ -16,6 +16,7 @@ import {
   humanizeStreamDropReason,
   pendingTodoCount,
 } from '../utils/streamInterrupt'
+import { basenameFromPath, sameProjectPath } from '../utils/projectPath'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -892,6 +893,25 @@ export async function loadProjects() {
   } catch {
     state.projects = []
   }
+}
+
+// Delight-2: register a folder as a project, switch into it, and
+// open a blank session. Used by drag-drop of Explorer folders.
+export async function registerProjectAndOpen(path: string, name?: string): Promise<void> {
+  const trimmed = path.trim()
+  if (!trimmed) throw new Error('项目路径为空')
+  const existing = state.projects.find(p => sameProjectPath(p.path, trimmed))
+  if (!existing) {
+    const projectName = (name || basenameFromPath(trimmed)).trim() || basenameFromPath(trimmed)
+    await api.addProject(projectName, trimmed)
+    await loadProjects()
+  }
+  const matched = state.projects.find(p => sameProjectPath(p.path, trimmed))
+  const targetPath = matched?.path || trimmed
+  if (state.activeProjectPath !== targetPath) {
+    await setActiveProject(targetPath)
+  }
+  await createSession()
 }
 
 export async function setActiveProject(path: string) {

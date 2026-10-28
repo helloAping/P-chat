@@ -24,13 +24,14 @@ import {
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, currentPendingInputRevision, currentRollbackDraft,
-  undoRollback, dismissRollback, prefillComposer,
+  undoRollback, dismissRollback, prefillComposer, registerProjectAndOpen,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
   hasQueuedTurns, markSessionActive,
   currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
   generateSessionTitle,
 } from '../stores/chat'
+import { inspectDataTransfer } from '../utils/dropActions'
 import {
   SCENE_CAPSULES,
   matchScene,
@@ -1280,10 +1281,47 @@ function onDragOver(e: DragEvent) {
   }
 }
 function onDragLeave() { isDragging.value = false }
-function onDrop(e: DragEvent) {
+
+async function onDrop(e: DragEvent) {
   e.preventDefault()
+  e.stopPropagation()
   isDragging.value = false
-  onFiles(e.dataTransfer?.files || null)
+  const inspected = await inspectDataTransfer(e.dataTransfer)
+  if (inspected.kind === 'folder') {
+    await handleFolderDrop(inspected.folderPath, inspected.folderName)
+    return
+  }
+  if (inspected.kind !== 'files' || inspected.files.length === 0) return
+  const hadText = !!inputText.value.trim()
+  try {
+    await addAttachments(inspected.files)
+    const preview = inspected.files.slice(0, 2).map(f => f.name).join(', ')
+    const more = inspected.files.length > 2 ? ` 等 ${inspected.files.length} 个` : ''
+    message.success(`已添加附件: ${preview}${more}`, { duration: 1800 })
+    // Empty composer + media/docs → prefill a short ask so send is one click.
+    if (!hadText) {
+      const allImages = inspected.files.every(f => (f.type || '').startsWith('image/'))
+      prefillComposer(allImages ? '请看看这些图片，并简要说明内容。' : '请看看这些附件，并告诉我要点。')
+    }
+  } catch (err: any) {
+    message.error(`上传失败: ${err?.message || err}`)
+  }
+}
+
+async function handleFolderDrop(folderPath: string, folderName: string) {
+  if (!folderPath) {
+    message.info(`检测到文件夹「${folderName}」，浏览器未给出绝对路径。请用侧栏「添加项目」选取目录。`, {
+      duration: 4500,
+    })
+    ;(window as any).openAddProject?.()
+    return
+  }
+  try {
+    await registerProjectAndOpen(folderPath, folderName)
+    message.success(`已打开项目「${folderName || folderPath}」`)
+  } catch (err: any) {
+    message.error(`添加项目失败：${err?.message || err}`)
+  }
 }
 
 onMounted(() => {

@@ -22,16 +22,33 @@ import ChatWindow from './components/ChatWindow.vue'
 import TitleBar from './components/TitleBar.vue'
 import TopBar from './components/TopBar.vue'
 import AppSettingsModal from './components/AppSettingsModal.vue'
+import FirstRunWizard from './components/FirstRunWizard.vue'
 import ImageLightbox from './components/ImageLightbox.vue'
 import PlanReviewModal from './components/PlanReviewModal.vue'
 import ToolConfirmModal from './components/ToolConfirmModal.vue'
 import CloseConfirmModal from './components/CloseConfirmModal.vue'
 import DownloadDock from './components/DownloadDock.vue'
-import { loadSessions, loadProviders, loadProjects } from './stores/chat'
+import { loadSessions, loadProviders, loadProjects, state as chatState } from './stores/chat'
 import { setupTrayEventListeners } from './utils/trayEvents'
 
 const showAppSettings = ref(false)
+const showFirstRun = ref(false)
+const FIRST_RUN_DISMISS_KEY = 'pchat-firstrun-dismissed'
 let cleanupTrayEvents: (() => void) | null = null
+
+function openFirstRunWizard() {
+  showFirstRun.value = true
+}
+
+function dismissFirstRun() {
+  try { localStorage.setItem(FIRST_RUN_DISMISS_KEY, '1') } catch { /* ignore */ }
+  showFirstRun.value = false
+}
+
+function onFirstRunDone() {
+  try { localStorage.removeItem(FIRST_RUN_DISMISS_KEY) } catch { /* ignore */ }
+  showFirstRun.value = false
+}
 
 // Sidebar collapse state. Persisted in localStorage so the user's
 // preference survives reloads. Toggled by the collapse button in
@@ -521,11 +538,19 @@ onMounted(async () => {
   // Expose an open handle too, in case something other than the
   // sidebar needs it.
   ;(window as any).openAppSettings = () => { showAppSettings.value = true }
+  ;(window as any).openFirstRunWizard = openFirstRunWizard
+  ;(window as any).openAddProject = () => { sidebarRef.value?.openAddProject() }
   try {
     // Projects must load before sessions so the store can restore
     // the last active project, then pick that project's last session.
     await Promise.all([loadProviders(), loadProjects()])
     await loadSessions()
+    const dismissed = (() => {
+      try { return localStorage.getItem(FIRST_RUN_DISMISS_KEY) === '1' } catch { return false }
+    })()
+    if ((chatState.providers || []).length === 0 && !dismissed) {
+      showFirstRun.value = true
+    }
   } catch (e) {
     console.error('init failed', e)
   }
@@ -627,6 +652,11 @@ onUnmounted(() => {
             <AppSettingsModal
               v-if="showAppSettings"
               v-model:show="showAppSettings"
+            />
+            <FirstRunWizard
+              v-model:show="showFirstRun"
+              @done="onFirstRunDone"
+              @dismiss="dismissFirstRun"
             />
             <ToolConfirmModal />
             <PlanReviewModal />
