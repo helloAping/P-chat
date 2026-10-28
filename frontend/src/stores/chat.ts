@@ -266,6 +266,8 @@ export const state = reactive({
   // Identifies the draft injected by rollback. InputArea uses the text
   // snapshot to avoid clearing user edits when "undo rollback" is clicked.
   rollbackDraft: {} as Record<string, RollbackDraft | null>,
+  // AE-07: latest undoable file-change batch per session (null = none / dismissed).
+  fileChangeUndo: {} as Record<string, api.FileChangeSummary | null>,
   // P0-1: transient banner shown for ~3s when the
   // recoverMissingParts flow successfully merged
   // server-side parts into the trailing assistant
@@ -1483,6 +1485,7 @@ export async function deleteSessionById(id: string) {
   delete state.pendingInputRevision[id]
   delete state.rollbackDraft[id]
   delete state.rollbackUndo[id]
+  delete state.fileChangeUndo[id]
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
@@ -1990,6 +1993,8 @@ export function appendLocalUserMessage(sessionId: string, message: Message) {
 export function startStream(id: string, ctrl: AbortController) {
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
   delete state.turnPlanReview[id]
+  // Hide previous-turn file undo while the new turn runs; refreshed on done.
+  state.fileChangeUndo[id] = null
   // Push a placeholder assistant message immediately. The
   // MessageBubble's loading-dots placeholder requires the
   // message object to exist *before* the first content
@@ -2959,6 +2964,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // P4-x: turn finished — refresh the Inspector context card
       // so the estimate reflects the tokens this turn added.
       void refreshContextUsage(id)
+      // AE-07: surface "undo this turn's file writes" when the journal has entries.
+      if (!sub) void refreshFileChangeUndo(id)
       break
     case 'question':
       // The LLM is asking the user a question. Two emit
@@ -3756,6 +3763,48 @@ export const currentRollbackBanner = computed(() => {
   if (!undo || !undo.messages.length) return null
   return { count: undo.displayMessages.length }
 })
+
+// AE-07: banner for undoing the latest agent turn's file mutations.
+export const currentFileChangeBanner = computed(() => {
+  const summary = state.fileChangeUndo[state.currentID]
+  if (!summary || !summary.count) return null
+  const names = (summary.entries || [])
+    .slice(0, 3)
+    .map((e) => basenameFromPath(e.path) || e.path)
+  return {
+    count: summary.count,
+    preview: names.join('、'),
+    more: summary.count > names.length,
+  }
+})
+
+export async function refreshFileChangeUndo(sessionId: string) {
+  if (!sessionId) return
+  try {
+    const summary = await api.getFileChanges(sessionId)
+    state.fileChangeUndo[sessionId] = summary?.count ? summary : null
+  } catch {
+    // Best-effort; leave previous banner state alone on network blips.
+  }
+}
+
+export async function undoFileChanges(sessionId: string) {
+  if (!sessionId) return
+  const result = await api.undoFileChanges(sessionId)
+  // After undo, peek again so stacked turns can surface the previous batch.
+  try {
+    const summary = await api.getFileChanges(sessionId)
+    state.fileChangeUndo[sessionId] = summary?.count ? summary : null
+  } catch {
+    state.fileChangeUndo[sessionId] = null
+  }
+  return result
+}
+
+export function dismissFileChangeUndo(sessionId: string) {
+  if (!sessionId) return
+  state.fileChangeUndo[sessionId] = null
+}
 
 export const currentPendingInput = computed(() =>
   state.pendingInput[state.currentID] || '',

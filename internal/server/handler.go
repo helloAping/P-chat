@@ -64,6 +64,9 @@ type Handler struct {
 	// GET /api/v1/tools endpoint reads from here. May be
 	// nil in tests that don't need tool listing.
 	toolReg *tool.Registry
+	// fileJournal tracks before-snapshots for AE-07 undo of the
+	// latest turn's write_file / edit_file / apply_patch calls.
+	fileJournal *tool.FileJournal
 
 	// memMon powers the /api/v1/diagnostics/* endpoints (live memory,
 	// config, heap/goroutine snapshot downloads). May be nil in tests
@@ -200,6 +203,12 @@ func (h *Handler) SetGeneratedAssetStore(store *generation.LocalAssetStore) {
 	if h.agent != nil {
 		h.agent.SetToolAssetStore(store)
 	}
+}
+
+// SetFileJournal installs the AE-07 file-change journal used by
+// GET/POST /sessions/:id/file-changes.
+func (h *Handler) SetFileJournal(j *tool.FileJournal) {
+	h.fileJournal = j
 }
 
 func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {

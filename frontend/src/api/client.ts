@@ -931,6 +931,28 @@ export const undoRollback = (sessionId: string, messages: Message[]) =>
     { method: 'POST', body: JSON.stringify({ messages }) },
   )
 
+// AE-07: file-change journal for undoing the latest agent turn's writes.
+export interface FileChangeEntry {
+  path: string
+  tool: string
+  existed: boolean
+}
+
+export interface FileChangeSummary {
+  count: number
+  started_at?: string
+  entries: FileChangeEntry[]
+}
+
+export const getFileChanges = (sessionId: string) =>
+  jsonFetch<FileChangeSummary>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/file-changes`)
+
+export const undoFileChanges = (sessionId: string) =>
+  jsonFetch<{ ok: boolean; summary: FileChangeSummary }>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-changes/undo`,
+    { method: 'POST' },
+  )
+
 // --- Fork ---
 export const forkSession = (sessionId: string, beforeId: number) =>
   jsonFetch<Session>(

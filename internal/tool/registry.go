@@ -1428,6 +1428,7 @@ func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, er
 		return &CallResult{Content: preview, Summary: "Dry run: would write " + a.Path, NextAction: "review"}, nil
 	}
 
+	RecordBeforeMutationFromCtx(ctx, "write_file", a.Path)
 	if err := writeFile(a.Path, []byte(a.Content)); err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}

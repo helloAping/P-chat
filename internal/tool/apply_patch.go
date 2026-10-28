@@ -96,6 +96,9 @@ func handleApplyPatch(ctx context.Context, args json.RawMessage) (*CallResult, e
 			}, nil
 		}
 
+		if !a.DryRun {
+			RecordBeforeMutationFromCtx(ctx, "apply_patch", path)
+		}
 		report, err := applyOnePatchFile(file, a.DryRun)
 		if err != nil {
 			ctxHint := conflictContext(file, err)

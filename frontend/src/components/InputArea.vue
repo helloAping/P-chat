@@ -12,7 +12,7 @@ import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
-  Undo2, FileText, File, Sparkles, ChevronDown,
+  Undo2, Files, FileText, File, Sparkles, ChevronDown,
   Lock, Unlock, Key, Copy, Scissors, ClipboardPaste, TextCursorInput,
   Settings, HelpCircle, Trash2, RotateCcw, CornerDownLeft, ChevronRight,
   Code2, ListTodo, MessageSquare,
@@ -23,8 +23,8 @@ import {
   isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
-  currentRollbackBanner, currentPendingInput, currentPendingInputRevision, currentRollbackDraft,
-  undoRollback, dismissRollback, prefillComposer, registerProjectAndOpen,
+  currentRollbackBanner, currentFileChangeBanner, currentPendingInput, currentPendingInputRevision, currentRollbackDraft,
+  undoRollback, dismissRollback, undoFileChanges, dismissFileChangeUndo, prefillComposer, registerProjectAndOpen,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
   hasQueuedTurns, markSessionActive,
@@ -97,6 +97,22 @@ async function onUndoRollback() {
     if (shouldClearInjectedText) inputText.value = ''
   } catch (e: any) {
     message.error(`撤销失败：${e?.message || e}`)
+  }
+}
+
+const undoingFiles = ref(false)
+async function onUndoFileChanges() {
+  const sessionID = state.currentID
+  if (!sessionID || undoingFiles.value) return
+  undoingFiles.value = true
+  try {
+    const result = await undoFileChanges(sessionID)
+    const n = result?.summary?.count ?? 0
+    message.success(n > 0 ? `已还原 ${n} 个文件` : '已还原文件改动')
+  } catch (e: any) {
+    message.error(`还原文件失败：${e?.message || e}`)
+  } finally {
+    undoingFiles.value = false
   }
 }
 
@@ -2038,6 +2054,27 @@ watch([() => state.currentID, queueSignature], () => {
       <button class="rollback-banner-dismiss" @click="dismissRollback(state.currentID)" aria-label="关闭">×</button>
     </div>
 
+    <!-- AE-07: undo this turn's file writes -->
+    <div v-else-if="currentFileChangeBanner" class="file-change-banner">
+      <Files :size="14" class="file-change-banner-icon" />
+      <span class="file-change-banner-text" :title="currentFileChangeBanner.preview">
+        本轮改动了 {{ currentFileChangeBanner.count }} 个文件
+        <span v-if="currentFileChangeBanner.preview" class="file-change-banner-preview">
+          （{{ currentFileChangeBanner.preview }}{{ currentFileChangeBanner.more ? '…' : '' }}）
+        </span>
+      </span>
+      <button
+        class="file-change-banner-undo"
+        :disabled="undoingFiles"
+        @click="onUndoFileChanges"
+      >撤销文件改动</button>
+      <button
+        class="file-change-banner-dismiss"
+        @click="dismissFileChangeUndo(state.currentID)"
+        aria-label="关闭"
+      >×</button>
+    </div>
+
     <Transition name="fade-up">
       <div
         v-if="queuedTurns.length > 0"
@@ -2908,6 +2945,65 @@ watch([() => state.currentID, queueSignature], () => {
   line-height: 1;
 }
 .rollback-banner-dismiss:hover {
+  color: var(--text);
+}
+
+/* AE-07 file-change undo banner */
+.file-change-banner {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  margin-bottom: 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+}
+.file-change-banner-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+}
+.file-change-banner-text {
+  color: var(--text-primary);
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-change-banner-preview {
+  color: var(--text-3);
+}
+.file-change-banner-undo {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 13px;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  flex-shrink: 0;
+}
+.file-change-banner-undo:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--on-brand);
+}
+.file-change-banner-undo:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.file-change-banner-dismiss {
+  background: none;
+  border: none;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 16px;
+  padding: 0 4px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+.file-change-banner-dismiss:hover {
   color: var(--text);
 }
 

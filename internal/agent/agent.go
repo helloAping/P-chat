@@ -65,6 +65,7 @@ type Agent struct {
 	skillManager skill.Manager
 	rules        []rules.Rule
 	sandbox      tool.SandboxChecker // optional; nil disables sandbox enforcement
+	fileJournal  *tool.FileJournal   // optional; AE-07 undo snapshots for file tools
 	options      llm.ChatOptions     // per-request sampling; populated from cfg
 	attach       AttachmentResolver  // optional; turns Attachment IDs into file paths for upload expansion
 	// generationExecutor is invoked only after the request-scoped operation
@@ -156,6 +157,17 @@ func (a *Agent) getStyleMemory(s style.Style) string {
 // dangerous operations. Pass nil to disable sandboxing.
 func (a *Agent) SetSandbox(s tool.SandboxChecker) {
 	a.sandbox = s
+}
+
+// SetFileJournal installs the AE-07 file-change journal used to undo
+// write_file / edit_file / apply_patch mutations from the latest turn.
+func (a *Agent) SetFileJournal(j *tool.FileJournal) {
+	a.fileJournal = j
+}
+
+// FileJournal returns the agent's file journal (may be nil).
+func (a *Agent) FileJournal() *tool.FileJournal {
+	return a.fileJournal
 }
 
 func (a *Agent) loadProjectDynamicTools(projectRoot string) {
@@ -2054,6 +2066,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		upstreamMessageID = strconv.FormatInt(req.ClientMsgID, 10)
 	}
 	ctx = requestheader.WithIdentifiers(ctx, req.SessionID, upstreamMessageID)
+	if a.fileJournal != nil && req.SessionID != "" && req.SubagentType == "" {
+		// Parent turns only — sub-agents share the parent journal turn.
+		a.fileJournal.BeginTurn(req.SessionID)
+		ctx = tool.WithFileJournal(ctx, a.fileJournal)
+	} else if a.fileJournal != nil {
+		ctx = tool.WithFileJournal(ctx, a.fileJournal)
+	}
 
 	// Per-stream monotonic counter for P3-1. sendOrDrop
 	// stamps each emitted chunk's Seq with nextSeq() (0, 1,
@@ -3501,6 +3520,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
+				}
+				if a.fileJournal != nil {
+					tctx = tool.WithFileJournal(tctx, a.fileJournal)
 				}
 				if a.store != nil && req.SessionID != "" {
 					tctx = tool.WithMediaContextResolver(tctx, a.resolveMediaContextForTool)

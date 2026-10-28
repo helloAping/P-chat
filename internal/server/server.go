@@ -154,6 +154,9 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 	r.Use(traceIDMiddleware())
 
 	h := NewHandlerWithConfigPath(agt, cfg, store, styleMgr, toolReg, mcpMgr, configPath)
+	fileJournal := tool.NewFileJournal()
+	h.SetFileJournal(fileJournal)
+	agt.SetFileJournal(fileJournal)
 
 	// Wire the summarizer so /compress and auto-compact work.
 	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
@@ -330,6 +333,8 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		api.DELETE("/sessions/:id/messages", h.ClearSessionMessages)
 		api.POST("/sessions/:id/rollback", h.RollbackMessages)
 		api.POST("/sessions/:id/rollback/undo", h.UndoRollback)
+		api.GET("/sessions/:id/file-changes", h.GetFileChanges)
+		api.POST("/sessions/:id/file-changes/undo", h.UndoFileChanges)
 		api.POST("/sessions/:id/fork", h.ForkSession)
 
 		// Projects
