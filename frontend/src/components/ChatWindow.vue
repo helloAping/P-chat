@@ -1,7 +1,10 @@
 <script setup lang="ts">
 import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useMessage } from 'naive-ui'
-import { ArrowDown, ArrowUp, MessageSquare, Loader2 } from './icons'
+import {
+  ArrowDown, ArrowUp, MessageSquare, Loader2,
+  Code2, FlaskConical, ImageIcon, Lightbulb,
+} from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
 import TodoPanel from './TodoPanel.vue'
@@ -13,7 +16,9 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer } from '../stores/chat'
+import { EMPTY_GUIDES, sceneById, type SceneId } from '../utils/scenePresets'
+import * as api from '../api/client'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
 // Watched reactively by the recovery-in-progress banner
@@ -22,6 +27,58 @@ const isRecoveringCurrent = computed(() => !!state.isRecovering[state.currentID]
 
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
+
+const emptyGuides = EMPTY_GUIDES
+const emptyGuideIcon: Record<string, typeof MessageSquare> = {
+  explain: MessageSquare,
+  'find-bug': Code2,
+  'write-test': FlaskConical,
+  sketch: ImageIcon,
+}
+
+async function onEmptyGuideClick(guideId: string) {
+  if (!state.currentID) return
+  const guide = EMPTY_GUIDES.find(item => item.id === guideId)
+  if (!guide) return
+  try {
+    await applyGuideScene(guide.scene)
+    prefillComposer(guide.prompt)
+  } catch (e: any) {
+    message.error(`无法填入引导：${e?.message || e}`)
+  }
+}
+
+async function applyGuideScene(sceneId: SceneId) {
+  const id = state.currentID
+  if (!id) return
+  const scene = sceneById(sceneId)
+  const meta = state.sessionMeta[id] || {}
+  const patch: Parameters<typeof api.updateSessionMeta>[1] = {}
+  if ((meta.workMode || state.globalWorkMode || 'coding') !== scene.workMode) {
+    patch.work_mode = scene.workMode
+  }
+  const currentTurn = meta.turn_mode_policy || (meta.plan_mode ? 'plan' : 'build')
+  if (currentTurn !== scene.turnMode) {
+    patch.turn_mode_policy = scene.turnMode
+    patch.plan_mode = scene.turnMode === 'plan'
+  }
+  if (Object.keys(patch).length === 0) return
+  const resp = await api.updateSessionMeta(id, patch)
+  state.sessionMeta[id] = {
+    ...meta,
+    workMode: resp.work_mode ?? patch.work_mode ?? meta.workMode,
+    turn_mode_policy: resp.turn_mode_policy ?? patch.turn_mode_policy ?? meta.turn_mode_policy,
+    plan_mode: resp.plan_mode ?? patch.plan_mode ?? meta.plan_mode,
+  }
+  const session = state.sessions.find(s => s.id === id)
+  if (session) {
+    if (patch.work_mode) session.work_mode = state.sessionMeta[id].workMode
+    if (patch.turn_mode_policy) {
+      session.turn_mode_policy = state.sessionMeta[id].turn_mode_policy
+      session.plan_mode = state.sessionMeta[id].plan_mode
+    }
+  }
+}
 
 // Scroll position bookkeeping for the infinite-scroll
 // history loader. We compare the scrollTop before and after
@@ -461,10 +518,25 @@ function messageKey(m: any, i: number): string | number {
       <div class="messages" :class="{ 'messages--switching': state.viewLoading }">
         <div v-if="!state.viewLoading && currentMessages.length === 0" class="empty">
           <div class="empty-icon">
-            <MessageSquare :size="48" />
+            <MessageSquare :size="40" />
           </div>
           <div class="empty-title">开始一个新对话吧</div>
-          <div class="empty-hint">输入 /help 查看可用命令 · 拖入或粘贴文件可作为附件</div>
+          <div class="empty-hint">点一张卡片填入提示，确认后再发送 · 也可直接输入或拖入附件</div>
+          <div class="empty-guides" role="list">
+            <button
+              v-for="guide in emptyGuides"
+              :key="guide.id"
+              type="button"
+              class="empty-guide"
+              role="listitem"
+              :title="guide.description"
+              @click="onEmptyGuideClick(guide.id)"
+            >
+              <component :is="emptyGuideIcon[guide.id] || Lightbulb" :size="16" class="empty-guide-icon" />
+              <span class="empty-guide-title">{{ guide.title }}</span>
+              <span class="empty-guide-desc">{{ guide.description }}</span>
+            </button>
+          </div>
         </div>
         <div
           v-if="state.sessionPaging[state.currentID]?.loading"
@@ -749,12 +821,65 @@ function messageKey(m: any, i: number): string | number {
   height: 100%;
   color: var(--text-3);
   gap: var(--space-2);
-  padding-top: calc(var(--space-8) * 3);
+  padding: calc(var(--space-8) * 2) var(--space-4) var(--space-8);
   text-align: center;
 }
-.empty-icon { font-size: 48px; color: var(--text-quaternary); display: inline-flex; }
+.empty-icon { color: var(--text-quaternary); display: inline-flex; }
 .empty-title { font-size: 15px; color: var(--text-2); }
-.empty-hint { font-size: 12px; color: var(--text-4); }
+.empty-hint { font-size: 12px; color: var(--text-4); max-width: 28rem; }
+.empty-guides {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 11.5rem));
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  width: min(100%, 24.5rem);
+  text-align: left;
+}
+.empty-guide {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  min-height: 4.5rem;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-3);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+.empty-guide:hover {
+  color: var(--text-2);
+  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
+}
+.empty-guide-icon {
+  color: var(--text-4);
+  margin-bottom: 2px;
+}
+.empty-guide:hover .empty-guide-icon {
+  color: var(--text-3);
+}
+.empty-guide-title {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-2);
+}
+.empty-guide-desc {
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-4);
+}
+@media (max-width: 560px) {
+  .empty-guides {
+    grid-template-columns: 1fr;
+    width: min(100%, 16rem);
+  }
+}
 
 /* Floating "jump to latest" button. Anchored to .chat-main's
  * right edge, hovering above the input area. The computed bottom

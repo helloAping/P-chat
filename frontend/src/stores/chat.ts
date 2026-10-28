@@ -3898,6 +3898,17 @@ export function dismissRollback(sessionId: string) {
   state.pendingInput[sessionId] = ''
 }
 
+// Prefill the composer for the active session without sending.
+// Used by empty-state guide cards and scene capsules. Bumping
+// revision wakes InputArea's watch even when the text is identical
+// to a previous inject (user cleared then clicked the same card).
+export function prefillComposer(text: string, sessionId?: string) {
+  const id = sessionId || state.currentID
+  if (!id) return
+  state.pendingInput[id] = text
+  state.pendingInputRevision[id] = (state.pendingInputRevision[id] || 0) + 1
+}
+
 // --- Fork ---
 
 export async function forkSession(sourceId: string, messageIndex: number) {

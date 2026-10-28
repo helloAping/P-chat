@@ -121,4 +121,6 @@ export {
   ShieldCheck,
   Monitor,
   CornerDownLeft,
+  Code2,
+  ListTodo,
 } from 'lucide-vue-next'

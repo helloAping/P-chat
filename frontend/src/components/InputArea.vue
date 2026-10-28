@@ -15,6 +15,7 @@ import {
   Undo2, FileText, File, Sparkles, ChevronDown,
   Lock, Unlock, Key, Copy, Scissors, ClipboardPaste, TextCursorInput,
   Settings, HelpCircle, Trash2, RotateCcw, CornerDownLeft, ChevronRight,
+  Code2, ListTodo, MessageSquare,
 } from './icons'
 import * as api from '../api/client'
 import {
@@ -23,13 +24,19 @@ import {
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, currentPendingInputRevision, currentRollbackDraft,
-  undoRollback, dismissRollback,
+  undoRollback, dismissRollback, prefillComposer,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
   hasQueuedTurns, markSessionActive,
   currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
   generateSessionTitle,
 } from '../stores/chat'
+import {
+  SCENE_CAPSULES,
+  matchScene,
+  type SceneId,
+  type TurnMode,
+} from '../utils/scenePresets'
 import type { PendingAttachment } from '../stores/chat'
 import { Pencil, Check, X } from './icons'
 import { editQueuedTurn, setTurnQueueEditing } from '../stores/chat'
@@ -64,14 +71,13 @@ function resizeTextarea() {
 watch(inputText, () => nextTick(resizeTextarea))
 watch(() => currentAttachments.value.length, () => nextTick(resizeTextarea))
 
-// Sync a rollback draft to the textarea. The revision signal is required for
-// attachment-only messages and repeated rollbacks whose caption is unchanged.
-// 撤回纯附件消息时同样要清空旧文字并聚焦输入框。
+// Sync store-driven composer injects (rollback recall, empty-state
+// guides, scene capsules). Revision must bump even when the text is
+// unchanged so re-clicking the same guide still refocuses the input.
 watch(
   () => [state.currentID, currentPendingInputRevision.value] as const,
   () => {
-    const draft = currentRollbackDraft.value
-    if (!draft) return
+    if (!state.currentID || !currentPendingInputRevision.value) return
     inputText.value = currentPendingInput.value
     nextTick(() => {
       inputEl.value?.focus()
@@ -139,9 +145,8 @@ const turnModePolicy = computed<api.TurnModePolicy>(() => {
   return meta?.turn_mode_policy || (meta?.plan_mode ? 'plan' : 'build')
 })
 
-async function togglePlanMode() {
+async function setTurnModePolicy(next: api.TurnModePolicy) {
   if (!state.currentID) return
-  const next = nextTurnModePolicy(turnModePolicy.value)
   try {
     const resp = await api.updateSessionMeta(state.currentID, {
       turn_mode_policy: next,
@@ -160,6 +165,10 @@ async function togglePlanMode() {
       session.plan_mode = resp.plan_mode ?? mode === 'plan'
     }
   } catch {}
+}
+
+async function togglePlanMode() {
+  await setTurnModePolicy(nextTurnModePolicy(turnModePolicy.value))
 }
 
 function nextTurnModePolicy(policy: api.TurnModePolicy): api.TurnModePolicy {
@@ -1676,6 +1685,39 @@ const currentWorkModeValue = computed({
 const currentWorkModeLabel = computed(() =>
   currentWorkModeValue.value === 'daily' ? '日常' : '编码',
 )
+
+const sceneCapsules = SCENE_CAPSULES
+const sceneIconById: Record<SceneId, typeof Code2> = {
+  coding: Code2,
+  plan: ListTodo,
+  daily: MessageSquare,
+}
+
+const activeSceneId = computed(() =>
+  matchScene(currentWorkModeValue.value, turnModePolicy.value),
+)
+
+async function applyScene(id: SceneId, opts?: { prompt?: string }) {
+  if (!state.currentID) return
+  const scene = SCENE_CAPSULES.find(item => item.id === id)
+  if (!scene) return
+  try {
+    if (currentWorkModeValue.value !== scene.workMode) {
+      await onWorkModePick(scene.workMode)
+    }
+    if (turnModePolicy.value !== scene.turnMode) {
+      await setTurnModePolicy(scene.turnMode as TurnMode)
+    }
+    if (opts?.prompt) prefillComposer(opts.prompt)
+    else nextTick(() => inputEl.value?.focus())
+  } catch (e: any) {
+    message.error(`切换场景失败：${e?.message || e}`)
+  }
+}
+
+function onSceneCapsuleClick(id: SceneId) {
+  void applyScene(id)
+}
 // Display label for the reasoning picker. Maps the enum
 // value (off/low/medium/high/max) to the Chinese label
 // that reasoningEffortOptions uses, so the button shows
@@ -2071,6 +2113,29 @@ watch([() => state.currentID, queueSignature], () => {
         </div>
       </div>
     </Transition>
+
+    <!-- Scenario capsules: one-click work_mode + turn_mode presets.
+         Keep them compact; full explanations stay in 会话设置. -->
+    <div
+      v-if="state.currentID"
+      class="scene-capsules"
+      role="toolbar"
+      aria-label="场景快捷切换"
+    >
+      <button
+        v-for="scene in sceneCapsules"
+        :key="scene.id"
+        type="button"
+        class="scene-capsule"
+        :class="{ 'scene-capsule--active': activeSceneId === scene.id }"
+        :title="scene.hint"
+        :aria-pressed="activeSceneId === scene.id"
+        @click="onSceneCapsuleClick(scene.id)"
+      >
+        <component :is="sceneIconById[scene.id]" :size="13" />
+        <span>{{ scene.label }}</span>
+      </button>
+    </div>
 
     <!-- Attachments live INSIDE the same input-wrap as the
          textarea but BELOW the input-row, so a pasted image
@@ -3069,6 +3134,41 @@ watch([() => state.currentID, queueSignature], () => {
 }
 .input-area--has-queue {
   padding-top: 0;
+}
+.scene-capsules {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-bottom: var(--space-2);
+  min-width: 0;
+}
+.scene-capsule {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: calc(var(--control-height) - 4px);
+  padding: 0 var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+.scene-capsule:hover {
+  color: var(--text-2);
+  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
+}
+.scene-capsule--active {
+  color: var(--text-1);
+  border-color: color-mix(in srgb, var(--brand-500) 36%, var(--border-default));
+  background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-2));
 }
 .input-bottom {
   display: flex;
