@@ -30,6 +30,7 @@
 import { computed, h, nextTick, ref, useTemplateRef, watch, type Component } from 'vue'
 import { renderMarkdown } from '../utils/markdownCache'
 import { formatMessageTime } from '../utils/format'
+import { buildTurnSummary, shouldShowTurnSummary } from '../utils/turnSummary'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
@@ -1004,6 +1005,12 @@ const hasTokens = computed(() =>
   && (props.message.tokens_in || props.message.tokens_out)
 )
 
+const turnSummary = computed(() => {
+  if (props.message.role !== 'assistant' || props.streaming) return null
+  const summary = buildTurnSummary(props.message)
+  return shouldShowTurnSummary(summary) ? summary : null
+})
+
 // "Image not supported" — when the LLM rejects the
 // user's image with the "this model does not support
 // image input" error, the chat store tags the trailing
@@ -1680,6 +1687,11 @@ function findPrecedingUserMessageId(): number {
           <div v-if="message.role === 'assistant' && message.is_archived" class="bubble-archived-chip">
             <CornerDownLeft :size="12" />
             <span class="bubble-archived-label">上一版回答</span>
+          </div>
+
+          <!-- Delight-3: one-line turn recap (tools / files / tokens). -->
+          <div v-if="turnSummary" class="turn-summary" :title="turnSummary.line">
+            {{ turnSummary.line }}
           </div>
 
           <!-- Footer for assistant: tokens / elapsed -->
@@ -2802,6 +2814,25 @@ function findPrecedingUserMessageId(): number {
   flex-wrap: wrap;
 }
 .msg-elapsed, .msg-model { color: var(--text-quaternary); }
+.turn-summary {
+  margin-top: var(--space-2);
+  max-width: 100%;
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--brand-500) 6%, var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--brand-500) 14%, var(--border-subtle));
+  color: var(--text-3);
+  font-size: 11px;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  animation: turn-summary-in var(--dur-base) var(--ease-out);
+}
+@keyframes turn-summary-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
 .msg-meta-tokens { display: inline-flex; align-items: center; gap: 1px; }
 .msg-meta-arrow { color: var(--text-quaternary); margin: 0 1px; }
 .stream-status {

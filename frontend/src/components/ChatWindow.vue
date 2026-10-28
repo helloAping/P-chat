@@ -16,9 +16,14 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments, currentMeta, activeProjectName } from '../stores/chat'
 import { EMPTY_GUIDES, sceneById, type SceneId } from '../utils/scenePresets'
 import { inspectDataTransfer } from '../utils/dropActions'
+import {
+  styleGreeting,
+  isStyleGreetingHidden,
+  setStyleGreetingHidden,
+} from '../utils/styleGreetings'
 import * as api from '../api/client'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
@@ -83,6 +88,18 @@ async function applyGuideScene(sceneId: SceneId) {
 
 const needsSetup = computed(() => (state.providers || []).length === 0)
 const dropOverChat = ref(false)
+const greetingHidden = ref(isStyleGreetingHidden())
+const greetingText = computed(() =>
+  styleGreeting(currentMeta.value.style, activeProjectName.value),
+)
+const greetingKey = computed(() =>
+  `${currentMeta.value.style || 'off'}|${activeProjectName.value}|${greetingText.value}`,
+)
+
+function hideGreeting() {
+  setStyleGreetingHidden(true)
+  greetingHidden.value = true
+}
 
 function openFirstRun() {
   ;(window as any).openFirstRunWizard?.()
@@ -574,6 +591,22 @@ function messageKey(m: any, i: number): string | number {
             <MessageSquare :size="40" />
           </div>
           <div class="empty-title">开始一个新对话吧</div>
+          <Transition name="greet-fade" mode="out-in">
+            <p
+              v-if="!greetingHidden"
+              :key="greetingKey"
+              class="empty-greeting"
+            >
+              <span>{{ greetingText }}</span>
+              <button
+                type="button"
+                class="empty-greeting-hide"
+                title="不再显示问候"
+                aria-label="不再显示问候"
+                @click="hideGreeting"
+              >×</button>
+            </p>
+          </Transition>
           <div class="empty-hint">点一张卡片填入提示，确认后再发送 · 也可拖入文件夹开项目，或拖入附件</div>
           <button
             v-if="needsSetup"
@@ -887,6 +920,42 @@ function messageKey(m: any, i: number): string | number {
 }
 .empty-icon { color: var(--text-quaternary); display: inline-flex; }
 .empty-title { font-size: 15px; color: var(--text-2); }
+.empty-greeting {
+  display: inline-flex;
+  align-items: flex-start;
+  gap: var(--space-1);
+  max-width: 28rem;
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--brand-500) 7%, var(--surface-2));
+  border: 1px solid color-mix(in srgb, var(--brand-500) 16%, var(--border-subtle));
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.45;
+  text-align: left;
+}
+.empty-greeting-hide {
+  flex-shrink: 0;
+  margin-top: -1px;
+  padding: 0 2px;
+  border: none;
+  background: transparent;
+  color: var(--text-4);
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+}
+.empty-greeting-hide:hover { color: var(--text-2); }
+.greet-fade-enter-active,
+.greet-fade-leave-active {
+  transition: opacity var(--dur-base) var(--ease-out), transform var(--dur-base) var(--ease-out);
+}
+.greet-fade-enter-from,
+.greet-fade-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
+}
 .empty-hint { font-size: 12px; color: var(--text-4); max-width: 28rem; }
 .empty-setup {
   margin-top: var(--space-1);

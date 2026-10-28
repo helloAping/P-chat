@@ -1384,11 +1384,19 @@ async function onModelSelect(sel: { provider: string; model: string }) {
 
 async function onStylePick(v: string) {
   if (!state.currentID) return
+  const prev = currentMeta.value.style || 'off'
   const resp = await api.updateSessionMeta(state.currentID, { style: v })
   const id = state.currentID
+  const next = resp.style ?? v
   state.sessionMeta[id] = {
     ...(state.sessionMeta[id] || currentMeta.value),
-    style: resp.style ?? v,
+    style: next,
+  }
+  // Delight-3: light feedback when switching persona (empty chat
+  // greeting also updates reactively via currentMeta.style).
+  if (next !== prev && next !== 'off') {
+    const label = styleOptions.value.find(o => o.value === next)?.label || next
+    message.success(`已切换风格：${label}`, { duration: 1600 })
   }
 }
 
