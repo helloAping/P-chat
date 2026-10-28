@@ -144,12 +144,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// the refreshed config).
 	search.SetGlobal(search.BuildProvider(cfg.Search))
 	search.SetQuotaLimit(cfg.Search.DailyQuota)
+	search.SetGlobalFetcher(search.BuildFetcher(cfg.Fetch))
+	search.SetFetchQuotaLimit(cfg.Fetch.DailyQuota)
 	if cfg.Search.Enabled {
 		log.Printf("[search] web_search enabled, provider=%s, daily_quota=%d",
 			search.Global().Name(), cfg.Search.DailyQuota)
 	} else {
 		log.Printf("[search] web_search disabled (no provider configured)")
 	}
+	log.Printf("[fetch] web_fetch provider=%s, daily_quota=%d",
+		search.GlobalFetcher().Name(), cfg.Fetch.DailyQuota)
 	tool.RegisterGrep(toolReg, cfg)
 	server.SyncConfigDrivenTools(toolReg, cfg)
 

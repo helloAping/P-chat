@@ -27,6 +27,7 @@ type SearchSettingsResponse struct {
 	BaseURL        string `json:"base_url,omitempty"`
 	Path           string `json:"path,omitempty"`
 	Topic          string `json:"topic,omitempty"`
+	Model          string `json:"model,omitempty"`
 	DailyQuota     int    `json:"daily_quota"`
 	RequestTimeout string `json:"request_timeout"`
 
@@ -50,6 +51,7 @@ func (h *Handler) GetWebSearchSettings(c *gin.Context) {
 		BaseURL:        cfg.BaseURL,
 		Path:           cfg.Path,
 		Topic:          cfg.Topic,
+		Model:          cfg.Model,
 		DailyQuota:     cfg.DailyQuota,
 		RequestTimeout: cfg.RequestTimeout.String(),
 		UsedToday:      used,
@@ -76,6 +78,7 @@ type SearchSettingsRequest struct {
 	BaseURL        *string `json:"base_url,omitempty"`
 	Path           *string `json:"path,omitempty"`
 	Topic          *string `json:"topic,omitempty"`
+	Model          *string `json:"model,omitempty"`
 	DailyQuota     *int    `json:"daily_quota,omitempty"`
 	RequestTimeout *string `json:"request_timeout,omitempty"`
 }
@@ -103,6 +106,7 @@ func (h *Handler) UpdateWebSearchSettings(c *gin.Context) {
 		BaseURL:        req.BaseURL,
 		Path:           req.Path,
 		Topic:          req.Topic,
+		Model:          req.Model,
 		DailyQuota:     req.DailyQuota,
 		RequestTimeout: req.RequestTimeout,
 	}
@@ -125,6 +129,7 @@ func (h *Handler) UpdateWebSearchSettings(c *gin.Context) {
 		BaseURL:        updated.BaseURL,
 		Path:           updated.Path,
 		Topic:          updated.Topic,
+		Model:          updated.Model,
 		DailyQuota:     updated.DailyQuota,
 		RequestTimeout: updated.RequestTimeout.String(),
 		UsedToday:      used,

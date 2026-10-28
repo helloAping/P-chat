@@ -1561,6 +1561,14 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 		return &CallResult{Content: "E_ARGS: method must be GET or POST", IsError: true}, nil
 	}
 
+	// Vendor fetch runs only for a public GET with no body. POST stays
+	// on this machine, and a vendor miss falls through to the local client.
+	if method == "GET" && a.Body == "" {
+		if result, handled := fetchViaVendor(ctx, a.URL); handled {
+			return result, nil
+		}
+	}
+
 	var reqBody io.Reader
 	if a.Body != "" {
 		if method != "POST" {

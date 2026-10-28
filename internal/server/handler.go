@@ -1359,6 +1359,9 @@ func (h *Handler) reloadAfterConfigChange() {
 	// (enable, key, provider) take effect on the very next
 	// tool call without a server restart.
 	search.SetGlobal(search.BuildProvider(cfg.Search))
+	search.SetQuotaLimit(cfg.Search.DailyQuota)
+	search.SetGlobalFetcher(search.BuildFetcher(cfg.Fetch))
+	search.SetFetchQuotaLimit(cfg.Fetch.DailyQuota)
 	SyncConfigDrivenTools(h.toolReg, cfg)
 	if h.agent == nil {
 		return

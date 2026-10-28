@@ -183,6 +183,18 @@ func newClient() *http.Client {
 // results with snippets).
 const maxResponseBytes = 4 << 20
 
+// truncateRunes clips s to at most max Unicode characters.
+func truncateRunes(s string, max int) string {
+	if max <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "…"
+}
+
 // truncateSnippet clips a snippet to 500 chars at a word
 // boundary when possible, to keep the LLM's context tidy.
 func truncateSnippet(s string) string {

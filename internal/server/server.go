@@ -379,6 +379,9 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		api.GET("/settings/web_search", h.GetWebSearchSettings)
 		api.PUT("/settings/web_search", h.UpdateWebSearchSettings)
 		api.POST("/settings/web_search/test", h.TestWebSearchConnection)
+		api.GET("/settings/web_fetch", h.GetWebFetchSettings)
+		api.PUT("/settings/web_fetch", h.UpdateWebFetchSettings)
+		api.POST("/settings/web_fetch/test", h.TestWebFetchConnection)
 
 		// Browser control
 		api.GET("/browser/status", h.BrowserStatus)

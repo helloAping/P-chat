@@ -2502,6 +2502,7 @@ export interface WebSearchSettings {
   base_url?: string
   path?: string
   topic?: string
+  model?: string
   daily_quota: number
   request_timeout: string
   used_today: number
@@ -2522,6 +2523,7 @@ export interface UpdateWebSearchRequest {
   base_url?: string
   path?: string
   topic?: string
+  model?: string
   daily_quota?: number
   request_timeout?: string
 }
@@ -2538,6 +2540,46 @@ export const updateWebSearchSettings = (patch: UpdateWebSearchRequest) =>
 export const testWebSearchConnection = () =>
   jsonFetch<{ ok: boolean; provider?: string; result_count?: number; error?: string }>(
     '/api/v1/settings/web_search/test',
+    { method: 'POST' },
+  )
+
+// ---- Web fetch settings ----
+
+export interface WebFetchSettings {
+  provider: string
+  has_key: boolean
+  base_url?: string
+  path?: string
+  model?: string
+  daily_quota: number
+  request_timeout: string
+  used_today: number
+  resets_at: string
+}
+
+export const getWebFetchSettings = () =>
+  jsonFetch<WebFetchSettings>('/api/v1/settings/web_fetch')
+
+export interface UpdateWebFetchRequest {
+  provider?: string
+  api_key?: string
+  clear_api_key?: boolean
+  base_url?: string
+  path?: string
+  model?: string
+  daily_quota?: number
+  request_timeout?: string
+}
+
+export const updateWebFetchSettings = (patch: UpdateWebFetchRequest) =>
+  jsonFetch<WebFetchSettings>('/api/v1/settings/web_fetch', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  })
+
+export const testWebFetchConnection = () =>
+  jsonFetch<{ ok: boolean; provider?: string; title?: string; error?: string }>(
+    '/api/v1/settings/web_fetch/test',
     { method: 'POST' },
   )
 

@@ -36,12 +36,60 @@ func BuildProvider(cfg config.SearchConfig) Provider {
 		return &OpenAICompatProvider{
 			APIKey:  cfg.APIKey,
 			BaseURL: cfg.BaseURL,
+			Path:    cfg.Path,
+			Timeout: pickTimeout(cfg.RequestTimeout),
+		}
+	case "deepseek":
+		if strings.TrimSpace(cfg.APIKey) == "" {
+			return DisabledProvider{}
+		}
+		return &DeepSeekProvider{
+			APIKey:  cfg.APIKey,
+			BaseURL: cfg.BaseURL,
+			Path:    cfg.Path,
+			Timeout: pickTimeout(cfg.RequestTimeout),
+		}
+	case "mimo":
+		if strings.TrimSpace(cfg.APIKey) == "" {
+			return DisabledProvider{}
+		}
+		return &MiMoProvider{
+			APIKey:  cfg.APIKey,
+			BaseURL: cfg.BaseURL,
+			Model:   cfg.Model,
+			Timeout: pickTimeout(cfg.RequestTimeout),
+		}
+	case "qwen":
+		if strings.TrimSpace(cfg.APIKey) == "" || strings.TrimSpace(cfg.BaseURL) == "" {
+			return DisabledProvider{}
+		}
+		return &QwenProvider{
+			APIKey:  cfg.APIKey,
+			BaseURL: cfg.BaseURL,
+			Model:   cfg.Model,
 			Timeout: pickTimeout(cfg.RequestTimeout),
 		}
 	default:
 		// Unknown provider name: surface a sentinel that the
 		// tool handler can translate to a user-friendly error.
 		return DisabledProvider{}
+	}
+}
+
+// ProviderReady reports whether cfg can serve web_search.
+func ProviderReady(cfg config.SearchConfig) bool {
+	if !cfg.Enabled {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
+	case "", "tavily", "deepseek", "mimo":
+		return strings.TrimSpace(cfg.APIKey) != ""
+	case "openai_compat":
+		return strings.TrimSpace(cfg.BaseURL) != ""
+	case "qwen":
+		return strings.TrimSpace(cfg.APIKey) != "" && strings.TrimSpace(cfg.BaseURL) != ""
+	default:
+		return false
 	}
 }
 

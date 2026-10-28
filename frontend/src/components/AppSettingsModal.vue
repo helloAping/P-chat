@@ -36,6 +36,7 @@ import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
 import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
+import WebFetchSettings from './WebFetchSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
 import KnowledgeRecallPreview from './KnowledgeRecallPreview.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
@@ -206,7 +207,7 @@ const settingsTabs = [
   { name: 'skills',    label: '技能',          icon: Wrench,   description: '可加载的技能包', group: '能力' },
   { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器', group: '能力' },
   { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索', group: '能力' },
-  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商', group: '能力' },
+  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: '搜索与网页抓取渠道', group: '能力' },
   { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制', group: '能力' },
   { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话', group: '数据' },
   { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照', group: '数据' },
@@ -4159,6 +4160,7 @@ function kbModelSupportsVision(scanModel: string) {
 
       <NTabPane name="websearch" tab="网络搜索" style="flex: 1; min-height: 0; overflow: auto">
         <WebSearchSettings />
+        <WebFetchSettings />
       </NTabPane>
 
       <NTabPane name="browser" tab="浏览器" style="flex: 1; min-height: 0; overflow: auto">

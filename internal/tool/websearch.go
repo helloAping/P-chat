@@ -38,23 +38,7 @@ func RegisterWebSearch(r *Registry, cfg config.SearchConfig) {
 	// duplicated in search.BuildProvider; we keep it here
 	// so the tool is *truly* invisible (not just erroring on
 	// every call).
-	if !cfg.Enabled {
-		return
-	}
-	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
-	case "", "tavily":
-		if cfg.APIKey == "" {
-			return
-		}
-	case "openai_compat":
-		if cfg.BaseURL == "" {
-			return
-		}
-	default:
-		// Unknown provider name — don't register. The
-		// settings UI surfaces this as a validation error
-		// at save time, so the LLM never sees the tool
-		// in a broken state.
+	if !search.ProviderReady(cfg) {
 		return
 	}
 

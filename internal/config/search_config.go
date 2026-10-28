@@ -31,6 +31,7 @@ type SearchConfigPatch struct {
 	Topic          *string `json:"topic,omitempty"`
 	DailyQuota     *int    `json:"daily_quota,omitempty"`
 	RequestTimeout *string `json:"request_timeout,omitempty"`
+	Model          *string `json:"model,omitempty"`
 }
 
 // UpdateSearchConfig merges a SearchConfigPatch into the
@@ -40,8 +41,8 @@ type SearchConfigPatch struct {
 // RegisterWebSearch and search.BuildProvider, so the
 // caller can rely on a round-trip):
 //
-//   - provider, if non-empty, must be "tavily" or
-//     "openai_compat" (case-insensitive).
+//   - provider, if non-empty, must be "tavily",
+//     "openai_compat", "deepseek", "mimo", or "qwen".
 //   - base_url (if non-empty) must parse as a URL with
 //     http or https scheme; non-loopback http is rejected.
 //   - daily_quota, if non-zero, must be 1..100000.
@@ -66,10 +67,10 @@ func UpdateSearchConfigAt(configPath string, patch SearchConfigPatch) (*SearchCo
 	if patch.Provider != nil {
 		normalized := strings.ToLower(strings.TrimSpace(*patch.Provider))
 		switch normalized {
-		case "", "tavily", "openai_compat":
+		case "", "tavily", "openai_compat", "deepseek", "mimo", "qwen":
 			// OK
 		default:
-			return nil, fmt.Errorf("%w: unknown provider %q (expected 'tavily' or 'openai_compat')",
+			return nil, fmt.Errorf("%w: unknown provider %q (expected tavily, openai_compat, deepseek, mimo, or qwen)",
 				ErrBadSearch, *patch.Provider)
 		}
 		cfg.Search.Provider = normalized
@@ -123,6 +124,14 @@ func UpdateSearchConfigAt(configPath string, patch SearchConfigPatch) (*SearchCo
 		cfg.Search.DailyQuota = q
 	}
 
+	if patch.Model != nil {
+		model := strings.TrimSpace(*patch.Model)
+		if len([]rune(model)) > 128 {
+			return nil, fmt.Errorf("%w: model must be at most 128 characters", ErrBadSearch)
+		}
+		cfg.Search.Model = model
+	}
+
 	if patch.RequestTimeout != nil {
 		raw := strings.TrimSpace(*patch.RequestTimeout)
 		if raw == "" {
@@ -157,6 +166,14 @@ func UpdateSearchConfigAt(configPath string, patch SearchConfigPatch) (*SearchCo
 			if cfg.Search.BaseURL == "" {
 				return nil, fmt.Errorf("%w: enabled=true requires base_url for provider 'openai_compat'", ErrBadSearch)
 			}
+		case "deepseek", "mimo":
+			if cfg.Search.APIKey == "" {
+				return nil, fmt.Errorf("%w: enabled=true requires api_key for provider %q", ErrBadSearch, prov)
+			}
+		case "qwen":
+			if cfg.Search.APIKey == "" || cfg.Search.BaseURL == "" {
+				return nil, fmt.Errorf("%w: enabled=true requires api_key and base_url for provider 'qwen'", ErrBadSearch)
+			}
 		}
 	}
 
@@ -184,6 +201,9 @@ func UpdateSearchConfigAt(configPath string, patch SearchConfigPatch) (*SearchCo
 	}
 	if patch.RequestTimeout != nil {
 		fields = append(fields, overlayField(cfg.Search.RequestTimeout, "search", "request_timeout"))
+	}
+	if patch.Model != nil {
+		fields = append(fields, overlayField(cfg.Search.Model, "search", "model"))
 	}
 	if err := saveConfigFieldsAt(configPath, cfg, fields...); err != nil {
 		return nil, fmt.Errorf("save search config: %w", err)

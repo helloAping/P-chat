@@ -34,7 +34,10 @@ type Config struct {
 	Knowledge KnowledgeConfig `json:"knowledge"`
 	Limits    LimitsConfig    `json:"limits"`
 	Search    SearchConfig    `json:"search"`
-	Browser   BrowserConfig   `json:"browser"`
+	// Fetch selects the web_fetch backend. An empty provider means
+	// the process fetches the URL itself.
+	Fetch   FetchConfig   `json:"fetch,omitempty"`
+	Browser BrowserConfig `json:"browser"`
 	// Generation selects application defaults for vendor-neutral media tools.
 	Generation GenerationConfig `json:"generation,omitempty"`
 	// Recognition is the canonical media-recognition configuration. Each
@@ -1003,6 +1006,9 @@ type MemoryConfig struct {
 //   - "openai_compat": any HTTP endpoint that accepts
 //     `{query, max_results, ...}` and returns
 //     `{results: [{title, url, snippet}, ...]}`; requires BaseURL
+//   - "deepseek": POST /v1/tools/search, requires APIKey
+//   - "mimo": Chat Completions web_search tool, requires APIKey
+//   - "qwen": Responses API web_search tool, requires APIKey and BaseURL
 type SearchConfig struct {
 	// Enabled is the master switch. When false, the `web_search`
 	// tool is not registered and the LLM cannot call it.
@@ -1042,6 +1048,41 @@ type SearchConfig struct {
 	// counter resets at 00:00 UTC and is *not* persisted
 	// across server restarts (a deliberate choice — quota
 	// is a soft budget, not a billing boundary).
+	DailyQuota int `json:"daily_quota,omitempty"`
+
+	// Model is the hosted-tool model for mimo and qwen.
+	// Empty uses the provider default.
+	Model string `json:"model,omitempty"`
+}
+
+// FetchConfig configures the web_fetch backend.
+//
+// The tool stays registered either way. Provider "local" (or empty)
+// fetches from this process. "deepseek" and "qwen" send the URL to
+// that vendor and fall back to a local GET when the vendor returns
+// no page, times out, or answers 5xx. POST requests always stay local.
+type FetchConfig struct {
+	// Provider selects the backend. Empty string = "local".
+	Provider string `json:"provider,omitempty"`
+
+	// APIKey is required for deepseek and qwen.
+	APIKey string `json:"api_key,omitempty"`
+
+	// BaseURL overrides the vendor endpoint. Required for qwen
+	// because the workspace host is account-specific.
+	BaseURL string `json:"base_url,omitempty"`
+
+	// Path overrides the fetch path. Empty uses the vendor default.
+	Path string `json:"path,omitempty"`
+
+	// Model is the hosted-tool model for qwen. Empty uses the default.
+	Model string `json:"model,omitempty"`
+
+	// RequestTimeout is the per-fetch HTTP timeout. Zero means 20s.
+	RequestTimeout time.Duration `json:"request_timeout,omitempty"`
+
+	// DailyQuota caps vendor fetches per UTC day. 0 = unlimited.
+	// Local fetches do not consume it. The counter is in-memory.
 	DailyQuota int `json:"daily_quota,omitempty"`
 }
 
@@ -1461,6 +1502,10 @@ func Default() *Config {
 		Search: SearchConfig{
 			Enabled:        false,
 			Provider:       "tavily",
+			RequestTimeout: 20 * time.Second,
+		},
+		Fetch: FetchConfig{
+			Provider:       "local",
 			RequestTimeout: 20 * time.Second,
 		},
 		Browser: BrowserConfig{
