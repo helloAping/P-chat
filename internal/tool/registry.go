@@ -831,6 +831,41 @@ func RegisterBuiltin(r *Registry) {
 	}, handleEditFile)
 
 	r.Register(Tool{
+		Name: "apply_patch",
+		Description: "Apply a multi-file, multi-hunk patch in one call. Prefer this over repeated edit_file/write_file for coordinated edits. " +
+			"Pass either Codex-style patch text (*** Begin Patch / *** Update File / @@ / ± lines / *** End Patch) " +
+			"or structured operations[{op,path,hunks|content}]. Each update hunk must match exactly once; conflicts return expected vs file context.",
+		Parameters: ObjectSchema(map[string]any{
+			"patch": StringProp("Codex-style patch envelope covering one or more Add/Update/Delete File sections"),
+			"operations": map[string]any{
+				"type": "array",
+				"description": "Structured alternative to patch text. op=update|add|delete; update needs hunks[{old_text,new_text}]; add needs content.",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"op":      StringProp("update | add | delete"),
+						"path":    StringProp("Target file path"),
+						"content": StringProp("Full file body when op=add"),
+						"hunks": map[string]any{
+							"type": "array",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"old_text": StringProp("Exact existing text to replace"),
+									"new_text": StringProp("Replacement text"),
+								},
+								"required": []string{"old_text", "new_text"},
+							},
+						},
+					},
+					"required": []string{"op", "path"},
+				},
+			},
+			"dry_run": BoolProp("If true, validate and report without writing"),
+		}, nil),
+	}, handleApplyPatch)
+
+	r.Register(Tool{
 		Name:        "list_files",
 		Description: "List files and subdirectories in a directory. Returns names only, not recursive.",
 		Parameters: ObjectSchema(map[string]any{

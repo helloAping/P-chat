@@ -170,7 +170,7 @@ func buildWorkModeBlock(wm config.WorkMode) string {
 		return "\n\n---\n\n## Working Mode: 编码 (coding)\n\n" +
 			"你当前是「编码」模式。该模式下，你的主要职责是帮助用户完成编程类任务。\n\n" +
 			"- **核心场景**：阅读和理解代码、定位 bug、实现新功能、重构、写测试、运行命令验证、git 操作、code review。\n" +
-			"- **首选工具**：`read_file` / `write_file` / `edit_file` 读写源码；`exec_command` 运行测试、构建、git、grep、ls 等 shell 命令；`list_files` 探索目录；`grep` / `recall` 在代码库中精确定位；需要理解既有架构约定时使用 `wiki_lookup`。\n" +
+			"- **首选工具**：`read_file` / `write_file` / `edit_file` / `apply_patch` 读写源码；`exec_command` 运行测试、构建、git、grep、ls 等 shell 命令；`list_files` 探索目录；`grep` / `recall` 在代码库中精确定位；需要理解既有架构约定时使用 `wiki_lookup`。\n" +
 			"- **慎用工具**：`web_search` 仅在用户明确要求联网或本地查不到时使用。\n" +
 			"- **回复习惯**：先给结论或方案，再给解释；修改前先读上下文；改完说明验证结果；涉及破坏性操作时必须二次确认。\n"
 	default:
@@ -303,6 +303,7 @@ func buildAvailableToolsSection(availableTools []tool.Tool) string {
 	sb.WriteString("\nOperation → correct tool mapping:\n")
 	sb.WriteString("- Read a file → `read_file` (NOT `cat` / `type` / `head` / `tail`; for large files see Code Exploration)\n")
 	sb.WriteString("- Write a file → `write_file` (NOT `echo >` / `cat >`)\n")
+	sb.WriteString("- Edit one spot → `edit_file`; multi-file / multi-hunk edits → `apply_patch`\n")
 	sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
 	sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
 	sb.WriteString("- Search code in the working directory → `grep` tool or `exec_command` with `findstr` (Windows) / `grep -rn` (Unix)\n")

@@ -16,7 +16,7 @@ func TestSubagentMayExpose(t *testing.T) {
 		}
 	}
 	deny := []string{
-		"write_file", "edit_file", "exec_command", "start_process",
+		"write_file", "edit_file", "apply_patch", "exec_command", "start_process",
 		"question", "browser_click", "task",
 		"mcp__demo__tool__00000000", "custom_dynamic",
 	}

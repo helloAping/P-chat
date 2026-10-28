@@ -104,6 +104,41 @@ func confirmTargetFor(toolName, argsJSON, projectRoot string, sb sandboxForConfi
 			PathClass:    classForPath(resolved, projectRoot),
 			RiskLevel:    "high", // writes mutate user data
 		}, true
+	case "apply_patch":
+		// Multi-path write: take the most restrictive sandbox decision
+		// across every file the patch touches.
+		paths := tool.PathsFromApplyPatchArgs(argsJSON)
+		if len(paths) == 0 {
+			return confirmTarget{
+				Decision:  tool.SandboxConfirm,
+				Reason:    "apply_patch with no resolvable paths",
+				RiskLevel: "high",
+			}, true
+		}
+		decision := tool.SandboxAllow
+		resolvedList := make([]string, 0, len(paths))
+		pathClass := "project"
+		for _, p := range paths {
+			resolved := resolveForConfirm(p, projectRoot)
+			resolvedList = append(resolvedList, resolved)
+			d := sb.CheckWriteDecision(resolved, projectRoot)
+			if d == tool.SandboxBlock {
+				decision = tool.SandboxBlock
+			} else if d == tool.SandboxConfirm && decision != tool.SandboxBlock {
+				decision = tool.SandboxConfirm
+			}
+			cls := classForPath(resolved, projectRoot)
+			if cls == "outside" || cls == "system" {
+				pathClass = cls
+			}
+		}
+		return confirmTarget{
+			Decision:     decision,
+			Reason:       "",
+			ResolvedPath: strings.Join(resolvedList, "; "),
+			PathClass:    pathClass,
+			RiskLevel:    "high",
+		}, true
 	case "read_file", "read_docx", "read_pdf":
 		var ra struct {
 			Path string `json:"path"`

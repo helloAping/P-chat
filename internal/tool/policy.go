@@ -159,7 +159,7 @@ func defaultToolPolicy(name string) ToolPolicy {
 	case name == "read_file" || name == "read_attachment" || name == "read_docx" || name == "read_pdf" || name == "list_files" || name == "grep" || name == "recall" || name == "wiki_lookup" || name == "wiki_list" || name == "task_status" || name == "image_recognize" || name == "media_recognize":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryRead, ToolSideEffectNone, ToolRiskLow, ToolParallelSafe
 		p.TimeoutMS = durationMS(ReadToolTimeout)
-	case name == "write_file" || name == "edit_file":
+	case name == "write_file" || name == "edit_file" || name == "apply_patch":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryMutate, ToolSideEffectWorkspace, ToolRiskConfirm, ToolParallelExclusive
 		p.TimeoutMS, p.RequiresVerification = durationMS(WriteToolTimeout), true
 	case name == "exec_command" || name == "start_process" || name == "stop_process" || name == "read_process_output" || name == "list_processes":
