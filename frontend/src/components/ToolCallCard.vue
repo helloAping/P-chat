@@ -219,6 +219,14 @@ const argsPretty = computed(() => {
   try { return JSON.stringify(JSON.parse(a), null, 2) } catch { return a }
 })
 
+// AE-01: while args are still streaming the JSON is often incomplete —
+// show a light cue so long write_file payloads don't look stuck.
+const argsStreaming = computed(() =>
+  props.part.status === 'start' && !!props.part.args && (() => {
+    try { JSON.parse(props.part.args!); return false } catch { return true }
+  })(),
+)
+
 // P2-4: a dry-run call is signalled by a `dry_run: true`
 // arg. The handler returns a preview string starting
 // with "[dry-run] would …" without actually executing
@@ -446,7 +454,10 @@ async function resultForCopy(): Promise<string> {
         <pre>{{ argsPretty }}</pre>
       </details>
       <div v-else-if="!isQuestionTool && part.args" class="tool-args">
-        <div class="tool-section-label">参数</div>
+        <div class="tool-section-label">
+          参数
+          <span v-if="argsStreaming" class="tool-args-streaming">生成中…</span>
+        </div>
         <pre>{{ argsPretty }}</pre>
       </div>
       <div v-if="!isQuestionTool && part.result" class="tool-result">
@@ -726,6 +737,11 @@ async function resultForCopy(): Promise<string> {
   color: var(--text-quaternary);
   margin: 4px 0 2px;
   font-weight: 500;
+}
+.tool-args-streaming {
+  margin-left: 6px;
+  color: var(--accent);
+  font-weight: 400;
 }
 .tool-context-refs {
   display: flex;

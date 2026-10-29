@@ -154,6 +154,9 @@ type nativeToolCall struct {
 	Name        string
 	ArgsJSON    string
 	OutputIndex int
+	// StreamAnnounced is true after a live start card was sent on
+	// the wire during LLM args streaming (AE-01). Not persisted.
+	StreamAnnounced bool
 }
 
 // partsAccumulator mutates a `[]MessagePart` in place as
@@ -511,6 +514,11 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	if c.ToolName != "" {
 		parts, subIdx := a.activePartsFor(c)
 		status := ToolStatusFromResult(c.ToolCallStatus, c.Step, c.ToolError)
+		// AE-01 args deltas are wire-only for the live ToolCard;
+		// full args land on the real start/ok events at dispatch.
+		if status == "args" {
+			return
+		}
 		if status == "start" {
 			// When a ToolID is present, avoid clobbering an
 			// earlier same-name start part — the ID is the
@@ -758,17 +766,17 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 
 	// StreamReset: the LLM attempt that produced the current round's
 	// text/thinking deltas failed mid-stream and is being retried.
-	// Drop every text/thinking part accumulated by the failed attempt
-	// so the retry re-streams onto a clean bubble instead of
-	// duplicating content. Skill / tool / question parts are kept:
-	// skill cards are emitted before the stream starts, and tool
-	// parts only exist after a successful stream (tools dispatch
-	// post-Done), so neither can belong to the failed attempt.
+	// Drop text/thinking and any AE-01 provisional tool cards
+	// (status=start) from the failed attempt. Completed tools from
+	// earlier rounds and skill/question cards are kept.
 	if c.StreamReset {
 		parts, subIdx := a.activePartsFor(c)
 		kept := parts[:0]
 		for _, p := range parts {
 			if p.Kind == "text" || p.Kind == "thinking" {
+				continue
+			}
+			if p.Kind == "tool" && p.Status == "start" {
 				continue
 			}
 			kept = append(kept, p)
@@ -888,6 +896,12 @@ func ToolStatusFromResult(callStatus, step, errMsg string) string {
 	if callStatus == "blocked" {
 		return "blocked"
 	}
+	// AE-01: args-delta chunks carry ToolCallStatus=args (and/or
+	// step call-N-args). Prefer the structured status so we never
+	// confuse a delta with a terminal tool result.
+	if callStatus == "args" {
+		return "args"
+	}
 	return ToolStatusFromStep(step, errMsg)
 }
 
@@ -903,7 +917,7 @@ func parseStepStatus(step string) string {
 	}
 	candidate := step[idx+1:]
 	switch candidate {
-	case "ok", "warn", "err", "error", "start":
+	case "ok", "warn", "err", "error", "start", "args":
 		return canonicalStatus(candidate)
 	}
 	return ""
@@ -921,6 +935,8 @@ func canonicalStatus(s string) string {
 		return "error"
 	case "start":
 		return "start"
+	case "args":
+		return "args"
 	}
 	return s
 }

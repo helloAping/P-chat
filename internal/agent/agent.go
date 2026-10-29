@@ -2831,7 +2831,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					//     usage deltas (usage itself is per-attempt)
 					//   - partsAcc + stream_reset event: drop the partial
 					//     text/thinking parts already shown in the UI
-					hadPartial := fullContentBuilder.Len() > 0 || fullThinkingBuilder.Len() > 0
+					hadPartial := fullContentBuilder.Len() > 0 || fullThinkingBuilder.Len() > 0 || len(argsAccum) > 0
 					fullContentBuilder.Reset()
 					fullThinkingBuilder.Reset()
 					argsAccum = make(map[int]*nativeToolCall)
@@ -2840,8 +2840,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					totalIn, totalOut = roundStartTotalIn, roundStartTotalOut
 					if hadPartial {
 						// The UI already carries partial text/thinking
-						// from the failed attempt — tell it to drop them
-						// before the retry's deltas arrive.
+						// (and AE-01 provisional tool cards) from the
+						// failed attempt — tell it to drop them before
+						// the retry's deltas arrive.
 						partsAcc.update(ChatStreamChunk{StreamReset: true})
 						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 							Phase:       "llm",
@@ -3079,6 +3080,36 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							existing.ItemID = tcd.ItemID
 						}
 						existing.ArgsJSON += tcd.ArgsJSON
+						// AE-01: surface the tool card as soon as id+name
+						// are known, then forward args fragments so the
+						// GUI can stream long write_file/edit_file JSON.
+						// Wire-only — partsAcc still records the full args
+						// on the post-stream start event.
+						if existing.ID != "" && existing.Name != "" {
+							if !existing.StreamAnnounced {
+								existing.StreamAnnounced = true
+								sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{
+									Phase:    "tool",
+									Step:     fmt.Sprintf("call-%d", tcd.Index+1),
+									ToolID:   existing.ID,
+									ToolName: existing.Name,
+									Round:    roundNum,
+									MaxRound: maxRounds,
+								})
+							}
+							if tcd.ArgsJSON != "" {
+								sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{
+									Phase:          "tool",
+									Step:           fmt.Sprintf("call-%d-args", tcd.Index+1),
+									ToolID:         existing.ID,
+									ToolName:       existing.Name,
+									ToolArgs:       tcd.ArgsJSON,
+									ToolCallStatus: "args",
+									Round:          roundNum,
+									MaxRound:       maxRounds,
+								})
+							}
+						}
 					}
 					if chunk.ResponsesOutputItem != nil {
 						responsesItems[chunk.ResponsesOutputItem.OutputIndex] = *chunk.ResponsesOutputItem
@@ -3426,11 +3457,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					tc.ID = "call_" + uuid.NewString()
 					toolCalls[i].ID = tc.ID
 				}
-				argsPreview := tc.ArgsJSON
-				if len(argsPreview) > 200 {
-					argsPreview = argsPreview[:200] + "..."
-				}
-				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
+				// AE-01: send full args on start (UI truncates for display).
+				// Streaming fragments already painted the card; this
+				// replaces partial JSON with the final payload.
+				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: tc.ArgsJSON, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
 				sendOrDrop(ctx, ch, nextSeq, startChunk)
 				if skillName, isLoad := parseSkillLoadCall(tc.Name, tc.ArgsJSON); isLoad {
@@ -4050,10 +4080,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					ordinaryWorkCalled = true
 				}
 				toolElapsed := formatElapsed(o.elapsed)
-				argsPreview := tc.ArgsJSON
-				if len(argsPreview) > 200 {
-					argsPreview = argsPreview[:200] + "..."
-				}
 
 				if o.err != nil || o.result == nil {
 					roundAnyToolErrored = true

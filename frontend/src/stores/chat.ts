@@ -2367,11 +2367,18 @@ function startsBeforeCurrentAttempt(parts: MessagePart[]): boolean {
 function resetCurrentStreamAttempt(parts: MessagePart[]) {
   const markedStart = streamAttemptStarts.get(parts)
   if (markedStart !== undefined) {
-    // 只删除当前 round 边界之后的流式文本，保留早先成功的 ReAct 轮次。
-    // Remove streamed prose only after the current round boundary, preserving
-    // successful text/thinking from earlier ReAct rounds in the same bubble.
+    // 只删除当前 round 边界之后的流式文本 / AE-01 临时工具卡，保留早先成功的 ReAct 轮次。
+    // Remove streamed prose and provisional tool cards after the current round
+    // boundary, preserving successful text/thinking/tools from earlier rounds.
     for (let i = parts.length - 1; i >= markedStart; i--) {
-      if (parts[i].kind === 'text' || parts[i].kind === 'thinking') parts.splice(i, 1)
+      const p = parts[i]
+      if (p.kind === 'text' || p.kind === 'thinking') {
+        parts.splice(i, 1)
+        continue
+      }
+      if (p.kind === 'tool' && p.status === 'start') {
+        parts.splice(i, 1)
+      }
     }
     return
   }
@@ -2380,9 +2387,16 @@ function resetCurrentStreamAttempt(parts: MessagePart[]) {
   // Older-server fallback: without a round-start phase, remove only the
   // contiguous streamed tail and stop at the nearest structural part.
   while (parts.length > 0) {
-    const kind = parts[parts.length - 1].kind
-    if (kind !== 'text' && kind !== 'thinking') break
-    parts.pop()
+    const last = parts[parts.length - 1]
+    if (last.kind === 'text' || last.kind === 'thinking') {
+      parts.pop()
+      continue
+    }
+    if (last.kind === 'tool' && last.status === 'start') {
+      parts.pop()
+      continue
+    }
+    break
   }
 }
 
@@ -2652,6 +2666,34 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
       closeTrailingThinking(parts)
+      // AE-01: append a tool-args fragment while the LLM is still
+      // generating the call. Create the start card if needed.
+      if (ev.tool_status === 'args') {
+        const delta = ev.tool_args || ''
+        if (!delta && !ev.tool_id) break
+        let target: ToolPart | null = null
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const p = parts[i]
+          if (p.kind !== 'tool' || p.status !== 'start') continue
+          if (ev.tool_id ? p.tool_id === ev.tool_id : p.name === ev.tool_name) {
+            target = p
+            break
+          }
+        }
+        if (!target) {
+          target = {
+            kind: 'tool',
+            id: ev.tool_name,
+            tool_id: ev.tool_id,
+            name: ev.tool_name,
+            args: '',
+            status: 'start',
+          }
+          parts.push(target)
+        }
+        if (delta) target.args = (target.args || '') + delta
+        break
+      }
       if (ev.tool_status === 'start') {
         // When tool_id is present, use it as the unique key
         // and never reuse the last part (two calls to the

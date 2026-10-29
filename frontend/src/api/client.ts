@@ -1676,9 +1676,8 @@ export interface StreamEvent {
     tool_retryable?: boolean
   tool_requires_user?: boolean
   tool_next_action?: string
-  // tool_args is the JSON-encoded arguments string the tool
-  // was called with. Best-effort: LLM clients only surface this
-  // once the call is complete.
+  // tool_args is the JSON-encoded arguments (or an AE-01 fragment
+  // when tool_status === 'args'). Full args still arrive on start/ok.
   tool_args?: string
   // Sub-agent fields. When sub_agent is true, the event
   // originated from a `task` tool's child run. The client

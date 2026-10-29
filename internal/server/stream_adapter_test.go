@@ -66,6 +66,15 @@ func TestChunkToEvent(t *testing.T) {
 			t.Fatalf("blocked tool event = %#v", ev)
 		}
 	})
+	t.Run("tool args delta", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Phase: "tool", Step: "call-1-args", ToolName: "write_file",
+			ToolID: "call_1", ToolArgs: `{"path":`, ToolCallStatus: "args",
+		}, "cs", "gpt-4o")
+		if ev.Type != "tool" || ev.ToolStatus != "args" || ev.ToolArgs != `{"path":` {
+			t.Fatalf("args delta event = %#v", ev)
+		}
+	})
 	t.Run("skill", func(t *testing.T) {
 		ev := chunkToEvent(agent.ChatStreamChunk{
 			SkillName: "lark-doc", SkillStatus: "ready", SkillScope: "global_managed",

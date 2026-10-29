@@ -350,6 +350,7 @@ func TestPartsAccumulator_ToolStatusFromStep(t *testing.T) {
 		{"call-1-ok", "", "ok"},
 		{"call-1-warn", "", "warn"},
 		{"call-1-err", "", "error"},
+		{"call-1-args", "", "args"},
 		{"call-1", "boom", "error"},
 		{"call-1", "", "start"},
 	}
