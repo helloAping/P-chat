@@ -473,6 +473,43 @@ CREATE INDEX IF NOT EXISTS idx_turn_queue_session_status ON turn_queue(session_i
 	DROP INDEX IF EXISTS idx_media_contexts_session_created;
 	DROP TABLE IF EXISTS media_contexts;`,
 	},
+	{
+		// Migration 14: PERF-02 — FTS5 index for message search.
+		//
+		// messages_fts is an external-content FTS5 table over messages.content.
+		// Triggers keep the index in sync; rebuild backfills existing rows.
+		// SearchMessages uses MATCH + SQL project filters instead of LIKE scans.
+		Version: 14,
+		Name:    "messages_fts",
+		Up: `
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+DROP TRIGGER IF EXISTS messages_fts_ai;
+DROP TRIGGER IF EXISTS messages_fts_ad;
+DROP TRIGGER IF EXISTS messages_fts_au;
+CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, content) VALUES (NEW.id, NEW.content);
+END;
+CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content)
+  VALUES ('delete', OLD.id, OLD.content);
+END;
+CREATE TRIGGER messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content)
+  VALUES ('delete', OLD.id, OLD.content);
+  INSERT INTO messages_fts(rowid, content) VALUES (NEW.id, NEW.content);
+END;
+INSERT INTO messages_fts(messages_fts) VALUES('rebuild');`,
+		Down: `
+DROP TRIGGER IF EXISTS messages_fts_ai;
+DROP TRIGGER IF EXISTS messages_fts_ad;
+DROP TRIGGER IF EXISTS messages_fts_au;
+DROP TABLE IF EXISTS messages_fts;`,
+	},
 }
 
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (

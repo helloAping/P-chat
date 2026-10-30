@@ -175,6 +175,12 @@ func OpenAt(dbPath string, maxHistory int) (*Store, error) {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
+	// PERF-02: ensure FTS index exists when bootstrap marked mig 14 applied
+	// without running Up, or triggers were dropped.
+	if err := ensureMessagesFTSReady(s.db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("messages fts: %w", err)
+	}
 
 	// Migrate legacy JSON file if present.
 	if err := s.migrateLegacy(); err != nil {
@@ -3522,15 +3528,13 @@ func newConvID() string {
 	return fmt.Sprintf("conv_%d_%d", time.Now().UnixNano(), n)
 }
 
-// SearchMessages 在所有未归档会话的可见文本消息中执行 LIKE 搜索。
-// SearchMessages performs a LIKE-based search across renderable text messages
-// in all active (non-archived) conversations.
+// SearchMessages 在所有未归档会话的可见文本消息中执行全文搜索。
+// SearchMessages searches renderable text messages in active conversations
+// via FTS5 (PERF-02), falling back to LIKE when the index is unavailable.
 // Returns up to `limit` results sorted by created_at desc.
 //
-// User input is escaped so that LIKE metacharacters (`%`, `_`)
-// in the search query don't behave as wildcards. A search for
-// "100%" matches the literal substring "100%", not "100" +
-// anything.
+// User input is escaped so that LIKE/FTS metacharacters do not act as
+// wildcards. A search for "100%" matches the literal token "100%".
 func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	return s.searchMessages(q, limit, "", false)
 }
@@ -3551,31 +3555,130 @@ func (s *Store) searchMessages(q string, limit int, projectPath string, filterPr
 	if q == "" {
 		return nil
 	}
-	// Escape LIKE metacharacters: backslash, percent, underscore.
-	// SQLite uses `\` as the ESCAPE char by default, so we prefix
-	// each metachar with `\`.
-	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	if searchQueryPreferFTS(q) && hasMessagesFTS(s.db) {
+		if out, ok := s.searchMessagesFTS(q, limit, projectPath, filterProject); ok {
+			return out
+		}
+	}
+	return s.searchMessagesLike(q, limit, projectPath, filterProject)
+}
 
-	// 先在 SQL 层排除已归档回复、工具行和附件行；ui_hidden 需要兼容
-	// bool/string 两种历史元数据形式，因此在 Go 层解析后再过滤。
-	// Exclude archived replies, tool rows, and attachment rows in SQL first.
-	// ui_hidden has historical bool/string encodings, so it is parsed below.
-	query := `SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at,
+func (s *Store) searchMessagesFTS(q string, limit int, projectPath string, filterProject bool) ([]SearchResult, bool) {
+	ftsQ := buildMessagesFTSQuery(q)
+	if ftsQ == `""` {
+		return nil, true
+	}
+	lim := limitOrHuge(limit)
+	// Over-fetch slightly so Go-side ui_hidden filtering can still fill limit.
+	fetchLimit := lim
+	if lim < 1<<30 {
+		fetchLimit = lim * 3
+		if fetchLimit < lim+32 {
+			fetchLimit = lim + 32
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at,
+				 COALESCE(c.metadata, ''), COALESCE(m.metadata, '')
+			 FROM messages_fts
+			 JOIN messages m ON m.id = messages_fts.rowid
+			 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
+			 WHERE messages_fts MATCH ?
+			   AND m.is_archived = 0
+			   AND m.msg_type = ?
+			   AND m.role IN (?, ?, ?)`)
+	args := []any{ftsQ, llm.MsgTypeText, llm.RoleUser, llm.RoleAssistant, llm.RoleSystem}
+	if filterProject {
+		cleaned := cleanConversationProjectPath(projectPath)
+		if cleaned == "" {
+			b.WriteString(`
+			   AND (
+			     json_extract(c.metadata, '$.project_path') IS NULL
+			     OR TRIM(COALESCE(json_extract(c.metadata, '$.project_path'), '')) = ''
+			     OR TRIM(json_extract(c.metadata, '$.project_path')) = '.'
+			   )`)
+		} else if runtime.GOOS == "windows" {
+			b.WriteString(`
+			   AND LOWER(json_extract(c.metadata, '$.project_path')) = LOWER(?)`)
+			args = append(args, cleaned)
+		} else {
+			b.WriteString(`
+			   AND json_extract(c.metadata, '$.project_path') = ?`)
+			args = append(args, cleaned)
+		}
+	}
+	b.WriteString(`
+			 ORDER BY m.created_at DESC, m.id DESC
+			 LIMIT ?`)
+	args = append(args, fetchLimit)
+
+	rows, err := s.db.Query(b.String(), args...)
+	if err != nil {
+		return nil, false
+	}
+	defer rows.Close()
+
+	out := collectSearchRows(rows, q, lim, false, "")
+	return out, true
+}
+
+func (s *Store) searchMessagesLike(q string, limit int, projectPath string, filterProject bool) []SearchResult {
+	// Escape LIKE metacharacters: backslash, percent, underscore.
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	lim := limitOrHuge(limit)
+	fetchLimit := lim
+	if lim < 1<<30 {
+		fetchLimit = lim * 3
+		if fetchLimit < lim+32 {
+			fetchLimit = lim + 32
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at,
 				 COALESCE(c.metadata, ''), COALESCE(m.metadata, '')
 			 FROM messages m
 			 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
 			 WHERE m.content LIKE ? ESCAPE '\'
 			   AND m.is_archived = 0
 			   AND m.msg_type = ?
-			   AND m.role IN (?, ?, ?)
-			 ORDER BY m.created_at DESC, m.id DESC`
+			   AND m.role IN (?, ?, ?)`)
 	args := []any{"%" + escaped + "%", llm.MsgTypeText, llm.RoleUser, llm.RoleAssistant, llm.RoleSystem}
-	rows, err := s.db.Query(query, args...)
+	if filterProject {
+		cleaned := cleanConversationProjectPath(projectPath)
+		if cleaned == "" {
+			b.WriteString(`
+			   AND (
+			     json_extract(c.metadata, '$.project_path') IS NULL
+			     OR TRIM(COALESCE(json_extract(c.metadata, '$.project_path'), '')) = ''
+			     OR TRIM(json_extract(c.metadata, '$.project_path')) = '.'
+			   )`)
+		} else if runtime.GOOS == "windows" {
+			b.WriteString(`
+			   AND LOWER(json_extract(c.metadata, '$.project_path')) = LOWER(?)`)
+			args = append(args, cleaned)
+		} else {
+			b.WriteString(`
+			   AND json_extract(c.metadata, '$.project_path') = ?`)
+			args = append(args, cleaned)
+		}
+	}
+	b.WriteString(`
+			 ORDER BY m.created_at DESC, m.id DESC
+			 LIMIT ?`)
+	args = append(args, fetchLimit)
+
+	rows, err := s.db.Query(b.String(), args...)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
+	// Project filter already applied in SQL when filterProject is set.
+	return collectSearchRows(rows, q, lim, false, "")
+}
 
+func collectSearchRows(rows *sql.Rows, q string, limit int, filterProject bool, projectPath string) []SearchResult {
 	var out []SearchResult
 	for rows.Next() {
 		var r SearchResult
@@ -3593,7 +3696,7 @@ func (s *Store) searchMessages(q string, limit int, projectPath string, filterPr
 		}
 		r.Snippet = snippet(content, q, 120)
 		out = append(out, r)
-		if len(out) >= limitOrHuge(limit) {
+		if len(out) >= limit {
 			break
 		}
 	}

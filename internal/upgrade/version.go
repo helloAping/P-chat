@@ -96,7 +96,10 @@ const (
 	// and write-protected paths into existing sandbox config.
 	V19 AppVersion = 19
 
+	// V20 — PERF-02: FTS5 index (messages_fts) for conversation message search.
+	V20 AppVersion = 20
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V19
+	Current AppVersion = V20
 )

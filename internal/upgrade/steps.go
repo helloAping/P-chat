@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
 )
 
@@ -47,6 +48,21 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V16: stepV16toV17,
 	V17: stepV17toV18,
 	V18: stepV18toV19,
+	V19: stepV19toV20,
+}
+
+// stepV19toV20 creates the messages_fts FTS5 index used by SearchMessages
+// (PERF-02). Idempotent — covers bootstrap paths that mark memory migration
+// 14 applied without running its Up SQL.
+func stepV19toV20(db *sql.DB) error {
+	log.Print("[upgrade] V19 → V20: ensuring messages_fts FTS5 index (PERF-02)")
+	if db == nil {
+		return nil
+	}
+	if err := memory.EnsureMessagesFTS(db); err != nil {
+		return fmt.Errorf("ensure messages_fts: %w", err)
+	}
+	return nil
 }
 
 // stepV18toV19 merges SEC-06 Windows sandbox baselines into the managed

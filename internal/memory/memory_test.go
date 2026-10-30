@@ -202,6 +202,19 @@ func TestStore_SearchMessagesByProject(t *testing.T) {
 	if got := s.SearchMessages("needle", 10); len(got) != 3 {
 		t.Fatalf("legacy search count = %d, want 3 (%+v)", len(got), got)
 	}
+
+	// Literal % / _ must not act as wildcards (LIKE escape / FTS literal).
+	s.AddChatMessageTo(globalID, llm.ChatMessage{Role: llm.RoleUser, Content: "progress 100% done"})
+	s.AddChatMessageTo(globalID, llm.ChatMessage{Role: llm.RoleUser, Content: "snake_case_token"})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.SearchMessages("100%", 10); len(got) != 1 || !strings.Contains(got[0].Snippet, "100%") {
+		t.Fatalf("literal percent search = %+v", got)
+	}
+	if got := s.SearchMessages("snake_case", 10); len(got) < 1 {
+		t.Fatalf("literal underscore search empty: %+v", got)
+	}
 }
 
 func projectMetaJSON(t *testing.T, projectPath string) string {

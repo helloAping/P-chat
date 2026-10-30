@@ -11,6 +11,53 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestRun_V19ToV20CreatesMessagesFTS(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// External-content FTS5 requires the content table to exist.
+	if _, err := db.Exec(`CREATE TABLE messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		content TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('needle in haystack')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUserVersion(V19); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V19: %v", err)
+	}
+	if got := readUserVersion(); got != V20 {
+		t.Fatalf("version = %d, want V20", got)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE name='messages_fts'`).Scan(&name); err != nil {
+		t.Fatalf("messages_fts missing: %v", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'needle'`).Scan(&n); err != nil {
+		t.Fatalf("fts match: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("fts hits = %d, want 1", n)
+	}
+	if err := stepV19toV20(db); err != nil {
+		t.Fatalf("repeat V20 step: %v", err)
+	}
+}
+
 func TestRun_V18ToV19MergesWindowsSandboxBaselines(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
@@ -36,8 +83,8 @@ func TestRun_V18ToV19MergesWindowsSandboxBaselines(t *testing.T) {
 	if err := Run(nil); err != nil {
 		t.Fatalf("Run from V18: %v", err)
 	}
-	if got := readUserVersion(); got != V19 {
-		t.Fatalf("version = %d, want V19", got)
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want Current=%d", got, Current)
 	}
 	output, err := os.ReadFile(configPath)
 	if err != nil {
