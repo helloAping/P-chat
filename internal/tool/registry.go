@@ -995,10 +995,12 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	log.Printf("%s[tool/exec_command] start cmd=%q dry_run=%t", TraceIDFromCtx(ctx), a.Command, a.DryRun)
 
 	if sb := sandboxFromCtx(ctx); sb != nil && !sb.CheckExecBool(a.Command) {
-		return &CallResult{
-			Content: fmt.Sprintf("E_SANDBOX: command blocked by sandbox policy\n  command: %s\n  tip: use /unsafe once to allow this single call, or set sandbox.exec_dangerous_patterns in config", a.Command),
-			IsError: true,
-		}, nil
+		msg := fmt.Sprintf("E_SANDBOX: command blocked by sandbox policy\n  command: %s", a.Command)
+		if matched := sb.MatchedPattern(a.Command); matched != "" {
+			msg += fmt.Sprintf("\n  matched: %s", matched)
+		}
+		msg += "\n  tip: use /unsafe once to allow this single call, or adjust sandbox.exec_dangerous_patterns in config"
+		return &CallResult{Content: msg, IsError: true}, nil
 	}
 
 	// Block commands that try to read uploaded files. The

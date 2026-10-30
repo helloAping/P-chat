@@ -11,6 +11,77 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestRun_V18ToV19MergesWindowsSandboxBaselines(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{
+  "sandbox": {
+    "enabled": true,
+    "require_confirm": "dangerous",
+    "exec_dangerous_patterns": ["\\brm\\s+-rf\\s+/"],
+    "write_protected_paths": [".ssh/"]
+  },
+  "llm": {"default": "local"}
+}`)
+	if err := os.WriteFile(configPath, input, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUserVersion(V18); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(nil); err != nil {
+		t.Fatalf("Run from V18: %v", err)
+	}
+	if got := readUserVersion(); got != V19 {
+		t.Fatalf("version = %d, want V19", got)
+	}
+	output, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(output, &root); err != nil {
+		t.Fatal(err)
+	}
+	sandbox, _ := root["sandbox"].(map[string]any)
+	patterns, _ := sandbox["exec_dangerous_patterns"].([]any)
+	paths, _ := sandbox["write_protected_paths"].([]any)
+	foundPattern, foundPath := false, false
+	for _, p := range patterns {
+		if s, ok := p.(string); ok && s == `(?i)\bdiskpart\b` {
+			foundPattern = true
+		}
+		if s, ok := p.(string); ok && s == `\brm\s+-rf\s+/` {
+			// keep user pattern
+		}
+	}
+	for _, p := range paths {
+		if s, ok := p.(string); ok && s == `C:\Windows\` {
+			foundPath = true
+		}
+	}
+	if !foundPattern {
+		t.Fatalf("windows exec pattern not merged: %s", output)
+	}
+	if !foundPath {
+		t.Fatalf("windows write path not merged: %s", output)
+	}
+	if err := stepV18toV19(nil); err != nil {
+		t.Fatalf("repeat V19 step: %v", err)
+	}
+	repeated, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output, repeated) {
+		t.Fatal("repeat V19 step rewrote unchanged config")
+	}
+}
+
 func TestRun_V17ToV18RemovesIMConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)
@@ -28,8 +99,8 @@ func TestRun_V17ToV18RemovesIMConfig(t *testing.T) {
 	if err := Run(nil); err != nil {
 		t.Fatalf("Run from V17: %v", err)
 	}
-	if got := readUserVersion(); got != V18 {
-		t.Fatalf("version = %d, want V18", got)
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want Current=%d", got, Current)
 	}
 	output, err := os.ReadFile(configPath)
 	if err != nil {

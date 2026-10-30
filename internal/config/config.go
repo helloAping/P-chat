@@ -1543,8 +1543,9 @@ func defaultWriteProtectedPaths() []string {
 		prefixes = append(prefixes, home)
 	}
 	// Common system paths (Linux/macOS); on Windows these simply won't
-	// match any real path.
-	return append(prefixes,
+	// match any real path. Windows paths are always included so a
+	// Windows install is covered even when Defaults() runs under tests.
+	return append(append(prefixes,
 		".ssh/",
 		".bashrc",
 		".zshrc",
@@ -1560,12 +1561,38 @@ func defaultWriteProtectedPaths() []string {
 		"~/.bashrc",
 		"~/.zshrc",
 		"~/.gnupg/",
-	)
+	), windowsWriteProtectedPaths()...)
+}
+
+// windowsWriteProtectedPaths is the SEC-06 Windows baseline. Exported via
+// WindowsWriteProtectedPaths for the V18→V19 upgrade merge.
+func windowsWriteProtectedPaths() []string {
+	return []string{
+		`AppData\Roaming\Microsoft\Credentials`,
+		`AppData\Local\Microsoft\Credentials`,
+		`AppData\Roaming\Microsoft\Protect`,
+		`C:\Windows\`,
+		`C:\Windows\System32\`,
+		`C:\Program Files\`,
+		`C:\Program Files (x86)\`,
+		`C:\Boot\`,
+	}
+}
+
+// WindowsWriteProtectedPaths returns the SEC-06 Windows write-protect
+// baseline for upgrade merges.
+func WindowsWriteProtectedPaths() []string {
+	return windowsWriteProtectedPaths()
 }
 
 // defaultDangerousPatterns returns the baseline list of regexes that
 // flag a shell command as potentially destructive.
 func defaultDangerousPatterns() []string {
+	return append(unixDangerousPatterns(), windowsDangerousPatterns()...)
+}
+
+// unixDangerousPatterns is the historical Unix/POSIX baseline.
+func unixDangerousPatterns() []string {
 	return []string{
 		`\brm\s+(-[a-zA-Z]*[rfRF]+\s+)+/`, // rm -rf /
 		`\brm\s+-rf\s+~`,                  // rm -rf ~
@@ -1586,4 +1613,39 @@ func defaultDangerousPatterns() []string {
 		`\bnc\s+-l\s+-p\s+\d+`,            // netcat listener
 		`\beval\s+.*\$\(`,                 // eval + command substitution
 	}
+}
+
+// windowsDangerousPatterns is the SEC-06 cmd.exe / PowerShell baseline.
+// Patterns use (?i) because Windows shells are case-insensitive.
+func windowsDangerousPatterns() []string {
+	return []string{
+		// cmd.exe recursive / quiet deletes
+		`(?i)\bdel\s+/[a-zA-Z]*s`,             // del /s …
+		`(?i)\b(rd|rmdir)\s+/[a-zA-Z]*s`,      // rd /s, rmdir /s
+		`(?i)\bformat\s+[a-z]:`,               // format C:
+		`(?i)\bdiskpart\b`,                    // diskpart
+		`(?i)\bcipher\s+/w:`,                  // cipher /w: wipe free space
+		`(?i)\breg(\.exe)?\s+delete\b`,        // reg delete
+		`(?i)\btakeown\s+/[fF]\b`,             // takeown /f
+		`(?i)\bicacls\b.*/grant(:r)?\b.*Everyone`, // icacls … /grant Everyone
+		`(?i)\bsc(\.exe)?\s+delete\b`,         // sc delete <service>
+		// PowerShell destructive cmdlets / download-exec
+		`(?i)\bRemove-Item\b.*(-(Recurse|Force)\b|-[rRfF]\b)`,
+		`(?i)\bFormat-Volume\b`,
+		`(?i)\bClear-Disk\b`,
+		`(?i)\bInitialize-Disk\b`,
+		`(?i)\b(Stop|Restart)-Computer\b`,
+		`(?i)\bSet-ExecutionPolicy\b.*\bUnrestricted\b`,
+		`(?i)\b(iex|Invoke-Expression)\b[\s(].*\b(iwr|Invoke-WebRequest|curl)\b`,
+		`(?i)\b(iwr|Invoke-WebRequest)\b.*\|\s*(iex|Invoke-Expression)\b`,
+		`(?i)\bGet-Content\b.*\|\s*(iex|Invoke-Expression)\b`,
+		`(?i)\bStart-Process\b.*-Verb\s+RunAs\b`,
+		`(?i)\bRemove-ItemProperty\b.*HK(LM|CU|CR|U|CC):`,
+	}
+}
+
+// WindowsDangerousPatterns returns the SEC-06 Windows exec baseline
+// for upgrade merges into existing config.json installs.
+func WindowsDangerousPatterns() []string {
+	return windowsDangerousPatterns()
 }

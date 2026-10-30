@@ -92,7 +92,11 @@ const (
 	// V18 — retire IM configuration from the managed global config file.
 	V18 AppVersion = 18
 
+	// V19 — SEC-06: merge Windows cmd/PowerShell dangerous exec patterns
+	// and write-protected paths into existing sandbox config.
+	V19 AppVersion = 19
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V18
+	Current AppVersion = V19
 )

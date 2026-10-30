@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/paths"
 )
 
@@ -45,6 +46,99 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V15: stepV15toV16,
 	V16: stepV16toV17,
 	V17: stepV17toV18,
+	V18: stepV18toV19,
+}
+
+// stepV18toV19 merges SEC-06 Windows sandbox baselines into the managed
+// global config without removing user customizations.
+func stepV18toV19(_ *sql.DB) error {
+	log.Print("[upgrade] V18 → V19: merging Windows sandbox baselines (SEC-06)")
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read global config: %w", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("decode global config: %w", err)
+	}
+	sandboxRaw, ok := root["sandbox"]
+	if !ok || len(sandboxRaw) == 0 || string(sandboxRaw) == "null" {
+		return nil
+	}
+	var sandbox map[string]json.RawMessage
+	if err := json.Unmarshal(sandboxRaw, &sandbox); err != nil {
+		return fmt.Errorf("decode sandbox config: %w", err)
+	}
+	changed := false
+	if merged, did := mergeStringListJSON(sandbox["exec_dangerous_patterns"], config.WindowsDangerousPatterns()); did {
+		raw, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("encode exec_dangerous_patterns: %w", err)
+		}
+		sandbox["exec_dangerous_patterns"] = raw
+		changed = true
+	}
+	if merged, did := mergeStringListJSON(sandbox["write_protected_paths"], config.WindowsWriteProtectedPaths()); did {
+		raw, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("encode write_protected_paths: %w", err)
+		}
+		sandbox["write_protected_paths"] = raw
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	outSandbox, err := json.Marshal(sandbox)
+	if err != nil {
+		return fmt.Errorf("encode sandbox config: %w", err)
+	}
+	root["sandbox"] = outSandbox
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode global config: %w", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return fmt.Errorf("stat global config: %w", err)
+	}
+	if err := writeUpgradeFileAtomic(configPath, append(out, '\n'), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write global config: %w", err)
+	}
+	return nil
+}
+
+// mergeStringListJSON appends missing extras onto an existing JSON string
+// array. When raw is empty/null/missing, extras become the new list.
+func mergeStringListJSON(raw json.RawMessage, extras []string) ([]string, bool) {
+	var existing []string
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			return nil, false
+		}
+	}
+	seen := make(map[string]struct{}, len(existing)+len(extras))
+	for _, s := range existing {
+		seen[s] = struct{}{}
+	}
+	out := append([]string(nil), existing...)
+	changed := false
+	for _, s := range extras {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+		changed = true
+	}
+	return out, changed
 }
 
 // stepV17toV18 从全局配置移除不再使用的 IM 凭据。
