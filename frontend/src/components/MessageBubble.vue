@@ -1002,8 +1002,22 @@ const statusLines = computed(() => {
 // Token usage badge — only show if we have it.
 const hasTokens = computed(() =>
   props.message.role === 'assistant'
-  && (props.message.tokens_in || props.message.tokens_out)
+  && (props.message.tokens_in || props.message.tokens_out
+    || props.message.cache_hit_tokens != null
+    || props.message.cache_miss_tokens != null)
 )
+
+// AE-03: hit/(hit+miss)*100 when the provider reported cache usage.
+const cacheHitRate = computed(() => {
+  if (props.message.cache_hit_tokens == null && props.message.cache_miss_tokens == null) {
+    return null
+  }
+  const hit = props.message.cache_hit_tokens ?? 0
+  const miss = props.message.cache_miss_tokens ?? 0
+  const total = hit + miss
+  if (total <= 0) return 0
+  return Math.round((hit / total) * 1000) / 10
+})
 
 const turnSummary = computed(() => {
   if (props.message.role !== 'assistant' || props.streaming) return null
@@ -1694,11 +1708,16 @@ function findPrecedingUserMessageId(): number {
             {{ turnSummary.line }}
           </div>
 
-          <!-- Footer for assistant: tokens / elapsed -->
+          <!-- Footer for assistant: tokens / cache / elapsed -->
           <div v-if="hasTokens" class="msg-meta">
             <span v-if="message.tokens_in || message.tokens_out" class="msg-meta-tokens">
               {{ message.tokens_in || 0 }}<ArrowDown :size="10" class="msg-meta-arrow" /> / {{ message.tokens_out || 0 }}<ArrowUp :size="10" class="msg-meta-arrow" />
             </span>
+            <span
+              v-if="cacheHitRate != null"
+              class="msg-meta-cache"
+              :title="`prompt cache 命中 ${message.cache_hit_tokens ?? 0} / 未命中 ${message.cache_miss_tokens ?? 0}`"
+            >· cache {{ cacheHitRate }}%</span>
             <span v-if="message.elapsed" class="msg-elapsed">· {{ message.elapsed }}</span>
             <span v-if="message.model" class="msg-model">· {{ message.model }}</span>
           </div>
@@ -2834,6 +2853,7 @@ function findPrecedingUserMessageId(): number {
   to { opacity: 1; transform: translateY(0); }
 }
 .msg-meta-tokens { display: inline-flex; align-items: center; gap: 1px; }
+.msg-meta-cache { color: var(--accent); }
 .msg-meta-arrow { color: var(--text-quaternary); margin: 0 1px; }
 .stream-status {
   margin-bottom: 6px;

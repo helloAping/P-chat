@@ -771,6 +771,11 @@ type MessageResponse struct {
 	// surface archived rows (e.g. the /replies endpoint)
 	// can do so without a separate schema.
 	IsArchived bool `json:"is_archived"`
+	// AE-03: turn token + cache usage restored from message metadata.
+	TokensIn        int  `json:"tokens_in,omitempty"`
+	TokensOut       int  `json:"tokens_out,omitempty"`
+	CacheHitTokens  *int `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens *int `json:"cache_miss_tokens,omitempty"`
 }
 
 // MessagePart is one block of a structured assistant message.
@@ -1090,9 +1095,12 @@ type StreamEvent struct {
 	// Done fields
 	TokensIn  int    `json:"tokens_in,omitempty"`
 	TokensOut int    `json:"tokens_out,omitempty"`
-	Elapsed   string `json:"elapsed,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
+	// AE-03: pointer so 0-hit is distinct from "provider did not report".
+	CacheHitTokens  *int   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens *int   `json:"cache_miss_tokens,omitempty"`
+	Elapsed         string `json:"elapsed,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
 	// UserMessageID is the SQLite row id of the user message
 	// that started this turn. Set only on the "done" event so
 	// the frontend can stamp it on the local Message for fork.

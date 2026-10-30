@@ -89,6 +89,14 @@ export function buildTurnSummary(message: Message): TurnSummary {
   if (tokensOut || tokensIn) {
     bits.push(`约 ${formatTokens(tokensOut || tokensIn)} tokens`)
   }
+  if (message.cache_hit_tokens != null || message.cache_miss_tokens != null) {
+    const hit = message.cache_hit_tokens ?? 0
+    const miss = message.cache_miss_tokens ?? 0
+    const total = hit + miss
+    if (total > 0) {
+      bits.push(`cache ${Math.round((hit / total) * 100)}%`)
+    }
+  }
   if (message.elapsed) bits.push(message.elapsed)
 
   const line = bits.length ? `本回合 · ${bits.join(' · ')}` : ''

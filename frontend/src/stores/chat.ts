@@ -299,6 +299,16 @@ export const state = reactive({
     error: string | null
     data: api.ContextInspector | null
   },
+  // AE-03: last completed turn's token/cache usage per session
+  // (Inspector "本回合" card; cleared on session delete).
+  lastTurnUsage: {} as Record<string, {
+    tokens_in: number
+    tokens_out: number
+    cache_hit_tokens?: number
+    cache_miss_tokens?: number
+    elapsed?: string
+    model?: string
+  } | null>,
   // P1-4: per-session, per-user-message regen sibling
   // cache. Keyed by [sessionId][userMsgId] = the full
   // RepliesResponse from GET .../replies. Loaded on
@@ -1016,6 +1026,7 @@ async function switchSessionBody(id: string) {
       const liveIDs = new Set(liveMessages.map(m => m.id).filter((messageID): messageID is number => messageID != null))
       const history = dedupMessagesByKey([], r.messages).filter(m => !liveIDs.has(m.id ?? 0))
       state.sessionMessages[id] = [...history, ...liveMessages]
+      seedLastTurnUsage(id, state.sessionMessages[id])
       state.sessionPaging[id] = {
         // Prefer the seq-based cursor (stable across
         // rollback/undo). Fall back to the legacy id-based
@@ -1486,6 +1497,7 @@ export async function deleteSessionById(id: string) {
   delete state.rollbackDraft[id]
   delete state.rollbackUndo[id]
   delete state.fileChangeUndo[id]
+  delete state.lastTurnUsage[id]
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
@@ -2925,9 +2937,23 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       delete state.streaming[id]
       if (ev.tokens_in != null) m.tokens_in = ev.tokens_in
       if (ev.tokens_out != null) m.tokens_out = ev.tokens_out
+      // AE-03: only stamp cache when the provider reported it
+      // (wire uses present-or-absent pointers, not zero-as-missing).
+      if (ev.cache_hit_tokens != null || ev.cache_miss_tokens != null) {
+        m.cache_hit_tokens = ev.cache_hit_tokens ?? 0
+        m.cache_miss_tokens = ev.cache_miss_tokens ?? 0
+      }
       if (ev.elapsed) m.elapsed = ev.elapsed
       if (ev.provider) m.provider = ev.provider
       if (ev.model) m.model = ev.model
+      state.lastTurnUsage[id] = {
+        tokens_in: m.tokens_in || 0,
+        tokens_out: m.tokens_out || 0,
+        cache_hit_tokens: m.cache_hit_tokens,
+        cache_miss_tokens: m.cache_miss_tokens,
+        elapsed: m.elapsed,
+        model: m.model,
+      }
       // Free the per-message live-status array. The stream
       // is over; the live status bar is no longer shown.
       // Without this, _statusText would stay around for
@@ -3797,6 +3823,31 @@ export const currentPendingConfirm = computed(() => {
 export const currentAttachments = computed(() =>
   state.pendingAttachments[state.currentID] || [],
 )
+
+// AE-03: last completed turn usage for the Inspector card.
+export const currentLastTurnUsage = computed(() =>
+  state.lastTurnUsage[state.currentID] || null,
+)
+
+function seedLastTurnUsage(sessionId: string, messages: Message[]) {
+  if (!sessionId || state.lastTurnUsage[sessionId]) return
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== 'assistant') continue
+    if (!(m.tokens_in || m.tokens_out || m.cache_hit_tokens != null || m.cache_miss_tokens != null)) {
+      continue
+    }
+    state.lastTurnUsage[sessionId] = {
+      tokens_in: m.tokens_in || 0,
+      tokens_out: m.tokens_out || 0,
+      cache_hit_tokens: m.cache_hit_tokens,
+      cache_miss_tokens: m.cache_miss_tokens,
+      elapsed: m.elapsed,
+      model: m.model,
+    }
+    return
+  }
+}
 
 // --- Rollback ---
 

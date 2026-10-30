@@ -90,6 +90,11 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.Type = "done"
 		ev.TokensIn = chunk.TokensIn
 		ev.TokensOut = chunk.TokensOut
+		if chunk.CacheReported {
+			hit, miss := chunk.CacheHitTokens, chunk.CacheMissTokens
+			ev.CacheHitTokens = &hit
+			ev.CacheMissTokens = &miss
+		}
 		// ev.Elapsed already populated above (chunk.Duration).
 		return ev
 	}

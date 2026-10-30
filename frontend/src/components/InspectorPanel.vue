@@ -8,7 +8,7 @@
  */
 import { computed, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
-import { state, currentMessages, refreshContextUsage } from '../stores/chat'
+import { state, currentMessages, refreshContextUsage, currentLastTurnUsage } from '../stores/chat'
 import * as api from '../api/client'
 import { formatCompactTokens } from '../utils/format'
 import { copyText, downloadBlob, downloadFromUrl } from '../utils/clipboard'
@@ -94,6 +94,26 @@ const ctxColor = computed(() => {
 const ctxUsageTitle = computed(() => {
   if (!hasContextUsage.value) return '暂无上下文数据，点击刷新'
   return `上下文占用 · ${ctxModel.value} · ${ctxTokensText.value}（${ctxPctText.value}）`
+})
+
+// AE-03: last turn token + cache hit rate for the Inspector.
+const lastTurn = computed(() => currentLastTurnUsage.value)
+const lastTurnCacheRate = computed(() => {
+  const u = lastTurn.value
+  if (!u || (u.cache_hit_tokens == null && u.cache_miss_tokens == null)) return null
+  const hit = u.cache_hit_tokens ?? 0
+  const miss = u.cache_miss_tokens ?? 0
+  const total = hit + miss
+  if (total <= 0) return 0
+  return Math.round((hit / total) * 1000) / 10
+})
+const lastTurnText = computed(() => {
+  const u = lastTurn.value
+  if (!u || !(u.tokens_in || u.tokens_out)) return ''
+  const bits = [`${u.tokens_in}↓ / ${u.tokens_out}↑`]
+  if (lastTurnCacheRate.value != null) bits.push(`cache ${lastTurnCacheRate.value}%`)
+  if (u.elapsed) bits.push(u.elapsed)
+  return bits.join(' · ')
 })
 
 const idSnippet = computed(() => {
@@ -359,6 +379,9 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
               <span>{{ ctxLoading ? '刷新中' : '点击刷新' }}</span>
             </span>
           </button>
+          <div v-if="lastTurnText" class="last-turn-usage" :title="lastTurnText">
+            本回合 {{ lastTurnText }}
+          </div>
         </section>
         <section v-if="toolStats.total" class="section">
           <div class="section-label">工具调用</div>
@@ -1001,6 +1024,19 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 }
 .context-usage-foot span {
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.last-turn-usage {
+  margin-top: var(--space-2);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

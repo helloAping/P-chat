@@ -859,6 +859,8 @@ func buildMessageResponseForSession(sessionID string, m llm.ChatMessage, metas [
 		if parts := decodePartsFromMeta(metas[i], m.Content); len(parts) > 0 {
 			resp.Parts = parts
 		}
+		// AE-03: restore turn token / cache usage from meta.
+		applyUsageMeta(&resp, metas[i])
 	}
 	// Attachment messages carry their payload as URLs in
 	// Attachments; clear Content so the frontend doesn't
@@ -896,6 +898,63 @@ func isUIHiddenMessageMeta(raw string) bool {
 		return strings.EqualFold(strings.TrimSpace(v), "true")
 	default:
 		return false
+	}
+}
+
+// applyUsageMeta copies AE-03 token/cache fields from message metadata
+// onto the wire MessageResponse so reloads keep the bubble footer.
+func applyUsageMeta(resp *MessageResponse, raw string) {
+	if resp == nil || raw == "" {
+		return
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(raw), &meta); err != nil {
+		return
+	}
+	if v, ok := metaInt(meta, "tokens_in"); ok {
+		resp.TokensIn = v
+	}
+	if v, ok := metaInt(meta, "tokens_out"); ok {
+		resp.TokensOut = v
+	}
+	reported := false
+	switch v := meta["cache_reported"].(type) {
+	case bool:
+		reported = v
+	case string:
+		reported = v == "1" || strings.EqualFold(v, "true")
+	case float64:
+		reported = v != 0
+	}
+	if !reported {
+		return
+	}
+	hit, _ := metaInt(meta, "cache_hit_tokens")
+	miss, _ := metaInt(meta, "cache_miss_tokens")
+	resp.CacheHitTokens = &hit
+	resp.CacheMissTokens = &miss
+}
+
+func metaInt(meta map[string]any, key string) (int, bool) {
+	v, ok := meta[key]
+	if !ok || v == nil {
+		return 0, false
+	}
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(n))
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
 	}
 }
 

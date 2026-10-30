@@ -307,6 +307,10 @@ export interface Message {
   // assistant message when the 'done' event arrives.
   tokens_in?: number
   tokens_out?: number
+  // AE-03: prompt-cache telemetry when the provider reported it.
+  // Present (even as 0) only when cache_reported; omitted otherwise.
+  cache_hit_tokens?: number
+  cache_miss_tokens?: number
   elapsed?: string
   // visionUnsupported is set on a *user* message when the
   // LLM rejected the user's image with the "this model
@@ -1701,6 +1705,9 @@ export interface StreamEvent {
   thinking_rewrite?: string
   tokens_in?: number
   tokens_out?: number
+  // AE-03: present only when the provider reported cache usage.
+  cache_hit_tokens?: number
+  cache_miss_tokens?: number
   elapsed?: string
   provider?: string
   model?: string

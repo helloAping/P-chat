@@ -1538,6 +1538,12 @@ type ChatStreamChunk struct {
 
 	TokensIn  int `json:"tokens_in,omitempty"`
 	TokensOut int `json:"tokens_out,omitempty"`
+	// AE-03: prompt-cache telemetry when the provider reports it.
+	// CacheReported distinguishes "provider said 0 hits" from
+	// "provider did not report cache at all".
+	CacheHitTokens  int  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int  `json:"cache_miss_tokens,omitempty"`
+	CacheReported   bool `json:"cache_reported,omitempty"`
 
 	// SubAgent is true when this chunk originated from a
 	// sub-agent (e.g. a `task` tool call). The UI should
@@ -2344,7 +2350,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			sendOrDrop(ctx, ch, nextSeq, event)
 		})
 		if err != nil {
-			persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, req.RegenGroupID)
+			persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, 0, 0, false, req.RegenGroupID)
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true})
 			return
 		}
@@ -2564,6 +2570,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		var totalIn, totalOut int
+		var totalCacheHit, totalCacheMiss int
+		var cacheReported bool
 
 		// Stuck-loop guard. Track the signature of the (sorted)
 		// tool calls in each round, plus whether the round ended
@@ -2793,6 +2801,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// usage deltas were already added to totalIn/totalOut and
 			// the retry's fresh requestUsage would add them again.
 			roundStartTotalIn, roundStartTotalOut := totalIn, totalOut
+			roundStartCacheHit, roundStartCacheMiss := totalCacheHit, totalCacheMiss
+			roundStartCacheReported := cacheReported
 		att:
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				var usage requestUsage
@@ -2827,8 +2837,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					//   - argsAccum: tool-call args JSON (would otherwise
 					//     be concatenated into invalid JSON)
 					//   - streamBytes: per-round output budget accounting
-					//   - totalIn/totalOut: roll back the failed attempt's
-					//     usage deltas (usage itself is per-attempt)
+					//   - totalIn/totalOut/cache: roll back the failed
+					//     attempt's usage deltas (usage itself is per-attempt)
 					//   - partsAcc + stream_reset event: drop the partial
 					//     text/thinking parts already shown in the UI
 					hadPartial := fullContentBuilder.Len() > 0 || fullThinkingBuilder.Len() > 0 || len(argsAccum) > 0
@@ -2838,6 +2848,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					responsesItems = make(map[int]llm.ResponsesOutputItem)
 					streamBytes = 0
 					totalIn, totalOut = roundStartTotalIn, roundStartTotalOut
+					totalCacheHit, totalCacheMiss = roundStartCacheHit, roundStartCacheMiss
+					cacheReported = roundStartCacheReported
 					if hadPartial {
 						// The UI already carries partial text/thinking
 						// (and AE-01 provisional tool cards) from the
@@ -3050,6 +3062,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						totalOut += outDelta
 					}
 					if cache := chunk.CacheUsage; cache != nil {
+						hitDelta, missDelta, known := usage.addCache(cache)
+						totalCacheHit += hitDelta
+						totalCacheMiss += missDelta
+						if known {
+							cacheReported = true
+						}
 						log.Printf("%s[llm/cache] provider=%s model=%s round=%d attempt=%d input_tokens=%d cache_hit_tokens=%d cache_miss_tokens=%d",
 							trace.LogPrefix(ctx), req.Provider, req.Model, roundNum, attempt, chunk.TokensIn, cache.HitTokens, cache.MissTokens)
 					}
@@ -3138,7 +3156,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			toolCalls = orderedToolCalls(argsAccum)
 
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+			roundDone := ChatStreamChunk{
+				Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum),
+				Message:  fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))),
+				Round:    roundNum, MaxRound: maxRounds,
+				TokensIn: totalIn, TokensOut: totalOut,
+			}
+			stampCacheUsage(&roundDone, totalCacheHit, totalCacheMiss, cacheReported)
+			sendOrDrop(ctx, ch, nextSeq, roundDone)
 
 			if len(toolCalls) == 0 {
 				toolCalls = parseMarkdownToolCalls(fullContent)
@@ -3234,7 +3259,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if roundPersisted {
 					return
 				}
-				assistantRowID := persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				assistantRowID := persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, req.RegenGroupID)
 				if a.store != nil {
 					for _, msg := range roundToolMessages {
 						a.store.AddChatMessageTo(req.SessionID, msg)
@@ -3265,16 +3290,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// the reply and end with a done event.
 			if successAttempt > 1 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				persistRound()
-				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
-					Phase:     "done",
-					Step:      "done",
-					Message:   "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
-					Round:     roundNum,
-					MaxRound:  maxRounds,
-					TokensIn:  totalIn,
-					TokensOut: totalOut,
-				})
-				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{Done: true})
+				phaseDone := ChatStreamChunk{
+					Phase: "done", Step: "done",
+					Message:  "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
+					Round:    roundNum, MaxRound: maxRounds,
+					TokensIn: totalIn, TokensOut: totalOut,
+				}
+				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
+				sendOrDrop(retryCtx, ch, nextSeq, phaseDone)
+				sendOrDrop(retryCtx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
 				return
 			}
 
@@ -3422,12 +3446,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if pending > 0 {
 					persistRound()
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+					sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
 					return
 				}
 				persistRound()
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+				phaseDone := ChatStreamChunk{
+					Phase: "done", Step: "done",
+					Message:  fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum),
+					Round:    roundNum, MaxRound: maxRounds,
+					TokensIn: totalIn, TokensOut: totalOut,
+				}
+				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
+				sendOrDrop(ctx, ch, nextSeq, phaseDone)
+				sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
 				return
 			}
 
@@ -4262,7 +4293,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if todoCheckpointAttempts >= MaxTodoCheckpointAttempts {
 						emitTodoIncomplete("todo_write was not completed during the required state check", roundNum)
 						persistRound()
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+						sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
 						return
 					}
 				}
@@ -4325,15 +4356,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			prevErrored = curErrored
 			if stuckStreak >= stuckThreshold {
 				emitTodoIncomplete("stuck-loop stopped the agent before the plan was complete", roundNum)
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-					Phase:    "stuck",
-					Step:     "stuck-loop",
+				stuckChunk := ChatStreamChunk{
+					Phase: "stuck", Step: "stuck-loop",
 					Message:  fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
-					Round:    roundNum,
-					MaxRound: maxRounds,
+					Round:    roundNum, MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
-				})
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+				}
+				stampCacheUsage(&stuckChunk, totalCacheHit, totalCacheMiss, cacheReported)
+				sendOrDrop(ctx, ch, nextSeq, stuckChunk)
+				sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
 				return
 			}
 
@@ -4554,7 +4585,31 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 	return ch
 }
 
-func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int, regenGroupID string) int64 {
+// stampCacheUsage copies AE-03 cache totals onto a chunk when the
+// provider reported cache telemetry at least once this turn.
+func stampCacheUsage(c *ChatStreamChunk, hit, miss int, reported bool) {
+	if c == nil || !reported {
+		return
+	}
+	c.CacheHitTokens = hit
+	c.CacheMissTokens = miss
+	c.CacheReported = true
+}
+
+// makeDoneChunk builds the terminal Done=true event with turn token
+// + cache totals so the GUI can stamp the assistant bubble.
+func makeDoneChunk(tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported bool, start time.Time) ChatStreamChunk {
+	c := ChatStreamChunk{
+		Done:      true,
+		TokensIn:  tokensIn,
+		TokensOut: tokensOut,
+		Duration:  formatElapsed(time.Since(start)),
+	}
+	stampCacheUsage(&c, cacheHit, cacheMiss, cacheReported)
+	return c
+}
+
+func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported bool, regenGroupID string) int64 {
 	if store == nil {
 		return 0
 	}
@@ -4607,6 +4662,11 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 	}
 	if tokensOut > 0 {
 		meta["tokens_out"] = fmt.Sprintf("%d", tokensOut)
+	}
+	if cacheReported {
+		meta["cache_hit_tokens"] = fmt.Sprintf("%d", cacheHit)
+		meta["cache_miss_tokens"] = fmt.Sprintf("%d", cacheMiss)
+		meta["cache_reported"] = "1"
 	}
 	structural := snapshotStructural(partsAcc)
 	if len(structural) > 0 {
