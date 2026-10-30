@@ -680,6 +680,9 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 	// the turn via turnCtx so the agent loop exits and the session
 	// lock releases instead of blocking until MaxTurnSeconds.
 	const sseWriteTimeout = 10 * time.Second
+	// PERF-01: hold a non-mergeable lookahead chunk between Stream
+	// callback invocations so content/thinking coalescing can peek.
+	var coalesceHold *agent.ChatStreamChunk
 	// cancelTurn aborts the in-flight turn. Resolved from
 	// c.Request.Context()'s cancel — SendMessage registered it in
 	// h.turnCancels; we look it up here so Regenerate (which also
@@ -704,7 +707,7 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 				log.Printf("[sse] panic in stream writer: %v", r)
 			}
 		}()
-		chunk, ok := <-stream
+		chunk, ok := readCoalescedChunk(stream, &coalesceHold)
 		if !ok {
 			// 流关闭但没有 done：回合超时，或仍有追踪任务时被取消，都应进入自动续跑。
 			// Stream closed without a done event. If the turn was interrupted
