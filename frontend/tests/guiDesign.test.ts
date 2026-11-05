@@ -284,3 +284,21 @@ test('sub-agent rows keep type visible without duplicate run-mode badges', () =>
   assert.doesNotMatch(jobs, /job-type-label/)
   assert.doesNotMatch(jobs, />类型<\/span>/)
 })
+
+test('settings pages use a shared header and keep common system sections open', () => {
+  const layout = readFileSync(new URL('../src/components/AppSettingsLayout.vue', import.meta.url), 'utf8')
+  const settings = readFileSync(new URL('../src/components/AppSettingsModal.vue', import.meta.url), 'utf8')
+
+  assert.match(layout, /class="settings-page-title"/)
+  assert.match(layout, /headerSubtitle/)
+  assert.match(layout, /name="page-actions"/)
+  assert.match(settings, /当前会话在输入区选风格，自定义风格在此编辑，生成入口在检查器。/)
+  assert.match(settings, /修改后点页面底部「保存」。/)
+  assert.match(settings, /const sysExpanded = ref<string\[\]>\(\['work-mode', 'window', 'vision', 'generation'\]\)/)
+  assert.match(settings, /v-model:expanded-names="sysExpanded"/)
+  assert.doesNotMatch(settings, /<NTabs/)
+  assert.doesNotMatch(settings, /class="style-usage"/)
+  assert.match(settings, /去设置默认/)
+  assert.match(settings, /title="新增知识库"/)
+  assert.match(settings, /还没有声明此能力的模型/)
+})

@@ -260,7 +260,7 @@ setup.exe
 
 ### 设置面板
 
-点击最左侧 AppRail 的「设置」打开应用设置。左侧导航共 11 个分类，常用入口如下；完整操作顺序见 [仓库内图文指南](docs/p-chat-article-2026-09.md)，官网版本见 [P-Chat 使用说明](http://www.08ms.cn/article/p-chat)。
+点击最左侧 AppRail 的「设置」打开应用设置。左侧导航共 10 个分类，常用入口如下；完整操作顺序见 [仓库内图文指南](docs/p-chat-article-2026-09.md)，官网版本见 [P-Chat 使用说明](http://www.08ms.cn/article/p-chat)。
 
 | Tab | 作用 |
 | --- | --- |
