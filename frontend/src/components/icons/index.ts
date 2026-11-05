@@ -90,6 +90,7 @@ export {
   Minus,
   HelpCircle,
   Sparkles,
+  Tag,
   Bot,
   Lightbulb,
   User,

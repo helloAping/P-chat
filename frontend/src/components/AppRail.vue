@@ -112,7 +112,7 @@ function goGlobal() {
   gap: var(--space-2);
   padding: var(--space-3) var(--space-1);
   background: var(--surface-0);
-  border-right: 1px solid var(--border-subtle);
+  border-right: none;
   z-index: 2;
 }
 .rail-nav {
@@ -131,7 +131,6 @@ function goGlobal() {
   align-items: center;
   gap: var(--space-1);
   padding-top: var(--space-2);
-  border-top: 1px solid var(--border-subtle);
   width: 100%;
 }
 .rail-btn {

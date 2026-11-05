@@ -49,6 +49,7 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V17: stepV17toV18,
 	V18: stepV18toV19,
 	V19: stepV19toV20,
+	V20: stepV20toV21,
 }
 
 // stepV19toV20 creates the messages_fts FTS5 index used by SearchMessages
@@ -61,6 +62,15 @@ func stepV19toV20(db *sql.DB) error {
 	}
 	if err := memory.EnsureMessagesFTS(db); err != nil {
 		return fmt.Errorf("ensure messages_fts: %w", err)
+	}
+	return nil
+}
+
+// stepV20toV21 creates the message_bookmarks table (SM-06).
+func stepV20toV21(db *sql.DB) error {
+	log.Print("[upgrade] V20 → V21: ensuring message_bookmarks")
+	if err := memory.EnsureMessageBookmarks(db); err != nil {
+		return fmt.Errorf("ensure message_bookmarks: %w", err)
 	}
 	return nil
 }

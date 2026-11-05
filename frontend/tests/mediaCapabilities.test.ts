@@ -101,7 +101,7 @@ test('browser screenshots use the same durable media asset card as generated out
 
 test('all Naive UI selects use the session picker visual language', () => {
   assert.match(app, /Select: \{[\s\S]*?InternalSelection: \{[\s\S]*?color: 'var\(--surface-2\)'/)
-  assert.match(app, /border: '1px solid var\(--border-subtle\)'/)
+  assert.match(app, /InternalSelection: \{[\s\S]*?border: 'var\(--control-border\)'/)
   assert.match(app, /borderRadius: 'var\(--radius-sm\)'/)
   assert.match(app, /InternalSelectMenu: \{[\s\S]*?optionColorPending: 'var\(--surface-3\)'/)
 })

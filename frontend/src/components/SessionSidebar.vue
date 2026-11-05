@@ -46,11 +46,12 @@ import ProjectSwitcher from './ProjectSwitcher.vue'
 import TokenStatsModal from './TokenStatsModal.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
+import { normalizeSessionTags } from '../utils/sessionTags'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, FolderOpen, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
   ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
-  Download, RotateCw, ExternalLink,
+  Download, RotateCw, ExternalLink, Tag,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -77,6 +78,11 @@ const projectPathError = ref('')
 const showConfirmDeleteProject = ref(false)
 const showAbout = ref(false)
 const showRename = ref(false)
+const showTags = ref(false)
+const tagSessionId = ref('')
+const tagDraft = ref('')
+const editingTags = ref<string[]>([])
+const activeTag = ref('')
 const renameId = ref('')
 const renameTitle = ref('')
 const showExport = ref(false)
@@ -170,9 +176,28 @@ const sortedSessions = computed(() =>
   [...state.sessions].sort((a, b) => b.updated_at - a.updated_at),
 )
 
+const allTags = computed(() => {
+  const seen = new Set<string>()
+  const tags: string[] = []
+  for (const session of sortedSessions.value) {
+    for (const tag of session.tags || []) {
+      if (seen.has(tag)) continue
+      seen.add(tag)
+      tags.push(tag)
+    }
+  }
+  return tags
+})
+
+const listedSessions = computed(() => {
+  const tag = activeTag.value
+  if (!tag) return sortedSessions.value
+  return sortedSessions.value.filter(session => (session.tags || []).includes(tag))
+})
+
 const groupedSessions = computed(() => {
   const groups: Record<string, typeof sortedSessions.value> = {}
-  for (const s of sortedSessions.value) {
+  for (const s of listedSessions.value) {
     const k = groupKey(s.updated_at, s.id)
     if (!groups[k]) groups[k] = []
     groups[k].push(s)
@@ -365,6 +390,7 @@ function sessionMenuOptions(id: string) {
   const pinned = isPinned(id)
   return [
     actionOption('pin', pinned ? '取消置顶' : '置顶', pinned ? PinOff : Pin),
+    actionOption('tags', '标签', Tag),
     actionOption('rename', '重命名', Pencil),
     { type: 'divider' as const, key: 'd' },
     actionOption('export', '导出对话', FileText),
@@ -376,6 +402,7 @@ function sessionMenuOptions(id: string) {
 function onSessionMenu(key: string, id: string) {
   switch (key) {
     case 'pin': togglePin(id); break
+    case 'tags': openTagEditor(id); break
     case 'rename': onRename(id); break
     case 'delete': {
       // Delete needs a synthetic event so the confirmation
@@ -422,9 +449,14 @@ const recentlyExported = new Set<string>()
 const exportTarget = computed(() => state.sessions.find(s => s.id === exportSessionId.value) || null)
 const exportFilename = computed(() => suggestFilename(exportTarget.value?.title || '', exportFormat.value))
 
+const exportFromSeq = ref('')
+const exportToSeq = ref('')
+
 function openExportModal(id: string) {
   exportSessionId.value = id
   exportFormat.value = 'pdf'
+  exportFromSeq.value = ''
+  exportToSeq.value = ''
   showExport.value = true
 }
 
@@ -460,7 +492,13 @@ async function doExport(id: string, format: ExportFormat) {
     // the store, renders the selected archive format, and
     // returns the file with Content-Disposition.
     const fmtQuery = format
-    const exportURL = await api.waitForAPIURL(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`)
+    const range = new URLSearchParams()
+    const fromSeq = exportFromSeq.value.trim()
+    const toSeq = exportToSeq.value.trim()
+    if (fromSeq) range.set('from_seq', fromSeq)
+    if (toSeq) range.set('to_seq', toSeq)
+    const rangeQuery = range.toString()
+    const exportURL = await api.waitForAPIURL(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}${rangeQuery ? '&' + rangeQuery : ''}`)
     const resp = await fetch(exportURL, {
       method: 'GET',
     })
@@ -635,6 +673,52 @@ async function confirmDeleteProject() {
   if (!path) return
   await onRemoveProject(path)
   showConfirmDeleteProject.value = false
+}
+
+function openTagEditor(id: string) {
+  const session = state.sessions.find(item => item.id === id)
+  if (!session) return
+  tagSessionId.value = id
+  editingTags.value = [...(session.tags || [])]
+  tagDraft.value = ''
+  showTags.value = true
+}
+
+function addEditingTag() {
+  const next = normalizeSessionTags([...editingTags.value, tagDraft.value])
+  if (next.error) {
+    message.warning(next.error)
+    return
+  }
+  editingTags.value = next.tags
+  tagDraft.value = ''
+}
+
+function removeEditingTag(tag: string) {
+  editingTags.value = editingTags.value.filter(item => item !== tag)
+}
+
+async function saveTags() {
+  const id = tagSessionId.value
+  if (!id) return
+  const next = normalizeSessionTags(editingTags.value)
+  if (next.error) {
+    message.warning(next.error)
+    return
+  }
+  try {
+    const updated = await api.updateSessionMeta(id, { tags: next.tags })
+    const session = state.sessions.find(item => item.id === id)
+    if (session) session.tags = updated.tags || []
+    if (activeTag.value && !allTags.value.includes(activeTag.value)) activeTag.value = ''
+    showTags.value = false
+  } catch (error: any) {
+    message.error(`保存标签失败：${error?.message || error}`)
+  }
+}
+
+function toggleTagFilter(tag: string) {
+  activeTag.value = activeTag.value === tag ? '' : tag
 }
 
 async function onRename(id: string) {
@@ -1089,6 +1173,23 @@ onMounted(() => {
         </button>
       </div>
 
+      <div v-if="!searchQuery.trim() && allTags.length" class="tag-filters">
+        <button
+          type="button"
+          class="tag-filter"
+          :class="{ 'tag-filter--active': !activeTag }"
+          @click="activeTag = ''"
+        >全部</button>
+        <button
+          v-for="tag in allTags"
+          :key="tag"
+          type="button"
+          class="tag-filter"
+          :class="{ 'tag-filter--active': activeTag === tag }"
+          @click="toggleTagFilter(tag)"
+        >{{ tag }}</button>
+      </div>
+
       <NScrollbar class="session-scroll">
         <!-- Search results -->
         <div v-if="searchQuery.trim()" class="search-results">
@@ -1117,6 +1218,9 @@ onMounted(() => {
 
         <!-- Session list, grouped by relative time. -->
         <div v-else class="session-list">
+          <div v-if="activeTag && groupedSessions.length === 0" class="search-empty">
+            没有带「{{ activeTag }}」的会话
+          </div>
           <template v-for="group in groupedSessions" :key="group.key">
             <div class="group">
               <div class="group-header">
@@ -1145,6 +1249,12 @@ onMounted(() => {
                       <span>{{ sessionSourceFromID(s.id)?.label }}</span>
                     </span>
                     <span class="item-title">{{ sessionDisplayTitle(s) }}</span>
+                    <span
+                      v-for="tag in (s.tags || []).slice(0, 2)"
+                      :key="tag"
+                      class="item-tag"
+                    >{{ tag }}</span>
+                    <span v-if="(s.tags || []).length > 2" class="item-tag">+{{ (s.tags || []).length - 2 }}</span>
                     <span v-if="state.streaming[s.id]" class="streaming-dot" title="正在生成" aria-label="正在生成">
                       <Circle :size="7" fill="currentColor" />
                     </span>
@@ -1326,6 +1436,32 @@ onMounted(() => {
     </AppModal>
 
     <AppModal
+      v-model:show="showTags"
+      title="会话标签"
+      size="sm"
+    >
+      <div class="tag-editor">
+        <button
+          v-for="tag in editingTags"
+          :key="tag"
+          type="button"
+          class="tag-editor-chip"
+          @click="removeEditingTag(tag)"
+        >{{ tag }} ×</button>
+        <span v-if="editingTags.length === 0" class="tag-editor-empty">还没有标签</span>
+      </div>
+      <NInput
+        v-model:value="tagDraft"
+        placeholder="输入标签后回车，最多 8 个"
+        @keyup.enter="addEditingTag"
+      />
+      <template #footer>
+        <NButton size="small" quaternary @click="showTags = false">取消</NButton>
+        <NButton size="small" type="primary" @click="saveTags">保存</NButton>
+      </template>
+    </AppModal>
+
+    <AppModal
       v-model:show="showRename"
       title="重命名会话"
       size="sm"
@@ -1379,6 +1515,10 @@ onMounted(() => {
               <span>保留更完整样式，适合浏览器查看和打印</span>
             </span>
           </button>
+        </div>
+        <div class="export-range">
+          <NInput v-model:value="exportFromSeq" placeholder="起始序号，可空" />
+          <NInput v-model:value="exportToSeq" placeholder="结束序号，可空" />
         </div>
       </div>
       <template #footer>
@@ -1500,7 +1640,7 @@ onMounted(() => {
   width: var(--sidebar-width);
   min-width: 0;
   background: var(--surface-1);
-  border-right: 1px solid var(--border-subtle);
+  border-right: none;
   display: flex;
   flex-shrink: 0;
   overflow: hidden;
@@ -1528,13 +1668,19 @@ onMounted(() => {
   align-items: stretch;
   gap: var(--space-2);
   flex-shrink: 0;
-  border-bottom: 1px solid var(--border-subtle);
 }
 /* --- Search bar -------------------------------------------------------- */
 .search-bar {
-  padding: var(--space-3) var(--space-3) var(--space-2);
-  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 var(--space-3) var(--space-2);
   flex-shrink: 0;
+}
+.search-bar :deep(.n-input) {
+  --n-border: 1px solid transparent;
+  --n-border-hover: 1px solid transparent;
+  --n-border-focus: var(--control-focus-border);
+  --n-box-shadow-focus: var(--control-focus-ring);
+  --n-color: var(--surface-2);
+  --n-color-focus: var(--surface-2);
 }
 .search-bar :deep(.search-icon) { color: var(--text-tertiary); }
 
@@ -1554,8 +1700,8 @@ onMounted(() => {
   /* Calm outline CTA — avoid large saturated brand fill */
   background: var(--surface-2);
   color: var(--text-primary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
@@ -1565,9 +1711,9 @@ onMounted(() => {
     color var(--dur-fast) var(--ease-out);
 }
 .new-session-btn:hover {
-  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
-  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
-  color: var(--brand-600);
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text-primary);
 }
 .new-session-btn:active {
   background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-2));
@@ -1580,6 +1726,60 @@ onMounted(() => {
 }
 .session-list { padding: 4px 8px 8px; }
 .group { margin-bottom: 4px; }
+.tag-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 var(--space-3) var(--space-2);
+}
+.tag-filter {
+  border: var(--control-border);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.tag-filter--active {
+  color: var(--text-primary);
+  border-color: var(--border-default);
+  background: color-mix(in srgb, var(--brand-500) 8%, transparent);
+}
+.item-tag {
+  flex-shrink: 0;
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  background: var(--surface-3);
+}
+.tag-editor {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 28px;
+  margin-bottom: var(--space-2);
+}
+.tag-editor-chip {
+  border: 1px solid var(--border-default);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.tag-editor-empty {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
 .group-header {
   display: flex;
   align-items: center;
@@ -1762,8 +1962,7 @@ onMounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 10px 12px;
-  border-top: 1px solid var(--border-subtle);
+  padding: 12px;
   background: var(--surface-1);
   flex-shrink: 0;
 }
@@ -1883,7 +2082,7 @@ onMounted(() => {
 }
 .project-create-note svg {
   flex: 0 0 auto;
-  color: var(--brand-500);
+  color: var(--text-tertiary);
   fill: currentColor;
 }
 .field-hint {
@@ -1935,6 +2134,12 @@ onMounted(() => {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--space-3);
+}
+.export-range {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
 }
 .export-format-card {
   display: flex;

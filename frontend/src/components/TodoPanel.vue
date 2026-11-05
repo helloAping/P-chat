@@ -257,8 +257,10 @@ async function dismissInterrupted() {
 
 <style scoped>
 .todo-dock {
-  border-top: 1px solid var(--border);
-  background: var(--bg-2);
+  margin: 0 var(--space-3);
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
   flex-shrink: 0;
   display: flex;
   flex-direction: column;

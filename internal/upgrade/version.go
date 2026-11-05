@@ -99,7 +99,10 @@ const (
 	// V20 — PERF-02: FTS5 index (messages_fts) for conversation message search.
 	V20 AppVersion = 20
 
+	// V21 — message bookmarks table.
+	V21 AppVersion = 21
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V20
+	Current AppVersion = V21
 )

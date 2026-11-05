@@ -121,22 +121,20 @@ function promptLine(q: QuestionItem): string {
 <style scoped>
 .question-card {
   margin: var(--space-2) 0;
-  border: 1px solid var(--border-subtle);
-  border-left: 3px solid var(--border-default);
-  border-radius: var(--radius-md);
-  background: var(--surface-1);
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: transparent;
   overflow: hidden;
   font-size: 12.5px;
 }
-.question-card.status-open { border-left-color: var(--brand-500); }
-.question-card.status-error { border-left-color: var(--warn-500); }
 
 .qt-header {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 6px var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
+  padding: 6px 0;
+  border-bottom: none;
   font-size: 12px;
   color: var(--text-secondary);
 }

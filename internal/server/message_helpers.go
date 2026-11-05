@@ -1369,6 +1369,7 @@ func (h *Handler) sessionToResponse(cv memory.Conversation) SessionResponse {
 		SubAgentModelEnabled:           m.SubAgentModelEnabled,
 		SubAgentProvider:               m.SubAgentProvider,
 		SubAgentModel:                  m.SubAgentModel,
+		Tags:                           append([]string(nil), m.Tags...),
 		CreatedAt:                      cv.CreatedAt.Unix(),
 		UpdatedAt:                      cv.UpdatedAt.Unix(),
 	}

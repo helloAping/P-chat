@@ -122,6 +122,7 @@ export interface Session {
   title: string
   created_at: number
   updated_at: number
+  tags?: string[]
   // Resolved per-session picker state, included by the server
   // in the SessionResponse (see internal/server/handler.go
   // sessionToResponse). These may be empty when the session has
@@ -399,6 +400,7 @@ export interface UpdateSessionMetaResponse {
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
+  tags?: string[]
   created_at?: number
   updated_at?: number
 }
@@ -526,9 +528,20 @@ export const generateSessionTitle = (id: string, options: GenerateSessionTitleOp
     body: JSON.stringify(options),
   })
 
+export const listBookmarks = (id: string) =>
+  jsonFetch<{ bookmarks: { message_id: number; note?: string; seq?: number; created_at: number }[] }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks`,
+  )
+
+export const toggleBookmark = (id: string, messageID: number) =>
+  jsonFetch<{ bookmarked: boolean; message_id: number }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks/${messageID}`,
+    { method: 'POST' },
+  )
+
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; turn_mode_policy: TurnModePolicy; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; turn_mode_policy: TurnModePolicy; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string; tags: string[] }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',

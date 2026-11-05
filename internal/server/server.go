@@ -272,6 +272,8 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		// rendering happens server-side. See
 		// handler.go:ExportSession.
 		api.GET("/sessions/:id/export", h.ExportSession)
+		api.GET("/sessions/:id/bookmarks", h.ListBookmarks)
+		api.POST("/sessions/:id/bookmarks/:message_id", h.ToggleBookmark)
 		// P1-3 / P1-4: regenerate the assistant reply for a
 		// given user message. P1-3 physically deleted
 		// everything after that user message; P1-4

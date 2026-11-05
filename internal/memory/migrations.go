@@ -510,6 +510,21 @@ DROP TRIGGER IF EXISTS messages_fts_ad;
 DROP TRIGGER IF EXISTS messages_fts_au;
 DROP TABLE IF EXISTS messages_fts;`,
 	},
+	{
+		// Migration 15: message bookmarks for jump-back and range context.
+		Version: 15,
+		Name:    "message_bookmarks",
+		Up: `
+CREATE TABLE IF NOT EXISTS message_bookmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    UNIQUE(conversation_id, message_id)
+);`,
+		Down: `DROP TABLE IF EXISTS message_bookmarks;`,
+	},
 }
 
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (

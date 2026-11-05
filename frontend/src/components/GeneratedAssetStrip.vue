@@ -246,20 +246,16 @@ function assetSubtitle(asset: AttachmentArtifact): string {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   overflow: hidden;
-  background: var(--surface-1);
-  border: 1px solid var(--border-default);
+  background: transparent;
+  border: none;
   border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-sm);
-  transition:
-    border-color var(--dur-fast) var(--ease-out),
-    box-shadow var(--dur-fast) var(--ease-out),
-    transform var(--dur-fast) var(--ease-out);
+  box-shadow: none;
+  transition: transform var(--dur-fast) var(--ease-out);
 }
 
 .generated-strip-card:hover,
 .generated-strip-card:focus-within {
-  border-color: var(--border-strong);
-  box-shadow: var(--shadow-md);
+  box-shadow: none;
 }
 
 .generated-strip-card:active {
@@ -419,9 +415,9 @@ function assetSubtitle(asset: AttachmentArtifact): string {
   align-items: center;
   min-width: 0;
   min-height: calc(var(--control-height) + var(--space-1));
-  padding: var(--space-1) var(--space-2);
-  border-top: 1px solid var(--border-subtle);
-  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+  padding: var(--space-1) 0;
+  border-top: none;
+  background: transparent;
 }
 
 .generated-strip-identity {

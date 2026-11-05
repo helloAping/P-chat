@@ -1983,8 +1983,8 @@ const reasoningLevel = computed(() => {
   const idx = reasoningSteps.value.findIndex(opt => opt.value === reasoningEffort.value)
   return idx < 0 ? 0 : idx
 })
-// 思考开启后，一条短光沿名称外圈走。不用 SVG，只动画 offset-distance，
-// 避免 WebView2 每帧重绘描边。最高是实心绿，往低逐级变淡。
+// 思考开启后，一条短光沿名称外圈走。纯 CSS translate，大部分时间停住，
+// 避免脚本逐帧改 transform。
 const reasoningSpark = computed(() => reasoningLevel.value >= 1)
 const reasoningMeterStyle = computed(() => {
   const fills = [
@@ -2192,6 +2192,7 @@ watch([() => state.currentID, queueSignature], () => {
 </script>
 
 <template>
+  <div class="composer-shell">
   <div
     v-if="state.currentID"
     class="composer-toolbar"
@@ -2528,6 +2529,7 @@ watch([() => state.currentID, queueSignature], () => {
     </div>
   </div>
 
+  <slot name="composer-docks" />
 
   <div class="input-area" :class="{ 'input-area--has-queue': queuedTurns.length > 0 && !currentRollbackBanner }">
     <NDropdown
@@ -2792,7 +2794,12 @@ watch([() => state.currentID, queueSignature], () => {
                   :aria-label="currentMeta.model ? `当前模型 ${currentMeta.model}，思考强度${currentReasoningLabel}` : '选择模型'"
                   :aria-expanded="showModelSheet"
                 >
-                  <span v-if="reasoningSpark" class="model-badge-ecg" aria-hidden="true"></span>
+                  <span v-if="reasoningSpark" class="model-badge-ecg" aria-hidden="true">
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--top"><span class="model-badge-ecg-runner" /></span>
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--right"><span class="model-badge-ecg-runner" /></span>
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--bottom"><span class="model-badge-ecg-runner" /></span>
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--left"><span class="model-badge-ecg-runner" /></span>
+                  </span>
                   <Sparkles :size="12" class="model-badge-icon" />
                   <span class="model-badge-name">{{ currentMeta.model || '选择模型' }}</span>
                   <span class="model-badge-level" :class="`model-badge-level--${reasoningLevel}`">{{ currentReasoningLabel }}</span>
@@ -2889,6 +2896,7 @@ watch([() => state.currentID, queueSignature], () => {
       @select="onSelectCommand"
     />
   </Teleport>
+  </div>
 </template>
 
 <style scoped>
@@ -3256,11 +3264,6 @@ watch([() => state.currentID, queueSignature], () => {
   min-width: 0;
 }
 .input-wrap.has-attachments { padding-top: 0; }
-.input-wrap:focus-within {
-  border-color: var(--border-default);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-500) 12%, transparent);
-  background: var(--surface-input, var(--surface-1));
-}
 .input-wrap.dragover {
   border-color: var(--brand-500);
   background: color-mix(in srgb, var(--brand-500) 6%, var(--surface-1));
@@ -3351,8 +3354,8 @@ watch([() => state.currentID, queueSignature], () => {
  * `flex-shrink: 0` ensures the message list above gets
  * compressed first if the viewport is genuinely too small. */
 .input-area {
-  border-top: 1px solid var(--border-subtle);
-  background: var(--surface-1);
+  border-top: none;
+  background: transparent;
   padding: var(--space-2) var(--space-3);
   flex-shrink: 0;
   min-width: 0;
@@ -3361,21 +3364,34 @@ watch([() => state.currentID, queueSignature], () => {
 .input-area--has-queue {
   padding-top: 0;
 }
+.composer-shell {
+  position: relative;
+  flex-shrink: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+}
 .composer-toolbar {
+  position: absolute;
+  left: var(--space-3);
+  bottom: calc(100% + var(--space-1));
+  z-index: 3;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  align-self: flex-start;
   width: max-content;
   max-width: calc(100% - var(--space-6));
   gap: var(--space-2);
-  margin: 0 0 var(--space-1) var(--space-3);
+  margin: 0;
   padding: 0;
   background: transparent;
-  flex-shrink: 0;
   min-width: 0;
-  position: relative;
-  z-index: 3;
+  pointer-events: none;
+}
+.composer-toolbar .composer-toolbar-group,
+.composer-toolbar .scene-capsule {
+  pointer-events: auto;
 }
 .composer-toolbar-group {
   display: flex;
@@ -3469,14 +3485,14 @@ watch([() => state.currentID, queueSignature], () => {
   gap: var(--space-1);
   height: calc(var(--control-height) - 4px);
   padding: 0 var(--space-2);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  border: var(--control-border);
+  border-radius: var(--radius-sm);
   background: var(--surface-0);
   color: var(--text-3);
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
-  box-shadow: var(--shadow-xs);
+  box-shadow: none;
   transition:
     background var(--dur-fast) var(--ease-out),
     border-color var(--dur-fast) var(--ease-out),
@@ -3569,12 +3585,12 @@ watch([() => state.currentID, queueSignature], () => {
 .scene-capsule:hover {
   color: var(--text-2);
   border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
-  background: color-mix(in srgb, var(--brand-500) 8%, transparent);
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-0));
 }
 .scene-capsule--active {
   color: var(--text-1);
   border-color: color-mix(in srgb, var(--brand-500) 36%, var(--border-default));
-  background: color-mix(in srgb, var(--brand-500) 12%, transparent);
+  background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-0));
 }
 .input-bottom {
   display: flex;
@@ -3703,27 +3719,69 @@ watch([() => state.currentID, queueSignature], () => {
   border-radius: inherit;
   pointer-events: none;
   z-index: 1;
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--ecg, var(--success-500)) 42%, transparent);
 }
-.model-badge-ecg::before {
-  content: "";
+.model-badge-ecg-edge {
   position: absolute;
-  width: 18px;
-  height: 2px;
-  border-radius: 999px;
-  background: linear-gradient(90deg, transparent, var(--ecg, var(--success-500)));
-  offset-path: inset(0 round var(--radius-md));
-  offset-anchor: right center;
-  animation: model-ecg-run 3.2s linear infinite;
+  overflow: hidden;
 }
-@keyframes model-ecg-run {
-  to { offset-distance: 100%; }
+.model-badge-ecg-edge--top,
+.model-badge-ecg-edge--bottom {
+  left: 8px;
+  right: 8px;
+  height: 2px;
+}
+.model-badge-ecg-edge--top { top: 0; }
+.model-badge-ecg-edge--bottom { bottom: 0; }
+.model-badge-ecg-edge--left,
+.model-badge-ecg-edge--right {
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+}
+.model-badge-ecg-edge--left { left: 0; }
+.model-badge-ecg-edge--right { right: 0; }
+.model-badge-ecg-runner {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+}
+.model-badge-ecg-edge--top .model-badge-ecg-runner,
+.model-badge-ecg-edge--bottom .model-badge-ecg-runner {
+  background: linear-gradient(90deg, var(--ecg, var(--success-500)), transparent 14px);
+}
+.model-badge-ecg-edge--left .model-badge-ecg-runner,
+.model-badge-ecg-edge--right .model-badge-ecg-runner {
+  background: linear-gradient(180deg, var(--ecg, var(--success-500)), transparent 10px);
+}
+.model-badge-ecg-edge--top .model-badge-ecg-runner { animation: ecg-x 4.8s linear infinite; }
+.model-badge-ecg-edge--right .model-badge-ecg-runner { animation: ecg-y 4.8s linear -3.6s infinite; }
+.model-badge-ecg-edge--bottom .model-badge-ecg-runner { animation: ecg-x-back 4.8s linear -2.4s infinite; }
+.model-badge-ecg-edge--left .model-badge-ecg-runner { animation: ecg-y-back 4.8s linear -1.2s infinite; }
+@keyframes ecg-x {
+  0% { transform: translate3d(-100%, 0, 0); }
+  25% { transform: translate3d(100%, 0, 0); }
+  100% { transform: translate3d(100%, 0, 0); }
+}
+@keyframes ecg-x-back {
+  0% { transform: translate3d(100%, 0, 0); }
+  25% { transform: translate3d(-100%, 0, 0); }
+  100% { transform: translate3d(-100%, 0, 0); }
+}
+@keyframes ecg-y {
+  0% { transform: translate3d(0, -100%, 0); }
+  25% { transform: translate3d(0, 100%, 0); }
+  100% { transform: translate3d(0, 100%, 0); }
+}
+@keyframes ecg-y-back {
+  0% { transform: translate3d(0, 100%, 0); }
+  25% { transform: translate3d(0, -100%, 0); }
+  100% { transform: translate3d(0, -100%, 0); }
 }
 @media (prefers-reduced-motion: reduce) {
-  .model-badge-ecg::before {
-    animation: none;
-    offset-distance: 18%;
-  }
+  .model-badge-ecg-runner { animation: none; opacity: 0; }
 }
 .model-badge-icon { color: var(--ai-500); flex-shrink: 0; }
 .model-badge-caret { color: var(--text-tertiary); flex-shrink: 0; }
@@ -4205,7 +4263,7 @@ watch([() => state.currentID, queueSignature], () => {
 .perm-popover-radio {
   width: 12px; height: 12px;
   border-radius: 50%;
-  border: 1.5px solid var(--border-strong);
+  border: var(--control-border);
   flex-shrink: 0;
   position: relative;
 }

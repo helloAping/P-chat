@@ -33,7 +33,7 @@ import { formatMessageTime } from '../utils/format'
 import { buildTurnSummary, resolveTurnPath, shouldShowTurnSummary, turnFileLabel } from '../utils/turnSummary'
 import {
   ImageIcon, Volume2, Film, FileText, File,
-  Clipboard, Download, AlertTriangle, Undo2, GitBranch,
+  Clipboard, Download, AlertTriangle, Undo2, GitBranch, Bookmark,
   ArrowDown, ArrowUp, MoreHorizontal, Sparkles,
   Check, Loader2, XCircle, CornerDownLeft, Maximize2, Play,
 } from './icons'
@@ -85,10 +85,11 @@ import {
 
 const dialog = useDialog()
 
-const props = defineProps<{ message: Message; streaming?: boolean }>()
+const props = defineProps<{ message: Message; streaming?: boolean; bookmarked?: boolean }>()
 const emit = defineEmits<{
   rollback: []
   fork: []
+  'toggle-bookmark': []
   /** Inline-edit a user message and re-send. */
 }>()
 
@@ -1819,6 +1820,18 @@ function findPrecedingUserMessageId(): number {
             <Check v-if="isAction('copy', 'feedback')" :size="13" :key="`copy-ok-${pulseKey}`" class="bubble-action-icon" />
             <Clipboard v-else :size="13" :key="`copy-idle-${pulseKey}`" class="bubble-action-icon" />
           </button>
+          <button
+            v-if="message.id"
+            type="button"
+            class="bubble-action-btn"
+            :class="{ 'is-feedback': bookmarked }"
+            :title="bookmarked ? '取消书签' : '加书签'"
+            :aria-label="bookmarked ? '取消书签' : '加书签'"
+            :aria-pressed="bookmarked ? 'true' : 'false'"
+            @click="emit('toggle-bookmark')"
+          >
+            <Bookmark :size="13" class="bubble-action-icon" />
+          </button>
           <!-- P1-3 regenerate. Only shown on the trailing
                assistant message (we don't allow re-running
                a reply that's no longer the latest one).
@@ -2107,30 +2120,20 @@ function findPrecedingUserMessageId(): number {
   display: flex;
   flex-direction: column;
   gap: 0;
-  margin: var(--space-2) 0;
+  margin: var(--space-1) 0 var(--space-2);
   padding: 0;
-  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-xs);
-  overflow: hidden;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
 }
 .event-timeline > :deep(.tool-card),
 .event-timeline > :deep(.skill-card),
 .event-timeline > :deep(.sub-agent-card),
 .event-timeline > :deep(.tool-group) {
   margin: 0;
-}
-.event-timeline > :deep(.tool-card + .tool-card),
-.event-timeline > :deep(.skill-card + .skill-card),
-.event-timeline > :deep(.tool-card + .skill-card),
-.event-timeline > :deep(.skill-card + .tool-card),
-.event-timeline > :deep(.tool-card + .sub-agent-card),
-.event-timeline > :deep(.sub-agent-card + .tool-card),
-.event-timeline > :deep(.skill-card + .sub-agent-card),
-.event-timeline > :deep(.sub-agent-card + .skill-card),
-.event-timeline > :deep(.sub-agent-card + .sub-agent-card) {
-  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 /* "展开全文" affordance for truncated text parts. */
@@ -2392,8 +2395,7 @@ function findPrecedingUserMessageId(): number {
 }
 .media-thumbnail:hover,
 .media-thumbnail:focus-visible {
-  border-color: var(--border-strong);
-  box-shadow: var(--shadow-md);
+  box-shadow: none;
 }
 .media-thumbnail:focus-visible {
   outline: 2px solid var(--accent);

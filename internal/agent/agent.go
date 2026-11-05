@@ -3526,16 +3526,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			type forwarder struct{ done chan struct{} }
 			var forwarders []forwarder
 			var wg sync.WaitGroup
-			serialToolCalls := false
-			for _, tc := range toolCalls {
+			// REL-02: only exclusive calls take the gate. Read-safe tools in
+			// the same batch still run together; unknown tools stay exclusive.
+			canParallel := make([]bool, len(toolCalls))
+			for i, tc := range toolCalls {
 				meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot)
-				if !ok || !meta.EffectivePolicy().CanRunInParallel() {
-					serialToolCalls = true
-					break
-				}
+				canParallel[i] = ok && meta.EffectivePolicy().CanRunInParallel()
 			}
+			exclusiveCall, anyExclusive := exclusiveCallMask(canParallel)
 			var serialGate chan struct{}
-			if serialToolCalls {
+			if anyExclusive {
 				serialGate = make(chan struct{}, 1)
 			}
 			for i, tc := range toolCalls {
@@ -3754,7 +3754,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 				}()
 
-				go func(i int, tc nativeToolCall) {
+				go func(i int, tc nativeToolCall, exclusive bool) {
 					defer wg.Done()
 					defer close(eventCh)
 					// Tool definitions are intentionally restricted during a
@@ -3798,7 +3798,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 						return
 					}
-					if serialGate != nil {
+					if exclusive && serialGate != nil {
 						select {
 						case serialGate <- struct{}{}:
 							defer func() { <-serialGate }()
@@ -4050,7 +4050,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						err:     err,
 						elapsed: time.Since(toolStart),
 					}
-				}(i, tc)
+				}(i, tc, exclusiveCall[i])
 			}
 			// Wait for all tool goroutines to finish, but release the main
 			// stream immediately on cancellation. Third-party and dynamic

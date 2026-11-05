@@ -29,6 +29,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -919,6 +920,40 @@ func truncateRunes(s string, limit int) string {
 	return string(rs[:limit])
 }
 
+const (
+	maxSessionTags     = 8
+	maxSessionTagRunes = 16
+)
+
+// normalizeSessionTags trims, drops blanks, and rejects duplicates,
+// overlong labels, and lists past the cap. Order of first appearance
+// is kept.
+func normalizeSessionTags(in []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		tag := strings.TrimSpace(raw)
+		if tag == "" {
+			continue
+		}
+		if strings.ContainsAny(tag, "\r\n\t") {
+			return nil, fmt.Errorf("tag %q contains whitespace", tag)
+		}
+		if utf8.RuneCountInString(tag) > maxSessionTagRunes {
+			return nil, fmt.Errorf("tag %q is longer than %d characters", tag, maxSessionTagRunes)
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	if len(out) > maxSessionTags {
+		return nil, fmt.Errorf("at most %d tags", maxSessionTags)
+	}
+	return out, nil
+}
+
 // UpdateSessionMeta is the "change provider / model / style without
 // sending a message" endpoint. Bound to PATCH /sessions/:id. The
 // request body uses pointer fields so callers can send partial
@@ -1107,6 +1142,21 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.KnowledgeBase = *req.KnowledgeBase
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+
+	if req.Tags != nil {
+		tags, err := normalizeSessionTags(*req.Tags)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		h.ensureMetaLoaded(id)
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.Tags = tags
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)

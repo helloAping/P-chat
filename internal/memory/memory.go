@@ -2059,6 +2059,16 @@ func AttachmentsFromMultiContent(parts []openai.ChatMessagePart) []Attachment {
 // every REPL call or thread a "skip-current" flag
 // through call sites that don't need it.
 func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
+	return s.getMessagesFullByID(sessionID, 0, 0)
+}
+
+// GetMessagesFullBySeqRange returns the same rich rows as GetMessagesFullByID,
+// limited to an inclusive seq window. Zero bounds are open.
+func (s *Store) GetMessagesFullBySeqRange(sessionID string, fromSeq, toSeq int64) []MessageFull {
+	return s.getMessagesFullByID(sessionID, fromSeq, toSeq)
+}
+
+func (s *Store) getMessagesFullByID(sessionID string, fromSeq, toSeq int64) []MessageFull {
 	if sessionID == "" {
 		return nil
 	}
@@ -2066,7 +2076,7 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 
 	limit := s.maxHistory
 	rows, err := s.db.Query(
-		`SELECT id, role, content, metadata, created_at FROM messages
+		`SELECT id, seq, role, content, metadata, created_at FROM messages
 		 WHERE conversation_id = ?
 		 ORDER BY id ASC`,
 		sessionID,
@@ -2085,12 +2095,19 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 	for rows.Next() {
 		var (
 			id            int64
+			seq           int64
 			role, content string
 			metadata      sql.NullString
 			created       int64
 		)
-		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
+		if err := rows.Scan(&id, &seq, &role, &content, &metadata, &created); err != nil {
 			break
+		}
+		if fromSeq > 0 && seq < fromSeq {
+			continue
+		}
+		if toSeq > 0 && seq > toSeq {
+			continue
 		}
 		m := llm.Message{Role: role, Content: content}
 		metaStr := ""

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,7 +80,21 @@ func (h *Handler) ExportSession(c *gin.Context) {
 		return
 	}
 
-	msgs := h.store.GetMessagesFullByID(id)
+	fromSeq, err := parseOptionalSeq(c, "from_seq")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	toSeq, err := parseOptionalSeq(c, "to_seq")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if fromSeq > 0 && toSeq > 0 && fromSeq > toSeq {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "from_seq must be <= to_seq"})
+		return
+	}
+	msgs := h.store.GetMessagesFullBySeqRange(id, fromSeq, toSeq)
 	msgs = h.resolveExportUploads(msgs)
 	if len(msgs) == 0 {
 		// Empty session still produces a valid
@@ -138,6 +153,18 @@ func (h *Handler) ExportSession(c *gin.Context) {
 			asciiName, export.URLEncodeFilename(unicodeName)))
 	c.Header("Content-Length", fmt.Sprintf("%d", len(body)))
 	c.Data(http.StatusOK, mime, body)
+}
+
+func parseOptionalSeq(c *gin.Context, key string) (int64, error) {
+	raw := strings.TrimSpace(c.Query(key))
+	if raw == "" {
+		return 0, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return n, nil
 }
 
 func (h *Handler) resolveExportUploads(msgs []memory.MessageFull) []memory.MessageFull {

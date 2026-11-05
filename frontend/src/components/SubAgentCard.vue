@@ -435,8 +435,8 @@ onBeforeUnmount(() => clearStuckTimer())
   width: 100%;
   background: transparent;
   border: 0;
-  padding: var(--space-1) var(--space-2);
-  min-height: calc(var(--space-6) - var(--space-1));
+  padding: 6px 0;
+  min-height: 28px;
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
@@ -444,7 +444,7 @@ onBeforeUnmount(() => clearStuckTimer())
   font-size: inherit;
   transition: background var(--dur-fast) var(--ease-out);
 }
-.sub-header:hover { background: var(--surface-3); }
+.sub-header:hover { background: transparent; color: var(--text-primary); }
 /* Running: static surface tint only — no shimmer / gradient sweep. */
 .sub-header.running {
   background: color-mix(in srgb, var(--sub-accent, var(--brand-500)) 6%, var(--surface-2));

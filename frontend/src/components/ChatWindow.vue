@@ -33,6 +33,46 @@ import * as api from '../api/client'
 // template below.
 const isRecoveringCurrent = computed(() => !!state.isRecovering[state.currentID])
 
+const bookmarks = ref<{ message_id: number; seq?: number }[]>([])
+const bookmarkedIds = computed(() => new Set(bookmarks.value.map(item => item.message_id)))
+
+async function loadBookmarks(id: string) {
+  if (!id) {
+    bookmarks.value = []
+    return
+  }
+  try {
+    const resp = await api.listBookmarks(id)
+    bookmarks.value = resp.bookmarks || []
+  } catch {
+    bookmarks.value = []
+  }
+}
+
+async function onToggleBookmark(id?: number) {
+  if (!id || !state.currentID) return
+  try {
+    const resp = await api.toggleBookmark(state.currentID, id)
+    if (resp.bookmarked) {
+      const existing = bookmarks.value.find(item => item.message_id === id)
+      if (!existing) bookmarks.value = [...bookmarks.value, { message_id: id }]
+    } else {
+      bookmarks.value = bookmarks.value.filter(item => item.message_id !== id)
+    }
+  } catch (err: any) {
+    message.error(`书签失败：${err?.message || err}`)
+  }
+}
+
+function jumpBookmark(id: number) {
+  const el = messagesEl.value?.querySelector(`[data-msg-id="${id}"]`) as HTMLElement | null
+  if (!el) {
+    message.info('这条消息不在当前已加载的记录里')
+    return
+  }
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
 
@@ -201,15 +241,13 @@ const showJumpToBottom = computed(() => !isAtBottom.value)
 // themselves and a button would be noise.
 //
 // visibleMsgIds is the set of message ids currently in
-// the viewport. Recomputed on every scroll event via
-// querySelectorAll('[data-msg-id]'); the Set construction
-// is O(visible_messages), not O(all_messages), so even
-// very long sessions (1000s of messages) only pay for
-// what's actually on screen. We pair distanceFromBottom
-// with hasArchivedInView to decide whether the anchor
-// FAB should render — the user must BOTH be scrolled
-// up AND have an archived (◀ N/M ▶ paginated) reply
-// in the viewport for the FAB to make sense.
+// the viewport. An IntersectionObserver maintains it as
+// bubbles enter and leave; scrolling does not walk the
+// whole message list. We pair distanceFromBottom with
+// hasArchivedInView to decide whether the anchor FAB
+// should render — the user must BOTH be scrolled up AND
+// have an archived (◀ N/M ▶ paginated) reply in the
+// viewport for the FAB to make sense.
 const ANCHOR_THRESHOLD = 50
 const distanceFromBottom = ref(0)
 const visibleMsgIds = ref<Set<number>>(new Set())
@@ -246,25 +284,79 @@ function updateScrollPosition(el: HTMLElement) {
   const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
   distanceFromBottom.value = distFromBottom
   isAtBottom.value = distFromBottom < SCROLL_BOTTOM_THRESHOLD
-  // P1-4: refresh the visible-msg set on every scroll
-  // event. O(visible) — no full DOM walk, no expensive
-  // selectors. The data-msg-id attribute is set on
-  // every MessageBubble's root element so we can map
-  // DOM nodes back to message ids without maintaining
-  // a side index.
-  const newSet = new Set<number>()
-  const nodes = el.querySelectorAll('[data-msg-id]')
-  const containerRect = el.getBoundingClientRect()
-  nodes.forEach((node) => {
-    const rect = (node as HTMLElement).getBoundingClientRect()
-    if (rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) return
-    const idAttr = node.getAttribute('data-msg-id')
-    if (idAttr) {
-      const n = Number(idAttr)
-      if (Number.isFinite(n) && n > 0) newSet.add(n)
+}
+
+let visibilityObserver: IntersectionObserver | null = null
+let messageDomObserver: MutationObserver | null = null
+
+function messageIDFromNode(node: Node): number | null {
+  if (!(node instanceof HTMLElement)) return null
+  const raw = node.dataset.msgId
+  if (!raw) return null
+  const id = Number(raw)
+  return Number.isFinite(id) && id > 0 ? id : null
+}
+
+function observeMessageTree(node: Node) {
+  if (!(node instanceof HTMLElement) || !visibilityObserver) return
+  if (node.dataset.msgId) visibilityObserver.observe(node)
+  node.querySelectorAll('[data-msg-id]').forEach(el => visibilityObserver?.observe(el))
+}
+
+function unobserveMessageTree(node: Node) {
+  if (!(node instanceof HTMLElement) || !visibilityObserver) return
+  if (node.dataset.msgId) visibilityObserver.unobserve(node)
+  node.querySelectorAll('[data-msg-id]').forEach(el => visibilityObserver?.unobserve(el))
+}
+
+function rememberVisible(id: number, intersecting: boolean) {
+  const ids = visibleMsgIds.value
+  const has = ids.has(id)
+  if (intersecting === has) return
+  const next = new Set(ids)
+  if (intersecting) next.add(id)
+  else next.delete(id)
+  visibleMsgIds.value = next
+}
+
+function attachMessageVisibility() {
+  const root = messagesEl.value
+  if (!root) return
+  visibilityObserver?.disconnect()
+  messageDomObserver?.disconnect()
+  visibleMsgIds.value = new Set()
+  visibilityObserver = new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      const id = messageIDFromNode(entry.target)
+      if (id == null) continue
+      rememberVisible(id, entry.isIntersecting)
+    }
+  }, { root, threshold: 0 })
+  root.querySelectorAll('[data-msg-id]').forEach(el => visibilityObserver?.observe(el))
+  messageDomObserver = new MutationObserver((records) => {
+    for (const record of records) {
+      record.addedNodes.forEach(observeMessageTree)
+      record.removedNodes.forEach((node) => {
+        const id = messageIDFromNode(node)
+        if (id != null) rememberVisible(id, false)
+        if (node instanceof HTMLElement) {
+          node.querySelectorAll('[data-msg-id]').forEach((el) => {
+            const childID = messageIDFromNode(el)
+            if (childID != null) rememberVisible(childID, false)
+          })
+        }
+        unobserveMessageTree(node)
+      })
     }
   })
-  visibleMsgIds.value = newSet
+  messageDomObserver.observe(root, { childList: true, subtree: true })
+}
+
+function detachMessageVisibility() {
+  visibilityObserver?.disconnect()
+  messageDomObserver?.disconnect()
+  visibilityObserver = null
+  messageDomObserver = null
 }
 
 // scrollToUserMsg scrolls the user message associated
@@ -452,16 +544,21 @@ watch(() => state.currentID, () => {
   // land on the latest message.
   isAtBottom.value = true
   scrollToBottom()
+  nextTick(attachMessageVisibility)
+  void loadBookmarks(state.currentID)
 })
 
 watch(() => state.viewLoading, (loading) => {
   if (loading) return
   isAtBottom.value = true
   scrollToBottom()
+  nextTick(attachMessageVisibility)
 })
 
 onMounted(() => {
   scrollToBottom()
+  nextTick(attachMessageVisibility)
+  void loadBookmarks(state.currentID)
   // Bridge Naive UI's useMessage() to the chat store. The store
   // can't call useMessage() itself (no component context), so it
   // publishes errors here and we surface them as toasts. Without
@@ -482,6 +579,7 @@ onBeforeUnmount(() => {
   // Unregister so the store doesn't keep a reference to a torn-
   // down component's message instance.
   setUIMessageHandler(null)
+  detachMessageVisibility()
   if (scrollFrame !== null) cancelAnimationFrame(scrollFrame)
   // No custom scroll listener to remove — onScroll is bound
   // by Vue's @scroll on the template element, which Vue
@@ -608,6 +706,7 @@ function messageKey(m: any, i: number): string | number {
       <div
         ref="messagesEl"
         class="messages-scroll"
+        :class="{ 'messages-scroll--empty': !state.viewLoading && currentMessages.length === 0 }"
         :aria-busy="state.viewLoading ? 'true' : undefined"
         @scroll="onScroll"
       >
@@ -674,13 +773,24 @@ function messageKey(m: any, i: number): string | number {
           v-if="state.sessionPaging[state.currentID]?.loading"
           class="history-loading"
         >加载更早的消息…</div>
+        <div v-if="bookmarks.length" class="bookmark-strip">
+          <button
+            v-for="b in bookmarks"
+            :key="b.message_id"
+            type="button"
+            class="bookmark-chip"
+            @click="jumpBookmark(b.message_id)"
+          >{{ b.seq ? `书签 ${b.seq}` : '书签' }}</button>
+        </div>
         <MessageBubble
           v-for="(m, i) in currentMessages"
           :key="messageKey(m, i)"
           :message="m"
           :streaming="isStreaming && i === currentMessages.length - 1 && m.role === 'assistant'"
+          :bookmarked="m.id != null && bookmarkedIds.has(m.id)"
           @rollback="handleRollback(i)"
           @fork="handleFork(i)"
+          @toggle-bookmark="onToggleBookmark(m.id)"
         />
       </div>
       </div>
@@ -715,14 +825,17 @@ function messageKey(m: any, i: number): string | number {
         />
       </div>
     </div>
-    <QuestionModal @locate-question="locateOpenQuestion" />
-    <TodoPanel />
-    <SubAgentJobsPanel
-      :session-id="state.currentID"
-      @job-terminal="handleSubAgentJobTerminal"
-      @locate-result="jumpToBottom"
-    />
-    <InputArea />
+    <InputArea>
+      <template #composer-docks>
+        <QuestionModal @locate-question="locateOpenQuestion" />
+        <TodoPanel />
+        <SubAgentJobsPanel
+          :session-id="state.currentID"
+          @job-terminal="handleSubAgentJobTerminal"
+          @locate-result="jumpToBottom"
+        />
+      </template>
+    </InputArea>
     <!-- P1-4: 锚定 FAB (jump-to-user-message). Shown
          when the user is scrolled up beyond the 50px
          "redundancy threshold" AND has an archived
@@ -882,6 +995,22 @@ function messageKey(m: any, i: number): string | number {
   outline: 2px solid color-mix(in srgb, var(--brand-500) 35%, transparent);
   outline-offset: 1px;
 }
+.messages-scroll--empty {
+  overflow: hidden;
+}
+.messages-scroll--empty .messages {
+  height: 100%;
+  padding: 0;
+}
+.messages-scroll--empty .empty {
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  padding: var(--space-4);
+  content-visibility: visible;
+  contain-intrinsic-size: auto;
+}
 .messages-scroll {
   /* `flex: 1` makes the message list grow to fill the space
    * above the input. `min-height: 0` lets it shrink below
@@ -916,13 +1045,34 @@ function messageKey(m: any, i: number): string | number {
 .messages-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--text-quaternary);
 }
+.bookmark-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 0 0 var(--space-2);
+}
+.bookmark-chip {
+  border: 1px solid var(--border-default);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  border-radius: 999px;
+  font-size: 11px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.bookmark-chip:hover {
+  color: var(--text-primary);
+  border-color: color-mix(in srgb, var(--brand-500) 40%, var(--border-default));
+}
 .messages {
   /* No min-height: 100% here — that breaks overflow because
    * the parent doesn't have a defined height for it to
    * resolve against. The empty state is vertically centred
    * via flex on `.empty` so the page still looks balanced
    * when there are no messages. */
-  padding: var(--space-3) 0;
+  /* Floating capsules overlay the bottom of the scrollport.
+   * This tail keeps the last line above them without a white bar. */
+  padding: var(--space-3) 0 calc(var(--control-height) + var(--space-4)) 0;
   display: flex;
   flex-direction: column;
   transition: opacity var(--dur-slow) var(--ease-out),
@@ -983,7 +1133,7 @@ function messageKey(m: any, i: number): string | number {
  * `contain-intrinsic-size` gives the browser a fallback size
  * for skipped content so scrollbar/scrollHeight estimates stay
  * sane before a bubble is first laid out. */
-.messages > * {
+.messages > *:not(.empty) {
   content-visibility: auto;
   contain-intrinsic-size: auto 220px;
 }

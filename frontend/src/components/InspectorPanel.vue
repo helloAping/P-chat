@@ -593,7 +593,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   min-height: 0;
   overflow: hidden;
   background: var(--surface-2);
-  border-left: 1px solid var(--border-subtle);
+  border-left: none;
   opacity: 1;
   transition:
     width var(--dur-slow) var(--ease-in-out),
@@ -614,7 +614,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   gap: var(--space-2);
   min-height: calc(var(--control-height) + var(--space-3));
   padding: 0 var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
+  border-bottom: none;
   flex-shrink: 0;
 }
 .tab-list {
@@ -702,10 +702,10 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 }
 .section {
   padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-1) 88%, transparent);
-  box-shadow: var(--shadow-xs);
+  background: var(--surface-1);
+  box-shadow: none;
 }
 .section-label {
   margin-bottom: var(--space-2);
@@ -761,7 +761,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   width: var(--control-height);
   height: var(--control-height);
   flex: 0 0 var(--control-height);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
   background: var(--surface-1);
   color: var(--text-secondary);
@@ -769,7 +769,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   transition: var(--transition-colors);
 }
 .path-copy-btn:hover {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -790,7 +789,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   gap: var(--space-1);
   min-height: calc(var(--control-height) - var(--space-2));
   padding: 0 var(--space-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-pill);
   background: var(--surface-1);
   color: var(--text-tertiary);
@@ -842,7 +841,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 .gallery-thumb {
   aspect-ratio: 1;
   padding: 0;
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
   background: var(--surface-2);
   overflow: hidden;
@@ -881,19 +880,14 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   min-width: 0;
   min-height: calc(var(--control-height) + var(--space-3));
   padding: var(--space-1);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
-  transition:
-    background var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out),
-    box-shadow var(--dur-fast) var(--ease-out);
+  background: var(--surface-0);
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .session-attachment-row:hover,
 .session-attachment-row:focus-within {
-  border-color: var(--border-default);
-  background: color-mix(in srgb, var(--surface-1) 82%, var(--surface-3));
-  box-shadow: var(--shadow-xs);
+  background: var(--surface-3);
 }
 .session-attachment-main {
   width: 100%;
@@ -923,7 +917,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   height: var(--space-7);
   flex: 0 0 var(--space-7);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border-subtle);
+  border: none;
   background: var(--surface-2);
   color: var(--text-secondary);
 }
@@ -987,7 +981,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   justify-content: center;
   width: calc(var(--space-6) + var(--space-1));
   height: calc(var(--space-6) + var(--space-1));
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
   background: var(--surface-overlay);
   color: var(--text-secondary);
@@ -995,7 +989,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   transition: var(--transition-colors);
 }
 .session-attachment-action:hover {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -1031,9 +1024,9 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   display: grid;
   gap: var(--space-2);
   padding: var(--space-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
+  background: var(--surface-0);
   color: var(--text-secondary);
   font: inherit;
   text-align: left;
@@ -1044,7 +1037,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
     color var(--dur-fast) var(--ease-out);
 }
 .context-usage-card:hover:not(:disabled) {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -1114,7 +1106,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   padding: 4px 8px;
   border-radius: var(--radius-sm);
   background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   color: var(--text-3);
   font-size: 11.5px;
   font-variant-numeric: tabular-nums;
@@ -1133,7 +1125,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   margin-top: var(--space-2);
   padding: 2px 8px;
   border-radius: var(--radius-pill, 9999px);
-  border: 1px solid var(--border-subtle);
+  border: none;
   background: color-mix(in srgb, var(--brand-50) 62%, var(--surface-1));
   color: var(--text-secondary);
   font-size: 11px;
@@ -1156,9 +1148,9 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   justify-content: flex-start;
   gap: var(--space-2);
   padding: 0 var(--space-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
+  background: var(--surface-0);
   color: var(--text-secondary);
   font: inherit;
   font-size: 12px;
@@ -1167,7 +1159,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   transition: var(--transition-colors);
 }
 .panel-action-btn:hover:not(:disabled) {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }

@@ -131,6 +131,9 @@ type sessionMeta struct {
 	AutoContinue *bool
 	// TodoLongRunMode is nil when the session inherits the global policy.
 	TodoLongRunMode *config.TodoLongRunMode
+	// Tags are user-facing session labels. They ride in the existing
+	// metadata blob so adding them does not need a schema migration.
+	Tags []string
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -160,6 +163,7 @@ type sessionMetaBlob struct {
 	// round-tripping "false" as if the user had disabled it.
 	AutoContinue    *bool                   `json:"auto_continue,omitempty"`
 	TodoLongRunMode *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	Tags            []string                `json:"tags,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager) *Handler {
@@ -233,6 +237,7 @@ func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 		SubAgentModel:            m.SubAgentModel,
 		AutoContinue:             m.AutoContinue,
 		TodoLongRunMode:          m.TodoLongRunMode,
+		Tags:                     append([]string(nil), m.Tags...),
 	}
 }
 
@@ -329,6 +334,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.SubAgentModel = blob.SubAgentModel
 				m.AutoContinue = blob.AutoContinue
 				m.TodoLongRunMode = blob.TodoLongRunMode
+				m.Tags = append([]string(nil), blob.Tags...)
 			}
 		}
 	}
@@ -657,6 +663,9 @@ type UpdateSessionMetaRequest struct {
 	SubAgentModelEnabled   *bool   `json:"sub_agent_model_enabled,omitempty"`
 	SubAgentProvider       *string `json:"sub_agent_provider,omitempty"`
 	SubAgentModel          *string `json:"sub_agent_model,omitempty"`
+	// Tags replaces the session label list. Nil leaves tags unchanged;
+	// an empty slice clears them.
+	Tags *[]string `json:"tags,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -695,6 +704,7 @@ type SessionResponse struct {
 	SubAgentModelEnabled           bool                         `json:"sub_agent_model_enabled"`
 	SubAgentProvider               string                       `json:"sub_agent_provider,omitempty"`
 	SubAgentModel                  string                       `json:"sub_agent_model,omitempty"`
+	Tags                           []string                     `json:"tags,omitempty"`
 }
 
 // MessageResponse is the JSON form of a single message in a

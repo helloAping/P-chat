@@ -273,11 +273,12 @@ const promptText = computed(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  background: var(--surface-1);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-sm);
+  padding: var(--space-2) 0 var(--space-2);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 0;
+  box-shadow: none;
 }
 .qmodal-header {
   display: flex;
@@ -397,10 +398,11 @@ const promptText = computed(() => {
   align-items: flex-start;
   gap: 6px;
   min-width: 0;
-  padding: 6px 8px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
+  padding: 6px 0;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: transparent;
   color: var(--text-primary);
   font-family: inherit;
   text-align: left;
@@ -410,11 +412,9 @@ const promptText = computed(() => {
     background var(--dur-fast) var(--ease-out);
 }
 .qopt:hover {
-  border-color: var(--border-default);
-  background: var(--surface-3);
+  background: var(--surface-2);
 }
 .qopt-sel {
-  border-color: var(--brand-100);
   background: var(--brand-50);
 }
 .qopt-ctrl {
@@ -466,22 +466,20 @@ const promptText = computed(() => {
   gap: var(--space-2);
   margin-top: 6px;
   min-height: 32px;
-  padding: 4px 8px;
-  border: 1px dashed var(--border-default);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
+  padding: 4px 0;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 0;
+  background: transparent;
   cursor: pointer;
   transition:
     border-color var(--dur-fast) var(--ease-out),
     background var(--dur-fast) var(--ease-out);
 }
 .qcustom:hover {
-  border-color: var(--border-strong);
-  background: var(--surface-3);
+  background: var(--surface-2);
 }
 .qcustom.qcustom-sel {
-  border-color: var(--brand-100);
-  border-style: solid;
   background: var(--brand-50);
 }
 .qcustom-toggle {
@@ -511,7 +509,7 @@ const promptText = computed(() => {
   align-items: center;
   gap: var(--space-2);
   padding-top: var(--space-2);
-  border-top: 1px solid var(--border-subtle);
+  border-top: none;
   flex-shrink: 0;
 }
 @media (max-width: 720px) {

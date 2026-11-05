@@ -68,7 +68,7 @@ TitleBar
 ### 0.5.4 色彩纪律
 
 - **减少大面积高饱和蓝紫**。Brand 只用于：发送按钮、关键状态点、极轻 hover / selected wash。
-- **默认 CTA**（如「新建对话」）用 **outline / surface** 次要按钮：`var(--surface-2)` + `var(--border-default)`；hover 才允许浅 brand wash。**禁止**整栏实心 `--brand-500` 大按钮抢戏。
+- **默认 CTA**（如「新建对话」）用发丝描边次要按钮：透明底 + `var(--control-border)`；hover 只加一层 `--surface-2`。**禁止**整栏实心 `--brand-500` 大按钮抢戏。
 - **列表 / Tab / Rail 激活态**：浅底 wash（`color-mix` brand 进 surface），**禁止**左侧或底部的 brand 竖条 / 弧线。
 - User 气泡：只用 `--user-bubble-bg` / `--user-bubble-border`（低饱和 tint），禁止实心 brand 填充。
 - Assistant 正文：**默认无厚重卡片底**；身份靠头像 / 名称，不靠整块紫色底板。
@@ -79,13 +79,13 @@ TitleBar
 |---|---|---|
 | `text`（assistant） | 正文流 | 无厚卡片；markdown 走 `.md-body` |
 | `text`（user） | 右对齐柔和气泡 | `--user-bubble-bg` / `--user-bubble-border` |
-| `thinking` | **独立组件，不进入 `.event-timeline`** | `ThinkingBlock` 扁平行；`--thinking-bg` 中性；**禁止**独立暖色厚卡；**禁止**左侧竖轨 |
-| `tool` / `skill` / `sub_agent` | `.event-timeline` 浅底面板 | 与 thinking 同族但独立分组；无左侧竖轨；错误行才允许细红左边框 + 短摘要 |
+| `thinking` | **独立组件，不进入 `.event-timeline`** | `ThinkingBlock`：小图标 + 文字，仅底边；无填充卡片；**禁止**左侧竖轨 |
+| `tool` / `skill` / `sub_agent` | `.event-timeline` 行列表 | 与 thinking 同族但独立分组；每行小图标 + 文字，仅底边；无浅底面板；错误行才允许细红左边框 + 短摘要 |
 | 附件 / 媒体结果 | 中性小卡片 | 不与 user 文字气泡混在一起 |
 
 **分组铁律**（`MessageBubble.vue`）：
 
-- 连续的 `tool` / `skill` / `sub_agent` 共用一个浅底 `.event-timeline` 面板，行与行扁平并列。
+- 连续的 `tool` / `skill` / `sub_agent` 共用一个无底色 `.event-timeline`，每行只留底边。
 - `thinking` **永远**用 `ThinkingBlock` 独立渲染（不是 ToolCallCard），不进入 `.event-timeline` /「工具轨」。
 - **不要**在面板左侧画竖线 / 时间线轨。
 - **不改 SSE / parts 数据结构**；只改布局与样式。
@@ -100,7 +100,8 @@ TitleBar
 
 - 流式：只允许小 spinner / caret / 状态点；只动画 `opacity` / `transform`。
 - **禁止** thinking / tool / sub-agent 运行态的大面积 shimmer、持续背景扫光。
-- 密度：信息完整但不堆叠；用弱分割线、popover、Inspector section 组织，而不是层层嵌套卡片。
+- 密度：信息完整但不堆叠；用底色、popover、Inspector section 组织，而不是层层嵌套卡片。
+- **右侧 Inspector 卡片线条不能重。** section、操作按钮、上下文卡、附件行用底色划分区域；静息态禁止描边和阴影。hover 只换底色。
 
 ### 0.5.7 UI chrome
 
@@ -119,7 +120,7 @@ TitleBar
 | 选中会话 / Tab 左侧或底部 brand 竖条 | 浅底 wash，无弧线 / 竖条 |
 | tool error 大红铺满 | 细红边 + 短摘要 |
 | assistant 正文厚卡片 | 透明/无底，正文直接落在画布 |
-| Inspector 多层 card 套娃 | 弱 section divider |
+| Inspector 多层 card 套娃，或 section / 操作行 / 附件行画描边和阴影 | 右侧卡片只靠底色分层，静息无描边、无阴影 |
 | NScrollbar 包消息区 | native `overflow-y: auto` + flex 铁律 |
 
 ---
@@ -156,9 +157,11 @@ TitleBar
 
 | Token | 暗色值 | 用途 |
 |---|---|---|
-| `--border-subtle` | `rgba(255,255,255,0.06)` | 卡片内分割线 |
-| `--border-default` | `rgba(255,255,255,0.10)` | 控件边框、卡片边 |
-| `--border-strong` | `rgba(255,255,255,0.16)` | 强调边框、focus |
+| `--border-subtle` | `rgba(255,255,255,0.05)` | 发丝分割线、控件静息边 |
+| `--border-default` | `rgba(255,255,255,0.08)` | hover、浮层边缘 |
+| `--border-strong` | `rgba(255,255,255,0.12)` | 需要比 hover 再清楚一点的边 |
+
+控件（按钮、输入、勾选、单选）不要各写一套描边。静息用 `--control-border`，hover 用 `--control-border-hover`，焦点用 `--control-focus-border` + `--control-focus-ring`。焦点是淡色光晕，不是整圈实心品牌色。主按钮填充不加第二道描边。
 
 ### 1.4 Brand + AI（双品牌色）
 
@@ -522,8 +525,8 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 **色系 / 表面**：
 - assistant 头像：`--ai-500` / `--ai-50`；正文默认透明无厚卡片
 - user 气泡：`--user-bubble-bg` / `--user-bubble-border`（禁止实心 brand）
-- thinking：`--thinking-bg` / `--thinking-border` / `--thinking-icon`（中性独立行，与 tool 同族）
-- 过程面板：浅底 `.event-timeline`，**无左侧竖轨**；status：`start` 蓝 spinner、`ok` 绿勾、`error` 细红边、`warn` 橙；行内扁平无卡套卡
+- thinking：小图标 + 文字，仅 `border-bottom`，不铺 `--thinking-bg`
+- 过程行：`.event-timeline` 无底色、无外框；每行小图标 + 文字 + 底边；**无左侧竖轨**；status：`start` 蓝 spinner、`ok` 绿勾、`error` 细红边、`warn` 橙
 
 **Markdown**：用 `.md-body`（`style.css` 集中定义）。**不要在组件里重定义** p/code/pre/a/ul/ol/blockquote/table/hr/h1-h4/img/strong/em。
 
@@ -535,14 +538,14 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 | `ProjectSwitcher.vue` | 侧栏顶项目 popover | 触发器优先完整显示当前项目名；搜索 / 新建项目 / 全局 / 项目列表只在 popover 内展开；触发器旁不放独立 `+`；当前项 Check + 浅 wash |
 | `SessionSidebar.vue` | 统一侧栏 | 宽 `--sidebar-width`；「新建对话」outline CTA；会话 active = 浅 brand wash，**无**左边线 |
 | `TopBar.vue` | 面包屑 + ctx + inspector toggle | 克制高度；不堆叠打开目录/终端/工具列表/生成风格 |
-| `InspectorPanel.vue` | 右栏会话/项目摘要 + 归类操作 | 可折叠、可拖拽宽度；tab 切换用轻过渡；会话 tab 放 trace/工具列表/生成风格；项目 tab 放项目名、路径、Git 分支/工作区状态、AGENTS.md、打开目录/终端；section 用弱分割线 |
+| `InspectorPanel.vue` | 右栏会话/项目摘要 + 归类操作 | 可折叠、可拖拽宽度；tab 切换用轻过渡；会话 tab 放 trace/工具列表/生成风格；项目 tab 放项目名、路径、Git 分支/工作区状态、AGENTS.md、打开目录/终端；section 与内部行只靠底色分层，静息无描边、无阴影 |
 | `ChatWindow.vue` | 消息列 + dock | 遵守 §3.5 flex 铁律 |
 
 ### 3.9 Thinking vs Tool 视觉分工
 
 | | ThinkingBlock | Tool / Skill / SubAgent |
 |---|---|---|
-| 容器 | 独立中性扁平块，不进入 `.event-timeline` | 浅底 `.event-timeline` 面板内的扁平行 |
+| 容器 | 独立行，不进入 `.event-timeline`；仅底边 | `.event-timeline` 内的扁平行，仅底边 |
 | 左边轨 | **无** | **无**（仅 error 行可用细红左边框） |
 | 错误态 | N/A | 细红左边框 + 一行摘要 |
 | 运行动效 | 仅小 spinner | 仅小 spinner / 状态点 |
@@ -560,16 +563,17 @@ function applyDocumentTheme(name: 'dark' | 'light') {
 ### 3.10 CTA / 激活态配方（Calm）
 
 ```css
-/* 默认次要 CTA —— 侧栏「新建对话」等 */
+/* 默认次要 CTA —— 侧栏「新建对话」等。发丝边，hover 只加一层浅底。 */
 .calm-cta {
-  background: var(--surface-2);
+  background: transparent;
   color: var(--text-primary);
-  border: 1px solid var(--border-default);
+  border: var(--control-border);
+  border-radius: var(--radius-sm);
 }
 .calm-cta:hover {
-  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
-  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
-  color: var(--brand-600);
+  background: var(--surface-2);
+  border: var(--control-border-hover);
+  color: var(--text-primary);
 }
 
 /* 列表 / Rail / Tab 激活 —— 浅 wash，不要竖条或底边条 */
@@ -809,11 +813,14 @@ watch(themeName, (n) => {
 
 | 自上而下 | 组件 | 角色 | 高度预算 |
 |---|---|---|---|
-| 1 | `QuestionModal` | LLM 提问（需立即回答） | `max-height: min(42vh, 420px)` |
-| 2 | `TodoPanel` | 会话待办进度 | 折叠 36px；展开 `min(50vh, 320px)` |
-| 3 | `SubAgentJobsPanel` | 后台子代理状态 | 默认折叠；展开列最多 5 条 |
-| 4 | `InputArea` 内 `.turn-queue` | 用户排队待发 | 默认一行摘要；展开约 3 行（`calc(var(--space-8) * 2.5)`） |
-| 5 | `InputArea` 输入框 + 底栏 | 输入 | 自身内容高度，`flex-shrink: 0` |
+| 1 | `InputArea` 胶囊 `.composer-toolbar` | 场景 / 权限 / 风格等快捷操作 | 自身一行 |
+| 2 | `QuestionModal` | LLM 提问（需立即回答） | `max-height: min(42vh, 420px)` |
+| 3 | `TodoPanel` | 会话待办进度 | 折叠 36px；展开 `min(50vh, 320px)` |
+| 4 | `SubAgentJobsPanel` | 后台子代理状态 | 默认折叠；展开列最多 5 条 |
+| 5 | `InputArea` 内 `.turn-queue` | 用户排队待发 | 默认一行摘要；展开约 3 行（`calc(var(--space-8) * 2.5)`） |
+| 6 | `InputArea` 输入框 + 底栏 | 输入 | 自身内容高度，`flex-shrink: 0` |
+
+胶囊、提问、待办、子代理都挂在 `.composer-shell` 里。视觉顺序仍是 **胶囊 → question / todo / subagent → 输入框**，但胶囊是 `position: absolute` 悬浮在壳层上沿，不占文档流、不铺白条。消息滚动条贴到输入框（或待办/提问条）上沿。提问、待办、子代理用底边轻线条，不用描边卡片和阴影。对话里的工具结果、生成附件同样不用卡片外框。
 
 全屏模态（`ToolConfirmModal` / 设置 / `ImageLightbox`）**不进此栈**，走独立 mask。
 
@@ -865,6 +872,7 @@ watch(themeName, (n) => {
 17. ❌ 供应商协议字段显示 HTTPS / HTTP，或模型弹窗继续展示「功能标签」
 18. ❌ 子代理折叠态同时展示首字母图标、`类型` badge、`后台子代理` badge，造成重复噪声
 19. ❌ 在 ProjectSwitcher 触发器旁重复放「新建项目」`+` 按钮，挤压当前项目名称；AppRail 左下角快捷 `+` 需要保留
+20. ❌ 右侧 Inspector 的 section、操作行、上下文卡、附件行使用描边或阴影；区域只靠底色区分
 
 ### 10.3 改动现有样式前
 
@@ -889,6 +897,7 @@ watch(themeName, (n) => {
 - [ ] 字号用 `13px / 12.5px / 11.5px` 三档（label / button / hint）
 - [ ] 按钮复用 `.opt-pick` / `.ctrl-btn` / calm-cta（不发明高饱和新变体）
 - [ ] 若含 thinking / tool parts → 遵守 §0.5.5 / §3.9 分离规则
+- [ ] 若改 Inspector 右侧卡片 → 静息无描边、无阴影，只靠底色分层（§0.5.6 / §10.2.20）
 - [ ] Hover/active/focus/disabled 四个态都有
 - [ ] 暗色 + 亮色都视觉验证
 - [ ] UI chrome 无 emoji

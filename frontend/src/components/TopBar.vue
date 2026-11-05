@@ -194,8 +194,8 @@ const themeToggleTitle = computed(() =>
   align-items: center;
   gap: var(--space-3);
   padding: 0 var(--space-4);
-  background: var(--surface-1);
-  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-0);
+  border-bottom: none;
   z-index: 10;
 }
 

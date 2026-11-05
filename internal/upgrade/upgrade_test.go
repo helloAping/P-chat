@@ -39,8 +39,8 @@ func TestRun_V19ToV20CreatesMessagesFTS(t *testing.T) {
 	if err := Run(db); err != nil {
 		t.Fatalf("Run from V19: %v", err)
 	}
-	if got := readUserVersion(); got != V20 {
-		t.Fatalf("version = %d, want V20", got)
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want current", got)
 	}
 	var name string
 	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE name='messages_fts'`).Scan(&name); err != nil {
@@ -55,6 +55,36 @@ func TestRun_V19ToV20CreatesMessagesFTS(t *testing.T) {
 	}
 	if err := stepV19toV20(db); err != nil {
 		t.Fatalf("repeat V20 step: %v", err)
+	}
+}
+
+func TestRun_V20ToV21CreatesBookmarks(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V20); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V20: %v", err)
+	}
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want current", got)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='message_bookmarks'`).Scan(&name); err != nil {
+		t.Fatalf("message_bookmarks missing: %v", err)
+	}
+	if err := stepV20toV21(db); err != nil {
+		t.Fatalf("repeat V21 step: %v", err)
 	}
 }
 
