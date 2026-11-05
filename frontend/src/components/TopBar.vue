@@ -11,16 +11,17 @@
  *
  *   left:    sidebar collapse toggle
  *   center:  session title (H1) + project breadcrumb separator
- *   right:   theme / inspector toggle
+   *   right:   mute / theme / inspector toggle
  *
  * Brand mark lives in TitleBar (frameless chrome), not here.
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { NButton, NTooltip } from 'naive-ui'
 import { state } from '../stores/chat'
+import { notifyManager } from '../utils/notify'
 import {
   FolderOpen, PanelLeftClose, PanelLeftOpen, PanelRight, PanelRightClose,
-  GitBranch, CheckCircle2, AlertCircle, Sun, Moon,
+  GitBranch, CheckCircle2, AlertCircle, Sun, Moon, Volume2, VolumeX,
 } from './icons'
 
 const props = defineProps<{
@@ -72,6 +73,14 @@ const projectMetaItems = computed(() => {
 function toggleSidebar() { emit('toggle-sidebar') }
 function toggleInspector() { emit('toggle-inspector') }
 function toggleTheme() { emit('toggle-theme') }
+
+const muted = ref(notifyManager.mute)
+function toggleMute() {
+  notifyManager.unlock()
+  notifyManager.mute = !notifyManager.mute
+  muted.value = notifyManager.mute
+}
+const muteTitle = computed(() => muted.value ? '开启提示音' : '关闭提示音')
 
 const themeToggleTitle = computed(() =>
   props.themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题',
@@ -128,9 +137,23 @@ const themeToggleTitle = computed(() =>
       </template>
     </div>
 
-    <!-- Right section: theme and inspector only. Project/session utilities
-         live in the InspectorPanel so this toolbar stays calm. -->
+    <!-- Right section: mute, theme, and inspector. Session controls
+         live as floating capsules above the composer. -->
     <div class="topbar-right">
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            size="tiny"
+            quaternary
+            :aria-label="muteTitle"
+            :title="muteTitle"
+            @click="toggleMute"
+          >
+            <component :is="muted ? VolumeX : Volume2" :size="16" />
+          </NButton>
+        </template>
+        {{ muteTitle }}
+      </NTooltip>
       <NTooltip>
         <template #trigger>
           <NButton

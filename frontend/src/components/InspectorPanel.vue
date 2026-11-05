@@ -17,6 +17,7 @@ import {
   attachmentArtifactSourceLabel,
   attachmentArtifactTypeLabel,
   collectConversationAttachments,
+  galleryMedia,
   type AttachmentArtifact,
 } from '../utils/attachmentArtifacts'
 import ToolListDrawer from './ToolListDrawer.vue'
@@ -138,6 +139,15 @@ const toolStats = computed(() => {
 })
 
 const sessionAttachments = computed(() => collectConversationAttachments(currentMessages.value))
+const gallery = computed(() => galleryMedia(sessionAttachments.value))
+const galleryExpanded = ref(false)
+const GALLERY_LIMIT = 8
+const visibleGalleryImages = computed(() =>
+  galleryExpanded.value ? gallery.value.images : gallery.value.images.slice(0, GALLERY_LIMIT),
+)
+const hiddenGalleryCount = computed(() =>
+  Math.max(0, gallery.value.images.length - GALLERY_LIMIT),
+)
 const visibleSessionAttachments = computed(() =>
   sessionAttachmentsExpanded.value
     ? sessionAttachments.value
@@ -149,6 +159,7 @@ const hiddenSessionAttachmentCount = computed(() =>
 
 watch(() => state.currentID, () => {
   sessionAttachmentsExpanded.value = false
+  galleryExpanded.value = false
 })
 
 const agentsStatus = computed(() =>
@@ -392,6 +403,39 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
             <span class="dot">·</span>
             进行中 {{ toolStats.running }}
           </div>
+        </section>
+        <section v-if="gallery.images.length || gallery.audio.length" class="section section--gallery">
+          <div class="section-title-row section-title-row--spaced">
+            <div class="section-label">会话画廊</div>
+            <span v-if="gallery.images.length" class="attachment-count">{{ gallery.images.length }}</span>
+          </div>
+          <div v-if="gallery.images.length" class="gallery-grid">
+            <button
+              v-for="item in visibleGalleryImages"
+              :key="item.key"
+              type="button"
+              class="gallery-thumb"
+              :title="attachmentArtifactFileName(item)"
+              @click="openSessionAttachment(item)"
+            >
+              <img :src="item.url || ''" :alt="attachmentArtifactFileName(item)" />
+            </button>
+          </div>
+          <button
+            v-if="hiddenGalleryCount && !galleryExpanded"
+            type="button"
+            class="gallery-more"
+            @click="galleryExpanded = true"
+          >还有 {{ hiddenGalleryCount }} 张</button>
+          <audio
+            v-for="item in gallery.audio"
+            :key="item.key"
+            class="gallery-audio"
+            :src="item.url || ''"
+            :title="attachmentArtifactFileName(item)"
+            controls
+            preload="none"
+          />
         </section>
         <section class="section section--attachments">
           <div class="section-title-row section-title-row--spaced">
@@ -788,6 +832,43 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   color: var(--text-tertiary);
   font-size: 12px;
   line-height: 1.45;
+}
+.gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+.gallery-thumb {
+  aspect-ratio: 1;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+  cursor: pointer;
+}
+.gallery-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.gallery-more {
+  margin-top: var(--space-2);
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.gallery-more:hover { color: var(--text-secondary); }
+.gallery-audio {
+  display: block;
+  width: 100%;
+  margin-top: var(--space-2);
 }
 .session-attachment-list {
   display: grid;

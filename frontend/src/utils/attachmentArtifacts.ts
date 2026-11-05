@@ -327,3 +327,11 @@ export function collectMessageGeneratedAttachments(message: Message): Attachment
   walkParts(message.parts, message.id, out, seen)
   return out
 }
+
+/** Previewable images and playable audio already collected for the session. */
+export function galleryMedia(items: AttachmentArtifact[]): { images: AttachmentArtifact[]; audio: AttachmentArtifact[] } {
+  return {
+    images: items.filter(item => item.kind === 'image' && !!item.url),
+    audio: items.filter(item => item.kind === 'audio' && !!item.url),
+  }
+}

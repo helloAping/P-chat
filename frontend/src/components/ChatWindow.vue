@@ -3,7 +3,7 @@ import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useMessage } from 'naive-ui'
 import {
   ArrowDown, ArrowUp, MessageSquare, Loader2,
-  Code2, FlaskConical, ImageIcon, Lightbulb,
+  Code2, FlaskConical, ImageIcon, Lightbulb, RotateCcw,
 } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
@@ -18,6 +18,8 @@ import QuestionModal from './QuestionModal.vue'
 // in App.vue is the single source of truth for question UI.
 import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments, currentMeta, activeProjectName } from '../stores/chat'
 import { EMPTY_GUIDES, sceneById, type SceneId } from '../utils/scenePresets'
+import { pickContinueSession } from '../utils/continueSession'
+import { buildMinimapMarks } from '../utils/sessionMinimap'
 import { inspectDataTransfer } from '../utils/dropActions'
 import {
   styleGreeting,
@@ -35,11 +37,30 @@ const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
 
 const emptyGuides = EMPTY_GUIDES
+const continueSession = computed(() => pickContinueSession(state.sessions, state.currentID))
+const continueDetail = computed(() => {
+  const when = continueSession.value?.when
+  return when ? `${when} · 回到这条对话` : '回到这条对话'
+})
+const emptyHint = computed(() => (
+  continueSession.value
+    ? '第一张卡片回到上次对话；其余卡片填入提示，确认后再发送 · 也可拖入文件夹或附件'
+    : '点一张卡片填入提示，确认后再发送 · 也可拖入文件夹开项目，或拖入附件'
+))
 const emptyGuideIcon: Record<string, typeof MessageSquare> = {
   explain: MessageSquare,
   'find-bug': Code2,
   'write-test': FlaskConical,
   sketch: ImageIcon,
+}
+
+async function onContinueLast() {
+  if (!continueSession.value) return
+  try {
+    await switchSession(continueSession.value.id)
+  } catch (e: any) {
+    message.error(`无法打开上次对话：${e?.message || e}`)
+  }
 }
 
 async function onEmptyGuideClick(guideId: string) {
@@ -233,15 +254,10 @@ function updateScrollPosition(el: HTMLElement) {
   // a side index.
   const newSet = new Set<number>()
   const nodes = el.querySelectorAll('[data-msg-id]')
-  const viewportTop = 0
-  const viewportBottom = el.clientHeight
+  const containerRect = el.getBoundingClientRect()
   nodes.forEach((node) => {
     const rect = (node as HTMLElement).getBoundingClientRect()
-    // Skip nodes that are completely above or below
-    // the viewport (rare with the CSS layout but
-    // possible for huge bubbles). This keeps the set
-    // truly "visible" rather than "in the DOM".
-    if (rect.bottom <= viewportTop || rect.top >= viewportBottom) return
+    if (rect.bottom <= containerRect.top || rect.top >= containerRect.bottom) return
     const idAttr = node.getAttribute('data-msg-id')
     if (idAttr) {
       const n = Number(idAttr)
@@ -321,6 +337,7 @@ function scrollToBottom(smooth = false) {
       } else {
         el.scrollTop = el.scrollHeight
       }
+      updateScrollPosition(el)
     })
   })
 }
@@ -331,6 +348,15 @@ function scrollToBottom(smooth = false) {
 // for any in-flight streaming chunks — otherwise the smooth
 // scroll would race with each new chunk's auto-scroll and
 // the user would see a stuttering animation.
+const minimapMarks = computed(() => buildMinimapMarks(currentMessages.value))
+
+function scrollToMark(messageId: number) {
+  const el = messagesEl.value?.querySelector(
+    `[data-msg-id="${messageId}"]`,
+  ) as HTMLElement | null
+  el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 function jumpToBottom() {
   isAtBottom.value = true
   scrollToBottom(true)
@@ -607,7 +633,7 @@ function messageKey(m: any, i: number): string | number {
               >×</button>
             </p>
           </Transition>
-          <div class="empty-hint">点一张卡片填入提示，确认后再发送 · 也可拖入文件夹开项目，或拖入附件</div>
+          <div class="empty-hint">{{ emptyHint }}</div>
           <button
             v-if="needsSetup"
             type="button"
@@ -617,6 +643,18 @@ function messageKey(m: any, i: number): string | number {
             还没有模型，点此 60 秒完成配置
           </button>
           <div class="empty-guides" role="list">
+            <button
+              v-if="continueSession"
+              type="button"
+              class="empty-guide empty-guide--continue"
+              :title="`回到「${continueSession.title}」`"
+              :aria-label="`继续上次对话：${continueSession.title}`"
+              @click="onContinueLast"
+            >
+              <RotateCcw :size="16" class="empty-guide-icon" />
+              <span class="empty-guide-title">继续：{{ continueSession.title }}</span>
+              <span class="empty-guide-desc">{{ continueDetail }}</span>
+            </button>
             <button
               v-for="guide in emptyGuides"
               :key="guide.id"
@@ -657,6 +695,25 @@ function messageKey(m: any, i: number): string | number {
           <span class="view-loading-hint">{{ state.viewLoadingHint || '正在加载对话…' }}</span>
         </div>
       </Transition>
+      <div
+        v-if="minimapMarks.length"
+        class="minimap"
+        aria-label="会话刻度"
+      >
+        <button
+          v-for="mark in minimapMarks"
+          :key="`${mark.kind}-${mark.messageId}`"
+          type="button"
+          class="minimap-mark"
+          :class="[
+            `minimap-mark--${mark.kind}`,
+            { 'minimap-mark--active': visibleMsgIds.has(mark.messageId) },
+          ]"
+          :style="{ top: `${mark.position * 100}%` }"
+          :aria-label="mark.kind === 'user' ? '跳到用户消息' : mark.kind === 'error' ? '跳到报错回合' : '跳到工具回合'"
+          @click="scrollToMark(mark.messageId)"
+        />
+      </div>
     </div>
     <QuestionModal @locate-question="locateOpenQuestion" />
     <TodoPanel />
@@ -794,6 +851,36 @@ function messageKey(m: any, i: number): string | number {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+.minimap {
+  position: absolute;
+  top: var(--space-3);
+  bottom: var(--space-3);
+  right: 2px;
+  width: 10px;
+  z-index: 4;
+  pointer-events: none;
+}
+.minimap-mark {
+  pointer-events: auto;
+  position: absolute;
+  left: 2px;
+  width: 6px;
+  height: 6px;
+  margin: 0;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-pill);
+  transform: translateY(-50%);
+  cursor: pointer;
+}
+.minimap-mark--user { background: var(--text-quaternary); }
+.minimap-mark--tool { background: color-mix(in srgb, var(--brand-500) 70%, transparent); }
+.minimap-mark--error { background: var(--error-500); }
+.minimap-mark--active {
+  background: color-mix(in srgb, var(--brand-500) 55%, var(--surface-0));
+  outline: 2px solid color-mix(in srgb, var(--brand-500) 35%, transparent);
+  outline-offset: 1px;
 }
 .messages-scroll {
   /* `flex: 1` makes the message list grow to fill the space
@@ -982,6 +1069,15 @@ function messageKey(m: any, i: number): string | number {
   margin-top: var(--space-3);
   width: min(100%, 24.5rem);
   text-align: left;
+}
+.empty-guide.empty-guide--continue {
+  grid-column: 1 / -1;
+}
+.empty-guide--continue .empty-guide-title {
+  align-self: stretch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .empty-guide {
   display: flex;

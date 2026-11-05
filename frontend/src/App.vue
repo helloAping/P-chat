@@ -28,11 +28,15 @@ import PlanReviewModal from './components/PlanReviewModal.vue'
 import ToolConfirmModal from './components/ToolConfirmModal.vue'
 import CloseConfirmModal from './components/CloseConfirmModal.vue'
 import DownloadDock from './components/DownloadDock.vue'
-import { loadSessions, loadProviders, loadProjects, state as chatState } from './stores/chat'
+import GlobalCommandPalette from './components/GlobalCommandPalette.vue'
+import { loadSessions, loadProviders, loadProjects, createSession, switchSession, state as chatState } from './stores/chat'
+import { pickContinueSession } from './utils/continueSession'
+import { buildGlobalCommands, isCommandPaletteShortcut } from './utils/globalCommands'
 import { setupTrayEventListeners } from './utils/trayEvents'
 
 const showAppSettings = ref(false)
 const showFirstRun = ref(false)
+const paletteOpen = ref(false)
 const FIRST_RUN_DISMISS_KEY = 'pchat-firstrun-dismissed'
 let cleanupTrayEvents: (() => void) | null = null
 
@@ -331,6 +335,47 @@ function toggleTheme() {
   themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
 }
 
+const paletteCommands = computed(() => {
+  const next = pickContinueSession(chatState.sessions, chatState.currentID)
+  return buildGlobalCommands({
+    sidebarCollapsed: sidebarCollapsed.value,
+    inspectorOpen: inspectorOpen.value,
+    theme: themeName.value,
+    continueTitle: next?.title || null,
+  })
+})
+
+function onGlobalKeydown(event: KeyboardEvent) {
+  if (isCommandPaletteShortcut(event)) {
+    event.preventDefault()
+    event.stopPropagation()
+    paletteOpen.value = !paletteOpen.value
+    return
+  }
+  if (paletteOpen.value && event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    paletteOpen.value = false
+  }
+}
+
+async function runPaletteCommand(id: string) {
+  const next = pickContinueSession(chatState.sessions, chatState.currentID)
+  paletteOpen.value = false
+  await nextTick()
+  try {
+    if (id === 'new-chat') await createSession()
+    else if (id === 'continue' && next) await switchSession(next.id)
+    else if (id === 'projects') await focusProjects()
+    else if (id === 'add-project') openAddProject()
+    else if (id === 'sidebar') toggleSidebar()
+    else if (id === 'inspector') toggleInspector()
+    else if (id === 'theme') toggleTheme()
+  } catch (error) {
+    console.error('command failed', error)
+  }
+}
+
 // Single brand color used by both Naive UI's primaryColor
 // and the rest of the app's --brand-500. Reading the CSS var
 // (rather than hard-coding) keeps the two in lock-step. The
@@ -556,6 +601,7 @@ onMounted(async () => {
   }
   cleanupTrayEvents = await setupTrayEventListeners()
   window.addEventListener('resize', keepPanelWidthsInBounds)
+  window.addEventListener('keydown', onGlobalKeydown, true)
 })
 
 onUnmounted(() => {
@@ -563,6 +609,7 @@ onUnmounted(() => {
   removeInspectorResizeListeners()
   if (typeof window !== 'undefined') {
     window.removeEventListener('resize', keepPanelWidthsInBounds)
+    window.removeEventListener('keydown', onGlobalKeydown, true)
   }
   if (cleanupTrayEvents) {
     cleanupTrayEvents()
@@ -662,6 +709,13 @@ onUnmounted(() => {
             <PlanReviewModal />
             <CloseConfirmModal />
             <DownloadDock />
+            <GlobalCommandPalette
+              :open="paletteOpen"
+              :commands="paletteCommands"
+              :theme="themeName"
+              @close="paletteOpen = false"
+              @run="runPaletteCommand"
+            />
           </div>
         </NNotificationProvider>
       </NDialogProvider>

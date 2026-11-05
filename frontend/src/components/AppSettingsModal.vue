@@ -3305,7 +3305,7 @@ function kbModelSupportsVision(scanModel: string) {
               <div class="style-usage-grid">
                 <div class="style-usage-item">
                   <div class="style-usage-item-title">当前会话怎么用</div>
-                  <p>在聊天输入框下方打开“会话设置”，选择一个风格后，只会影响当前会话。</p>
+                  <p>在对话框上方的风格胶囊里选择一个风格后，只会影响当前会话。</p>
                 </div>
                 <div class="style-usage-item">
                   <div class="style-usage-item-title">自动生成风格</div>

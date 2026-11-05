@@ -30,7 +30,7 @@
 import { computed, h, nextTick, ref, useTemplateRef, watch, type Component } from 'vue'
 import { renderMarkdown } from '../utils/markdownCache'
 import { formatMessageTime } from '../utils/format'
-import { buildTurnSummary, shouldShowTurnSummary } from '../utils/turnSummary'
+import { buildTurnSummary, resolveTurnPath, shouldShowTurnSummary, turnFileLabel } from '../utils/turnSummary'
 import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch,
@@ -1024,6 +1024,23 @@ const turnSummary = computed(() => {
   const summary = buildTurnSummary(props.message)
   return shouldShowTurnSummary(summary) ? summary : null
 })
+const turnFilesOpen = ref(false)
+watch(() => props.message.id, () => { turnFilesOpen.value = false })
+
+async function openTurnFile(raw: string) {
+  const full = resolveTurnPath(raw, state.activeProjectPath)
+  const desktop = typeof window !== 'undefined'
+    && typeof (window as any).go?.main?.App?.OpenExplorer === 'function'
+  if (desktop) {
+    try {
+      await api.openExplorer(full)
+      return
+    } catch { /* browser or missing path: copy instead */ }
+  }
+  const ok = await copyText(full)
+  if (ok) toast.success('已复制路径')
+  else toast.error('无法打开或复制路径')
+}
 
 // "Image not supported" — when the LLM rejects the
 // user's image with the "this model does not support
@@ -1703,13 +1720,30 @@ function findPrecedingUserMessageId(): number {
             <span class="bubble-archived-label">上一版回答</span>
           </div>
 
-          <!-- Delight-3: one-line turn recap (tools / files / tokens). -->
-          <div v-if="turnSummary" class="turn-summary" :title="turnSummary.line">
-            {{ turnSummary.line }}
-          </div>
-
-          <!-- Footer for assistant: tokens / cache / elapsed -->
-          <div v-if="hasTokens" class="msg-meta">
+          <!-- Footer: turn recap + tokens / cache / elapsed (plain meta, no chip). -->
+          <div v-if="turnSummary || hasTokens" class="msg-meta">
+            <span v-if="turnSummary" class="msg-meta-turn-block">
+              <button
+                v-if="turnSummary.files.length"
+                type="button"
+                class="msg-meta-turn msg-meta-turn--btn"
+                :aria-expanded="turnFilesOpen"
+                title="查看本轮改过的文件"
+                @click="turnFilesOpen = !turnFilesOpen"
+              >{{ turnSummary.line }}</button>
+              <span v-else class="msg-meta-turn" :title="turnSummary.line">{{ turnSummary.line }}</span>
+              <ul v-if="turnFilesOpen && turnSummary.files.length" class="msg-turn-files">
+                <li v-for="file in turnSummary.files" :key="file">
+                  <button
+                    type="button"
+                    class="msg-turn-file"
+                    :title="file"
+                    @click="openTurnFile(file)"
+                  >{{ turnFileLabel(file) }}</button>
+                </li>
+              </ul>
+            </span>
+            <span v-if="turnSummary && hasTokens" class="msg-meta-sep">·</span>
             <span v-if="message.tokens_in || message.tokens_out" class="msg-meta-tokens">
               {{ message.tokens_in || 0 }}<ArrowDown :size="10" class="msg-meta-arrow" /> / {{ message.tokens_out || 0 }}<ArrowUp :size="10" class="msg-meta-arrow" />
             </span>
@@ -2831,27 +2865,51 @@ function findPrecedingUserMessageId(): number {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
+  align-items: flex-start;
 }
 .msg-elapsed, .msg-model { color: var(--text-quaternary); }
-.turn-summary {
-  margin-top: var(--space-2);
-  max-width: 100%;
-  padding: 4px 8px;
-  border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--brand-500) 6%, var(--surface-2));
-  border: 1px solid color-mix(in srgb, var(--brand-500) 14%, var(--border-subtle));
-  color: var(--text-3);
-  font-size: 11px;
-  line-height: 1.4;
+.msg-meta-turn {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  animation: turn-summary-in var(--dur-base) var(--ease-out);
+  max-width: 100%;
 }
-@keyframes turn-summary-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
+.msg-meta-turn-block {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
 }
+.msg-meta-turn--btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.msg-meta-turn--btn:hover { color: var(--text-secondary); }
+.msg-turn-files {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.msg-turn-file {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.msg-turn-file:hover { color: var(--text-primary); }
+.msg-meta-sep { color: var(--text-quaternary); }
 .msg-meta-tokens { display: inline-flex; align-items: center; gap: 1px; }
 .msg-meta-cache { color: var(--accent); }
 .msg-meta-arrow { color: var(--text-quaternary); margin: 0 1px; }
