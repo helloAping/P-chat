@@ -195,18 +195,22 @@ func (h *Handler) QuestionResponse(c *gin.Context) {
 func (h *Handler) ConfirmResponse(c *gin.Context) {
 	id := c.Param("id")
 	var body struct {
-		ConfirmID string `json:"confirm_id,omitempty"`
-		Approved  bool   `json:"approved"`
-		Action    string `json:"action,omitempty"`
+		ConfirmID     string `json:"confirm_id,omitempty"`
+		Approved      bool   `json:"approved"`
+		Action        string `json:"action,omitempty"`
+		StyleID       string `json:"style_id,omitempty"`
+		NewStyleLabel string `json:"new_style_label,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 	matched, ok := tool.SubmitConfirmResponseDetailed(id, tool.ConfirmResponse{
-		ConfirmID: body.ConfirmID,
-		Approved:  body.Approved,
-		Action:    body.Action,
+		ConfirmID:     body.ConfirmID,
+		Approved:      body.Approved,
+		Action:        body.Action,
+		StyleID:       body.StyleID,
+		NewStyleLabel: body.NewStyleLabel,
 	})
 	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no pending confirm for this session"})

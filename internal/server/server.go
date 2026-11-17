@@ -213,6 +213,8 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		api.PATCH("/diagnostics/config", h.DiagnosticsConfigUpdate)
 		api.GET("/diagnostics/snapshot/heap", h.DiagnosticsHeapSnapshot)
 		api.GET("/diagnostics/snapshot/goroutine", h.DiagnosticsGoroutineSnapshot)
+		api.GET("/storage/gc", h.PreviewStorageGC)
+		api.POST("/storage/gc", h.RunStorageGC)
 
 		// Uploads
 		api.POST("/uploads", h.Upload)
@@ -272,7 +274,9 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		// rendering happens server-side. See
 		// handler.go:ExportSession.
 		api.GET("/sessions/:id/export", h.ExportSession)
+		api.GET("/bookmarks", h.ListAllBookmarks)
 		api.GET("/sessions/:id/bookmarks", h.ListBookmarks)
+		api.GET("/sessions/:id/user-turns", h.ListUserTurns)
 		api.POST("/sessions/:id/bookmarks/:message_id", h.ToggleBookmark)
 		// P1-3 / P1-4: regenerate the assistant reply for a
 		// given user message. P1-3 physically deleted
@@ -316,6 +320,9 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		api.POST("/sessions/:id/question-response", h.QuestionResponse)
 		api.POST("/sessions/:id/confirm-response", h.ConfirmResponse)
 		api.POST("/sessions/:id/execute-plan", h.ExecutePlan)
+		api.POST("/sessions/:id/style-compare", h.StyleCompare)
+		api.POST("/sessions/:id/style-compare/adopt", h.AdoptStyleCompare)
+		api.GET("/sessions/:id/turn-changes", h.ListTurnChanges)
 		// Client-side abort: cancels the in-flight SendMessage turn
 		// so the session lock releases promptly even when the TCP
 		// connection stays open (frozen renderer).

@@ -136,6 +136,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
+	tool.SetStyleMemory(styleMgr)
 	// Build the search provider and install it as the
 	// process-global. The tool handler reads it via
 	// search.Global() on every call, so we update it here

@@ -62,11 +62,29 @@ func resetSameToolErr(name *string, count *int) {
 func normalizeToolCallIDs(toolCalls []nativeToolCall, seen map[string]bool) {
 	for i := range toolCalls {
 		tc := &toolCalls[i]
+		// A card already on the wire must keep its id. Rewriting it
+		// makes the later result miss that card, so the UI stays on
+		// "执行中" and paints a second completed card beside it.
+		if tc.StreamAnnounced && tc.ID != "" {
+			seen[tc.ID] = true
+			continue
+		}
 		if tc.ID == "" || seen[tc.ID] {
 			tc.ID = "call_" + uuid.NewString()
 		}
 		seen[tc.ID] = true
 	}
+}
+
+// claimToolCallID returns an id that is unique among cards already
+// announced in this round. The live UI keys the spinning card by this
+// id, so a later normalize pass must not replace it.
+func claimToolCallID(id string, announced map[string]bool) string {
+	if id == "" || announced[id] {
+		id = "call_" + uuid.NewString()
+	}
+	announced[id] = true
+	return id
 }
 
 // normalizeToolCallArgsJSON ensures tool call arguments are a JSON object before

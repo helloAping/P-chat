@@ -141,6 +141,27 @@ func (a *Agent) SetChatOptions(opts llm.ChatOptions) {
 // getStyleMemory 读取当前风格的 Memory 内容。空字符串表示未配置。
 // Memory 存储在数据库 styles.memory 列，是用户自定义的背景知识，
 // 动态注入到每轮对话末尾。
+func (a *Agent) persistTurnReplay(sessionID string, messageID int64) {
+	if a == nil || a.fileJournal == nil || a.store == nil || sessionID == "" || messageID <= 0 {
+		return
+	}
+	previews := a.fileJournal.CurrentTurnPreviews(sessionID)
+	if len(previews) == 0 {
+		return
+	}
+	rows := make([]memory.TurnChange, 0, len(previews))
+	for _, preview := range previews {
+		rows = append(rows, memory.TurnChange{
+			Tool:    preview.Tool,
+			Path:    preview.Path,
+			Preview: preview.Preview,
+		})
+	}
+	if err := a.store.ReplaceTurnChanges(sessionID, messageID, rows); err != nil {
+		log.Printf("[agent] persist turn replay: %v", err)
+	}
+}
+
 func (a *Agent) getStyleMemory(s style.Style) string {
 	if s.IsOff() {
 		return ""
@@ -2094,6 +2115,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 	go func() {
 		defer close(ch)
+		var turnAssistantID int64
+		if req.SubagentType == "" {
+			defer func() { a.persistTurnReplay(req.SessionID, turnAssistantID) }()
+		}
 		var asyncLiveClosed atomic.Bool
 		defer asyncLiveClosed.Store(true)
 		// Global default working directory: when the session has no
@@ -2350,7 +2375,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			sendOrDrop(ctx, ch, nextSeq, event)
 		})
 		if err != nil {
-			persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, 0, 0, false, req.RegenGroupID)
+			turnAssistantID = persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, 0, 0, false, req.RegenGroupID)
 			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true})
 			return
 		}
@@ -2655,6 +2680,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				fullThinkingBuilder strings.Builder
 				toolCalls           []nativeToolCall
 				argsAccum           = make(map[int]*nativeToolCall)
+				announcedToolIDs    = make(map[string]bool)
 				responsesItems      = make(map[int]llm.ResponsesOutputItem)
 				roundAnyToolErrored bool
 				// roundFailSigs collects the normalized signatures of
@@ -2845,6 +2871,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					fullContentBuilder.Reset()
 					fullThinkingBuilder.Reset()
 					argsAccum = make(map[int]*nativeToolCall)
+					announcedToolIDs = make(map[string]bool)
 					responsesItems = make(map[int]llm.ResponsesOutputItem)
 					streamBytes = 0
 					totalIn, totalOut = roundStartTotalIn, roundStartTotalOut
@@ -3088,11 +3115,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							existing = &nativeToolCall{ID: tcd.ID, ItemID: tcd.ItemID, Name: tcd.Name, OutputIndex: tcd.Index}
 							argsAccum[tcd.Index] = existing
 						}
-						if tcd.ID != "" {
-							existing.ID = tcd.ID
-						}
-						if tcd.Name != "" {
-							existing.Name = tcd.Name
+						if !existing.StreamAnnounced {
+							if tcd.ID != "" {
+								existing.ID = tcd.ID
+							}
+							if tcd.Name != "" {
+								existing.Name = tcd.Name
+							}
 						}
 						if tcd.ItemID != "" {
 							existing.ItemID = tcd.ItemID
@@ -3101,10 +3130,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						// AE-01: surface the tool card as soon as id+name
 						// are known, then forward args fragments so the
 						// GUI can stream long write_file/edit_file JSON.
-						// Wire-only — partsAcc still records the full args
-						// on the post-stream start event.
+						// The id claimed here is the one the result event
+						// must use; changing it later leaves the card spinning.
 						if existing.ID != "" && existing.Name != "" {
 							if !existing.StreamAnnounced {
+								existing.ID = claimToolCallID(existing.ID, announcedToolIDs)
 								existing.StreamAnnounced = true
 								sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{
 									Phase:    "tool",
@@ -3158,8 +3188,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			roundDone := ChatStreamChunk{
 				Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum),
-				Message:  fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))),
-				Round:    roundNum, MaxRound: maxRounds,
+				Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))),
+				Round:   roundNum, MaxRound: maxRounds,
 				TokensIn: totalIn, TokensOut: totalOut,
 			}
 			stampCacheUsage(&roundDone, totalCacheHit, totalCacheMiss, cacheReported)
@@ -3260,6 +3290,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					return
 				}
 				assistantRowID := persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, req.RegenGroupID)
+				if assistantRowID > 0 {
+					turnAssistantID = assistantRowID
+				}
 				if a.store != nil {
 					for _, msg := range roundToolMessages {
 						a.store.AddChatMessageTo(req.SessionID, msg)
@@ -3292,8 +3325,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				persistRound()
 				phaseDone := ChatStreamChunk{
 					Phase: "done", Step: "done",
-					Message:  "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
-					Round:    roundNum, MaxRound: maxRounds,
+					Message: "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
+					Round:   roundNum, MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
 				}
 				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
@@ -3452,8 +3485,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				persistRound()
 				phaseDone := ChatStreamChunk{
 					Phase: "done", Step: "done",
-					Message:  fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum),
-					Round:    roundNum, MaxRound: maxRounds,
+					Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum),
+					Round:   roundNum, MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
 				}
 				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
@@ -4358,8 +4391,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				emitTodoIncomplete("stuck-loop stopped the agent before the plan was complete", roundNum)
 				stuckChunk := ChatStreamChunk{
 					Phase: "stuck", Step: "stuck-loop",
-					Message:  fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
-					Round:    roundNum, MaxRound: maxRounds,
+					Message: fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
+					Round:   roundNum, MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
 				}
 				stampCacheUsage(&stuckChunk, totalCacheHit, totalCacheMiss, cacheReported)

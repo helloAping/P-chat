@@ -520,20 +520,18 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 			return
 		}
 		if status == "start" {
-			// When a ToolID is present, avoid clobbering an
-			// earlier same-name start part — the ID is the
-			// unique key. For ID-less streams (old clients),
-			// fall back to the legacy name-based check.
+			// When a ToolID is present, update that call wherever it
+			// already sits. Parallel calls append in stream order, so
+			// the matching preview is often not the last part.
 			if c.ToolID != "" {
-				if i := len(parts) - 1; i >= 0 &&
-					parts[i].Kind == "tool" &&
-					parts[i].ToolID == c.ToolID &&
-					parts[i].Status == "start" {
-					if c.ToolArgs != "" {
-						parts[i].Args = c.ToolArgs
+				for i := range parts {
+					if parts[i].Kind == "tool" && parts[i].ToolID == c.ToolID && parts[i].Status == "start" {
+						if c.ToolArgs != "" {
+							parts[i].Args = c.ToolArgs
+						}
+						a.setPartsFor(subIdx, parts)
+						return
 					}
-					a.setPartsFor(subIdx, parts)
-					return
 				}
 			} else if i := len(parts) - 1; i >= 0 &&
 				parts[i].Kind == "tool" &&

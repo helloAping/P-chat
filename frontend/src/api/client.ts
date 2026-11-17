@@ -528,6 +528,24 @@ export const generateSessionTitle = (id: string, options: GenerateSessionTitleOp
     body: JSON.stringify(options),
   })
 
+export interface BookmarkIndexItem {
+  message_id: number
+  conversation_id: string
+  title: string
+  project_path: string
+  snippet: string
+  seq?: number
+  created_at: number
+}
+
+export const listAllBookmarks = () =>
+  jsonFetch<{ bookmarks: BookmarkIndexItem[] }>('/api/v1/bookmarks')
+
+export const listUserTurns = (id: string) =>
+  jsonFetch<{ turns: { message_id: number; seq?: number; content: string }[] }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/user-turns`,
+  )
+
 export const listBookmarks = (id: string) =>
   jsonFetch<{ bookmarks: { message_id: number; note?: string; seq?: number; created_at: number }[] }>(
     `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks`,
@@ -537,6 +555,37 @@ export const toggleBookmark = (id: string, messageID: number) =>
   jsonFetch<{ bookmarked: boolean; message_id: number }>(
     `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks/${messageID}`,
     { method: 'POST' },
+  )
+
+export interface StyleCompareVariant {
+  style: string
+  label: string
+  text?: string
+  error?: string
+}
+
+export const styleCompare = (id: string, text: string) =>
+  jsonFetch<{ source: string; current: string; variants: StyleCompareVariant[] }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/style-compare`,
+    { method: 'POST', body: JSON.stringify({ text }) },
+  )
+
+export const adoptStyleCompare = (id: string, text: string, style: string) =>
+  jsonFetch<{ ok: boolean; message_id: number }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/style-compare/adopt`,
+    { method: 'POST', body: JSON.stringify({ text, style }) },
+  )
+
+export interface TurnChangeItem {
+  message_id: number
+  tool: string
+  path?: string
+  preview?: string
+}
+
+export const listTurnChanges = (id: string) =>
+  jsonFetch<{ changes: TurnChangeItem[]; note?: string }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/turn-changes`,
   )
 
 export const updateSessionMeta = (
@@ -1784,6 +1833,12 @@ export interface StreamEvent {
 
 export type ConfirmAction = 'reject' | 'once' | 'always'
 
+export interface ConfirmDecision {
+  action: ConfirmAction
+  styleId?: string
+  newStyleLabel?: string
+}
+
 export interface ConfirmResponseResult {
   ok: boolean
   confirm_id?: string
@@ -1796,10 +1851,17 @@ export async function submitConfirmResponse(
   approved: boolean,
   action?: ConfirmAction,
   confirmId?: string,
+  style?: { styleId?: string; newStyleLabel?: string },
 ): Promise<ConfirmResponseResult> {
   return jsonFetch<ConfirmResponseResult>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/confirm-response`, {
     method: 'POST',
-    body: JSON.stringify({ approved, action, confirm_id: confirmId }),
+    body: JSON.stringify({
+      approved,
+      action,
+      confirm_id: confirmId,
+      style_id: style?.styleId || '',
+      new_style_label: style?.newStyleLabel || '',
+    }),
   })
 }
 
@@ -2672,6 +2734,30 @@ export function downloadDiagnosticsSnapshot(kind: 'heap' | 'goroutine') {
   a.click()
   a.remove()
 }
+
+export interface StorageGCItem {
+  id: string
+  label: string
+  detail: string
+  count: number
+  bytes: number
+}
+
+export interface StorageGCReport {
+  items: StorageGCItem[]
+  total_bytes: number
+  vacuumed: boolean
+  vacuum_error?: string
+}
+
+export const previewStorageGC = () =>
+  jsonFetch<StorageGCReport>('/api/v1/storage/gc')
+
+export const runStorageGC = (actions: string[]) =>
+  jsonFetch<StorageGCReport>('/api/v1/storage/gc', {
+    method: 'POST',
+    body: JSON.stringify({ actions }),
+  })
 
 // ---- Browser control ----
 

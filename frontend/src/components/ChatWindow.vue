@@ -16,7 +16,7 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments, currentMeta, activeProjectName } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments, currentMeta, activeProjectName, jumpToSearchResult, historyJumpInProgress } from '../stores/chat'
 import { EMPTY_GUIDES, sceneById, type SceneId } from '../utils/scenePresets'
 import { pickContinueSession } from '../utils/continueSession'
 import { buildMinimapMarks } from '../utils/sessionMinimap'
@@ -35,6 +35,29 @@ const isRecoveringCurrent = computed(() => !!state.isRecovering[state.currentID]
 
 const bookmarks = ref<{ message_id: number; seq?: number }[]>([])
 const bookmarkedIds = computed(() => new Set(bookmarks.value.map(item => item.message_id)))
+const turnChanges = ref<api.TurnChangeItem[]>([])
+const replayByMessage = computed(() => {
+  const map = new Map<number, api.TurnChangeItem[]>()
+  for (const item of turnChanges.value) {
+    const list = map.get(item.message_id) || []
+    list.push(item)
+    map.set(item.message_id, list)
+  }
+  return map
+})
+
+async function loadTurnChanges(id: string) {
+  if (!id) {
+    turnChanges.value = []
+    return
+  }
+  try {
+    const resp = await api.listTurnChanges(id)
+    turnChanges.value = resp.changes || []
+  } catch {
+    turnChanges.value = []
+  }
+}
 
 async function loadBookmarks(id: string) {
   if (!id) {
@@ -59,18 +82,25 @@ async function onToggleBookmark(id?: number) {
     } else {
       bookmarks.value = bookmarks.value.filter(item => item.message_id !== id)
     }
+    window.dispatchEvent(new Event('pchat:bookmarks-changed'))
   } catch (err: any) {
     message.error(`书签失败：${err?.message || err}`)
   }
 }
 
-function jumpBookmark(id: number) {
+async function jumpBookmark(id: number) {
   const el = messagesEl.value?.querySelector(`[data-msg-id="${id}"]`) as HTMLElement | null
-  if (!el) {
-    message.info('这条消息不在当前已加载的记录里')
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
     return
   }
-  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  if (!state.currentID) return
+  try {
+    await jumpToSearchResult(state.currentID, id)
+  } catch (err: unknown) {
+    const text = err instanceof Error ? err.message : '无法跳转到这条书签'
+    message.info(text)
+  }
 }
 
 const messagesEl = ref<HTMLElement | null>(null)
@@ -415,10 +445,15 @@ let pendingSmoothScroll = false
 // action; starting one animation for every token causes the visible
 // flashing reported during long tool-heavy tasks.
 function scrollToBottom(smooth = false) {
+  if (historyJumpInProgress()) return
   pendingSmoothScroll ||= smooth
   if (scrollFrame !== null) return
   scrollFrame = requestAnimationFrame(() => {
     scrollFrame = null
+    if (historyJumpInProgress()) {
+      pendingSmoothScroll = false
+      return
+    }
     const useSmooth = pendingSmoothScroll
     pendingSmoothScroll = false
     nextTick(() => {
@@ -440,13 +475,61 @@ function scrollToBottom(smooth = false) {
 // for any in-flight streaming chunks — otherwise the smooth
 // scroll would race with each new chunk's auto-scroll and
 // the user would see a stuttering animation.
-const minimapMarks = computed(() => buildMinimapMarks(currentMessages.value))
+const guideTurns = ref<{ id: number; content: string }[]>([])
 
-function scrollToMark(messageId: number) {
+async function loadGuideTurns(id: string) {
+  if (!id) {
+    guideTurns.value = []
+    return
+  }
+  try {
+    const resp = await api.listUserTurns(id)
+    if (state.currentID !== id) return
+    guideTurns.value = (resp.turns || []).map(turn => ({
+      id: turn.message_id,
+      content: turn.content || '',
+    }))
+  } catch {
+    if (state.currentID === id) guideTurns.value = []
+  }
+}
+
+watch(() => state.currentID, (id) => { void loadGuideTurns(id) }, { immediate: true })
+watch(() => {
+  const messages = currentMessages.value
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i]
+    if (message.role === 'user' && (message.id || 0) > 0) return message.id
+  }
+  return 0
+}, () => { void loadGuideTurns(state.currentID) })
+
+const minimapMarks = computed(() => {
+  if (guideTurns.value.length) {
+    return buildMinimapMarks(guideTurns.value.map(turn => ({
+      id: turn.id,
+      role: 'user' as const,
+      content: turn.content,
+    })))
+  }
+  return buildMinimapMarks(currentMessages.value)
+})
+
+async function scrollToMark(messageId: number) {
   const el = messagesEl.value?.querySelector(
     `[data-msg-id="${messageId}"]`,
   ) as HTMLElement | null
-  el?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  if (el) {
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    return
+  }
+  if (!state.currentID) return
+  try {
+    await jumpToSearchResult(state.currentID, messageId)
+  } catch (err: unknown) {
+    const text = err instanceof Error ? err.message : '无法跳转到这条消息'
+    message.error(text)
+  }
 }
 
 function jumpToBottom() {
@@ -470,10 +553,17 @@ function locateOpenQuestion() {
 watch(() => state.searchJumpTarget, async (target) => {
   if (!target || target.sessionID !== state.currentID) return
   await nextTick()
+  await nextTick()
   if (state.searchJumpTarget?.requestID !== target.requestID) return
-  const el = messagesEl.value?.querySelector(
+  let el = messagesEl.value?.querySelector(
     `[data-msg-id="${target.messageID}"]`,
   ) as HTMLElement | null
+  if (!el) {
+    await new Promise<void>(resolve => requestAnimationFrame(() => resolve()))
+    el = messagesEl.value?.querySelector(
+      `[data-msg-id="${target.messageID}"]`,
+    ) as HTMLElement | null
+  }
   if (!el) {
     completeSearchJump(target.requestID, '消息已加载，但页面中没有对应的可见气泡')
     return
@@ -511,6 +601,7 @@ async function onScroll(e: Event) {
 // "scrolled up" branch is intentionally a no-op so the user
 // can keep reading whatever they were looking at.
 watch(() => currentMessages.value.length, (newLen, oldLen) => {
+  if (historyJumpInProgress()) return
   if (newLen <= (oldLen || 0)) return
   if (wasAtTop.value) {
     nextTick(() => {
@@ -540,25 +631,36 @@ watch(
 )
 
 watch(() => state.currentID, () => {
+  void loadBookmarks(state.currentID)
+  void loadTurnChanges(state.currentID)
+  nextTick(attachMessageVisibility)
+  if (historyJumpInProgress()) {
+    isAtBottom.value = false
+    return
+  }
   // A new session is a fresh slate: assume the user wants to
   // land on the latest message.
   isAtBottom.value = true
   scrollToBottom()
-  nextTick(attachMessageVisibility)
-  void loadBookmarks(state.currentID)
 })
 
 watch(() => state.viewLoading, (loading) => {
   if (loading) return
+  if (historyJumpInProgress() || state.searchJumpTarget) return
   isAtBottom.value = true
   scrollToBottom()
   nextTick(attachMessageVisibility)
+})
+
+watch(isStreaming, (streaming, was) => {
+  if (was && !streaming) void loadTurnChanges(state.currentID)
 })
 
 onMounted(() => {
   scrollToBottom()
   nextTick(attachMessageVisibility)
   void loadBookmarks(state.currentID)
+  void loadTurnChanges(state.currentID)
   // Bridge Naive UI's useMessage() to the chat store. The store
   // can't call useMessage() itself (no component context), so it
   // publishes errors here and we surface them as toasts. Without
@@ -788,6 +890,7 @@ function messageKey(m: any, i: number): string | number {
           :message="m"
           :streaming="isStreaming && i === currentMessages.length - 1 && m.role === 'assistant'"
           :bookmarked="m.id != null && bookmarkedIds.has(m.id)"
+          :replay="m.id != null ? replayByMessage.get(m.id) : undefined"
           @rollback="handleRollback(i)"
           @fork="handleFork(i)"
           @toggle-bookmark="onToggleBookmark(m.id)"
@@ -808,21 +911,22 @@ function messageKey(m: any, i: number): string | number {
       <div
         v-if="minimapMarks.length"
         class="minimap"
+        :class="{ 'minimap--fade-top': minimapMarks.length > 10 }"
         aria-label="会话刻度"
       >
         <button
           v-for="mark in minimapMarks"
-          :key="`${mark.kind}-${mark.messageId}`"
+          :key="mark.messageId"
           type="button"
           class="minimap-mark"
-          :class="[
-            `minimap-mark--${mark.kind}`,
-            { 'minimap-mark--active': visibleMsgIds.has(mark.messageId) },
-          ]"
-          :style="{ top: `${mark.position * 100}%` }"
-          :aria-label="mark.kind === 'user' ? '跳到用户消息' : mark.kind === 'error' ? '跳到报错回合' : '跳到工具回合'"
+          :class="{ 'minimap-mark--active': visibleMsgIds.has(mark.messageId) }"
+          :style="{ '--mark-span': String(mark.span) }"
+          :aria-label="mark.tip"
           @click="scrollToMark(mark.messageId)"
-        />
+        >
+          <span class="minimap-tip">{{ mark.tip }}</span>
+          <span class="minimap-bar" />
+        </button>
       </div>
     </div>
     <InputArea>
@@ -967,33 +1071,72 @@ function messageKey(m: any, i: number): string | number {
 }
 .minimap {
   position: absolute;
-  top: var(--space-3);
-  bottom: var(--space-3);
-  right: 2px;
-  width: 10px;
+  top: 50%;
+  right: 10px;
   z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 7px;
+  width: max-content;
+  max-width: min(320px, 46%);
+  max-height: 52%;
+  transform: translateY(-50%);
+  overflow: hidden;
+  justify-content: flex-end;
   pointer-events: none;
+}
+.minimap--fade-top {
+  -webkit-mask-image: linear-gradient(to bottom, transparent, #000 36px);
+  mask-image: linear-gradient(to bottom, transparent, #000 36px);
 }
 .minimap-mark {
   pointer-events: auto;
-  position: absolute;
-  left: 2px;
-  width: 6px;
-  height: 6px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  max-width: 100%;
+  height: 16px;
   margin: 0;
   padding: 0;
   border: none;
-  border-radius: var(--radius-pill);
-  transform: translateY(-50%);
+  background: transparent;
+  color: var(--text-secondary);
   cursor: pointer;
 }
-.minimap-mark--user { background: var(--text-quaternary); }
-.minimap-mark--tool { background: color-mix(in srgb, var(--brand-500) 70%, transparent); }
-.minimap-mark--error { background: var(--error-500); }
-.minimap-mark--active {
-  background: color-mix(in srgb, var(--brand-500) 55%, var(--surface-0));
-  outline: 2px solid color-mix(in srgb, var(--brand-500) 35%, transparent);
-  outline-offset: 1px;
+.minimap-bar {
+  flex: 0 0 auto;
+  width: calc(12px + var(--mark-span, 0) * 14px);
+  height: 2px;
+  border-radius: 1px;
+  background: var(--text-quaternary);
+  transition: width var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.minimap-tip {
+  display: none;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 0;
+  font-size: 12px;
+  line-height: 1.3;
+  text-align: right;
+  color: var(--text-primary);
+}
+.minimap-mark:hover .minimap-tip,
+.minimap-mark:focus-visible .minimap-tip {
+  display: block;
+}
+.minimap-mark--active .minimap-bar {
+  background: var(--text-secondary);
+}
+.minimap-mark:hover .minimap-bar,
+.minimap-mark:focus-visible .minimap-bar {
+  width: calc(28px + var(--mark-span, 0) * 18px);
+  background: var(--text-secondary);
 }
 .messages-scroll--empty {
   overflow: hidden;
@@ -1072,7 +1215,7 @@ function messageKey(m: any, i: number): string | number {
    * when there are no messages. */
   /* Floating capsules overlay the bottom of the scrollport.
    * This tail keeps the last line above them without a white bar. */
-  padding: var(--space-3) 0 calc(var(--control-height) + var(--space-4)) 0;
+  padding: var(--space-3) 36px calc(var(--control-height) + var(--space-4)) 0;
   display: flex;
   flex-direction: column;
   transition: opacity var(--dur-slow) var(--ease-out),

@@ -2492,6 +2492,10 @@ func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 
 // DeleteConversation removes a conversation and all its messages.
 func (s *Store) DeleteConversation(id string) error {
+	_ = s.DeleteTurnChanges(id)
+	if err := s.DeleteBookmarks(id); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`DELETE FROM conversations WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -2517,6 +2521,9 @@ func (s *Store) DeleteConversation(id string) error {
 // without removing the conversation record itself (preserves session ID).
 func (s *Store) ClearMessages(conversationID string) error {
 	_ = s.Flush()
+	if err := s.DeleteBookmarks(conversationID); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`DELETE FROM messages WHERE conversation_id = ?`, conversationID); err != nil {
 		return err
 	}
@@ -3164,6 +3171,12 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 		`UPDATE media_contexts
 		 SET archived = 1, archive_reason = 'rollback'
 		 WHERE session_id = ? AND message_id >= ? AND archived = 0`,
+		conversationID, fromID,
+	); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM message_bookmarks WHERE conversation_id = ? AND message_id >= ?`,
 		conversationID, fromID,
 	); err != nil {
 		return nil, err

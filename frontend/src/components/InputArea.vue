@@ -33,6 +33,7 @@ import {
   generateSessionTitle,
 } from '../stores/chat'
 import { inspectDataTransfer } from '../utils/dropActions'
+import { runStyleCompare } from '../utils/styleCompareState'
 import {
   SCENE_CAPSULES,
   matchScene,
@@ -189,6 +190,17 @@ async function setTurnModePolicy(next: api.TurnModePolicy) {
 
 async function togglePlanMode() {
   await setTurnModePolicy(nextTurnModePolicy(turnModePolicy.value))
+}
+
+async function onStyleCompare() {
+  const id = state.currentID
+  if (!id || isStreaming.value) return
+  window.dispatchEvent(new Event('pchat:open-inspector'))
+  try {
+    await runStyleCompare(id, inputText.value.trim())
+  } catch (err: any) {
+    message.error(err?.message || '换种说法失败')
+  }
 }
 
 function nextTurnModePolicy(policy: api.TurnModePolicy): api.TurnModePolicy {
@@ -2526,6 +2538,16 @@ watch([() => state.currentID, queueSignature], () => {
 		          <component :is="turnModeIcon" :size="13" />
 		          <span class="ctrl-btn-label">{{ turnModeLabel }}</span>
 		        </button>
+        <button
+          type="button"
+          class="scene-capsule"
+          :disabled="!state.currentID || isStreaming"
+          title="用另外两种风格重写当前这句话，采用后才写入会话"
+          @click="onStyleCompare"
+        >
+          <Palette :size="13" />
+          <span class="ctrl-btn-label">换种说法</span>
+        </button>
     </div>
   </div>
 

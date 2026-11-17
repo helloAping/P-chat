@@ -6,9 +6,9 @@
  * without turning the panel into a heavy dashboard.
  * Collapse is owned by the parent (v-if / width 0).
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
-import { state, currentMessages, refreshContextUsage, currentLastTurnUsage } from '../stores/chat'
+import { state, currentMessages, refreshContextUsage, currentLastTurnUsage, jumpToBookmarkedMessage, refreshLatestMessages } from '../stores/chat'
 import * as api from '../api/client'
 import { formatCompactTokens } from '../utils/format'
 import { copyText, downloadBlob, downloadFromUrl } from '../utils/clipboard'
@@ -20,10 +20,11 @@ import {
   galleryMedia,
   type AttachmentArtifact,
 } from '../utils/attachmentArtifacts'
+import { styleCompareState, clearStyleCompare } from '../utils/styleCompareState'
 import ToolListDrawer from './ToolListDrawer.vue'
 import StyleGenModal from './StyleGenModal.vue'
 import {
-  Copy, Globe, Folder, FolderOpen, Terminal, Wrench, Sparkles, Hash, X,
+  Copy, Globe, Folder, FolderOpen, Terminal, Wrench, Sparkles, Hash, X, Bookmark,
   GitBranch, CheckCircle2, AlertCircle, BarChart3, ImageIcon, Film, Volume2,
   FileText, File, ChevronDown, ChevronRight, Download, Clipboard,
 } from './icons'
@@ -37,6 +38,29 @@ const emit = defineEmits<{
 }>()
 
 const message = useMessage()
+const bookmarkItems = ref<api.BookmarkIndexItem[]>([])
+const bookmarkLoading = ref(false)
+
+async function loadBookmarkIndex() {
+  bookmarkLoading.value = true
+  try {
+    const resp = await api.listAllBookmarks()
+    bookmarkItems.value = resp.bookmarks || []
+  } catch {
+    bookmarkItems.value = []
+  } finally {
+    bookmarkLoading.value = false
+  }
+}
+
+async function openBookmark(item: api.BookmarkIndexItem) {
+  try {
+    await jumpToBookmarkedMessage(item.conversation_id, item.message_id, item.project_path || '')
+  } catch (err: unknown) {
+    const text = err instanceof Error ? err.message : String(err)
+    message.error(text || '无法打开书签')
+  }
+}
 const tab = ref<'session' | 'project'>('session')
 const showToolList = ref(false)
 const showStyleGen = ref(false)
@@ -55,6 +79,11 @@ const project = computed(() => {
 const projectName = computed(() => {
   if (!state.activeProjectPath) return '全局空间'
   return project.value?.name || state.activeProjectPath
+})
+
+const projectBookmarks = computed(() => {
+  const path = state.activeProjectPath || ''
+  return bookmarkItems.value.filter(item => (item.project_path || '') === path)
 })
 
 const ctx = computed(() => {
@@ -226,6 +255,26 @@ async function openTerminal() {
   }
 }
 
+async function adoptCompare(variant: api.StyleCompareVariant) {
+  const id = state.currentID
+  if (!id || !variant.text) return
+  try {
+    await api.adoptStyleCompare(id, variant.text, variant.style)
+    clearStyleCompare()
+    await refreshLatestMessages(id)
+  } catch (err: any) {
+    message.error(err?.message || '没有写入会话')
+  }
+}
+
+onMounted(() => {
+  void loadBookmarkIndex()
+  window.addEventListener('pchat:bookmarks-changed', loadBookmarkIndex)
+})
+onUnmounted(() => {
+  window.removeEventListener('pchat:bookmarks-changed', loadBookmarkIndex)
+})
+
 function refreshContext() {
   if (!state.currentID) return
   refreshContextUsage(state.currentID)
@@ -326,6 +375,25 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
           <div class="section-label">当前会话</div>
           <div class="section-title">{{ currentSession?.title || '未选择会话' }}</div>
           <div class="section-meta">ID {{ idSnippet }}</div>
+        </section>
+        <section v-if="styleCompareState.source || styleCompareState.loading || styleCompareState.error" class="section">
+          <div class="section-title-row section-title-row--spaced">
+            <div class="section-label">换种说法</div>
+            <button type="button" class="bookmark-refresh" @click="clearStyleCompare">关闭</button>
+          </div>
+          <div v-if="styleCompareState.loading" class="section-text">另外两种风格正在写…</div>
+          <div v-else-if="styleCompareState.error" class="section-text">{{ styleCompareState.error }}</div>
+          <div v-for="variant in styleCompareState.variants" :key="variant.style" class="compare-card">
+            <div class="section-title">{{ variant.label }}</div>
+            <div v-if="variant.error" class="section-text">{{ variant.error }}</div>
+            <div v-else class="section-text compare-text">{{ variant.text }}</div>
+            <button
+              v-if="variant.text"
+              type="button"
+              class="bookmark-refresh"
+              @click="adoptCompare(variant)"
+            >采用</button>
+          </div>
         </section>
         <section class="section">
           <div class="section-label">会话操作</div>
@@ -561,6 +629,26 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
               <span>打开终端</span>
             </button>
           </div>
+        </section>
+        <section class="section">
+          <div class="section-title-row section-title-row--spaced">
+            <div class="section-label">项目书签</div>
+            <button type="button" class="bookmark-refresh" :disabled="bookmarkLoading" @click="loadBookmarkIndex">刷新</button>
+          </div>
+          <div v-if="!projectBookmarks.length" class="section-text">{{ state.activeProjectPath ? '这个项目还没有书签' : '全局会话还没有书签' }}</div>
+          <button
+            v-for="item in projectBookmarks"
+            :key="`${item.conversation_id}-${item.message_id}`"
+            type="button"
+            class="bookmark-row"
+            @click="openBookmark(item)"
+          >
+            <Bookmark :size="13" />
+            <span class="bookmark-copy">
+              <span class="bookmark-where">{{ item.title || '未命名对话' }}</span>
+              <span class="bookmark-snippet">{{ item.snippet || '附件' }}</span>
+            </span>
+          </button>
         </section>
         <section class="section">
           <div class="section-label">AGENTS.md</div>
@@ -810,6 +898,50 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   color: var(--text-secondary);
   font-size: 12.5px;
   line-height: 1.45;
+}
+.bookmark-refresh {
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.bookmark-refresh:hover { color: var(--text-primary); }
+.bookmark-row {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  margin-top: var(--space-2);
+  padding: 0 0 var(--space-2);
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+.bookmark-row:last-child { border-bottom: none; padding-bottom: 0; }
+.bookmark-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bookmark-where {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.bookmark-snippet {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 .attachment-count {
   display: inline-flex;
@@ -1178,6 +1310,15 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 .dot {
   margin: 0 4px;
   color: var(--text-quaternary);
+}
+.compare-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+.compare-text {
+  white-space: pre-wrap;
 }
 @media (max-width: 1040px) {
   .inspector {

@@ -15,6 +15,75 @@ type bookmarkResponse struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+type bookmarkIndexResponse struct {
+	MessageID      int64  `json:"message_id"`
+	ConversationID string `json:"conversation_id"`
+	Title          string `json:"title"`
+	ProjectPath    string `json:"project_path"`
+	Snippet        string `json:"snippet"`
+	Seq            int64  `json:"seq,omitempty"`
+	CreatedAt      int64  `json:"created_at"`
+}
+
+type userTurnResponse struct {
+	MessageID int64  `json:"message_id"`
+	Seq       int64  `json:"seq,omitempty"`
+	Content   string `json:"content"`
+}
+
+// ListAllBookmarks returns every pinned message across conversations.
+func (h *Handler) ListAllBookmarks(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	list, err := h.store.ListAllBookmarks()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]bookmarkIndexResponse, 0, len(list))
+	for _, hit := range list {
+		out = append(out, bookmarkIndexResponse{
+			MessageID:      hit.MessageID,
+			ConversationID: hit.ConversationID,
+			Title:          hit.Title,
+			ProjectPath:    hit.ProjectPath,
+			Snippet:        hit.Snippet,
+			Seq:            hit.Seq,
+			CreatedAt:      hit.CreatedAt.Unix(),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"bookmarks": out})
+}
+
+// ListUserTurns returns every user message in the session for the guide rail.
+func (h *Handler) ListUserTurns(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	if _, err := h.store.GetConversation(id); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+	list, err := h.store.ListUserTurns(id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]userTurnResponse, 0, len(list))
+	for _, turn := range list {
+		out = append(out, userTurnResponse{
+			MessageID: turn.MessageID,
+			Seq:       turn.Seq,
+			Content:   turn.Snippet,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"turns": out})
+}
+
 func (h *Handler) ListBookmarks(c *gin.Context) {
 	if h.store == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})

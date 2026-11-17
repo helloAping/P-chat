@@ -58,36 +58,39 @@ test('turn summary lists written paths and skips dry runs', () => {
   assert.equal(resolveTurnPath('D:\\tmp\\a.go', 'D:\\develop\\project\\P-chat'), 'D:\\tmp\\a.go')
 })
 
-test('minimap keeps user, tool, and error marks and hides short chats', () => {
-  const short: Message[] = [
-    { id: 1, role: 'user', content: 'hi' },
+test('minimap ticks only user turns, longer for earlier ones', () => {
+  const none: Message[] = [
     { id: 2, role: 'assistant', content: 'ok', parts: [{ kind: 'tool', name: 'read_file', status: 'ok' }] },
   ]
-  assert.deepEqual(buildMinimapMarks(short), [])
+  assert.deepEqual(buildMinimapMarks(none), [])
+
+  const one: Message[] = [
+    { id: 1, role: 'user', content: 'hi' },
+    { id: 2, role: 'assistant', content: 'ok' },
+  ]
+  assert.equal(buildMinimapMarks(one).length, 1)
+  assert.equal(buildMinimapMarks(one)[0]?.span, 1)
 
   const messages: Message[] = []
   for (let i = 1; i <= 8; i++) {
-    if (i % 2 === 1) messages.push({ id: i, role: 'user', content: `q${i}` })
-    else if (i === 4) {
+    if (i % 2 === 1) messages.push({ id: i, role: 'user', content: `ask ${i}` })
+    else {
       messages.push({
         id: i,
         role: 'assistant',
         content: '',
-        parts: [{ kind: 'tool', name: 'exec_command', status: 'error' }],
-      })
-    } else {
-      messages.push({
-        id: i,
-        role: 'assistant',
-        content: '',
-        parts: [{ kind: 'tool', name: 'read_file', status: 'ok' }],
+        parts: [{ kind: 'tool', name: 'read_file', status: i === 4 ? 'error' : 'ok' }],
       })
     }
   }
   const marks = buildMinimapMarks(messages)
-  assert.deepEqual(marks.map(mark => mark.kind), ['user', 'tool', 'user', 'error', 'user', 'tool', 'user', 'tool'])
+  assert.deepEqual(marks.map(mark => mark.messageId), [1, 3, 5, 7])
+  assert.equal(marks[0]?.tip, 'ask 1')
+  assert.equal(marks[0]?.span, 1)
+  assert.equal(marks.at(-1)?.span, 0)
+  assert.ok((marks[0]?.span ?? 0) > (marks[1]?.span ?? 0))
   assert.equal(marks[0]?.position, 0)
-  assert.equal(marks.at(-1)?.position, 1)
+  assert.ok((marks.at(-1)?.position ?? 0) < 1)
 })
 
 test('gallery keeps previewable images and playable audio', () => {

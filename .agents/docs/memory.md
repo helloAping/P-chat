@@ -63,6 +63,8 @@ todo_items: session_id, item_id, content, status, sort_order
 chunks: id, source, content, metadata, created_at
 embeddings: chunk_id, model, vector, dim, created_at
 subagent_jobs: id, task_id, session_id, status, subagent_type, model, description, result, error, progress_json, created_at, started_at, finished_at, cancelled_at
+turn_changes: 回合文件/命令摘要，不含文件字节
+styles.memory: 风格记忆。remember 追加到已有风格，或据此新建风格
 ```
 
 **Schema 变更规则** → 详见 [versioning.md §二](versioning.md#二schema-迁移规范)。

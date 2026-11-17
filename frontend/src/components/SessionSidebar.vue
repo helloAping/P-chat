@@ -75,6 +75,21 @@ const newProjectName = ref('')
 const newProjectPath = ref('')
 const projectNameError = ref('')
 const projectPathError = ref('')
+const canSubmitNewProject = computed(() =>
+  newProjectName.value.trim().length > 0 && newProjectPath.value.trim().length > 0,
+)
+
+function onProjectPathInput(path: string) {
+  newProjectPath.value = path
+  projectPathError.value = ''
+  if (!newProjectName.value.trim()) {
+    const base = basenameFromPath(path)
+    if (base && base !== '新项目') {
+      newProjectName.value = base
+      projectNameError.value = ''
+    }
+  }
+}
 const showConfirmDeleteProject = ref(false)
 const showAbout = ref(false)
 const showRename = ref(false)
@@ -773,14 +788,7 @@ async function onAddProject() {
 async function pickDirectory() {
   try {
     const { path } = await api.pickFolder()
-    if (path) {
-      newProjectPath.value = path
-      projectPathError.value = ''
-      if (!newProjectName.value.trim()) {
-        newProjectName.value = basenameFromPath(path)
-        projectNameError.value = ''
-      }
-    }
+    if (path) onProjectPathInput(path)
   } catch (e: any) {
     message.error(e.message || '选取目录失败')
   }
@@ -1345,37 +1353,31 @@ onMounted(() => {
       size="md"
     >
       <div class="add-project-form">
-        <p class="add-project-lead">
-          选择一个本地项目根目录，后续会话会自动归入该项目空间。
-        </p>
+        <p class="add-project-lead">选择本地根目录，之后的会话会归到这个项目。</p>
         <div class="form-field">
           <label for="add-project-path">项目路径</label>
           <div class="path-row">
             <NInput
               id="add-project-path"
-              v-model:value="newProjectPath"
+              :value="newProjectPath"
               size="small"
               placeholder="例如：D:\Workspace\P-Chat"
               class="path-input"
               :status="projectPathError ? 'error' : undefined"
-              @update:value="projectPathError = ''"
+              @update:value="onProjectPathInput"
               @keyup.enter="onAddProject"
             />
-            <NButton
-              size="small"
-              secondary
+            <button
+              type="button"
               class="path-browse"
               title="选择目录"
+              aria-label="选择目录"
               @click="pickDirectory"
             >
-              <template #icon>
-                <FolderOpen :size="14" />
-              </template>
-              浏览
-            </NButton>
+              <FolderOpen :size="14" />
+            </button>
           </div>
           <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
-          <p v-else class="field-hint">选择项目的根目录（含源代码的那一层）</p>
         </div>
         <div class="form-field">
           <label for="add-project-name">项目名称</label>
@@ -1390,20 +1392,11 @@ onMounted(() => {
           />
           <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
         </div>
-        <div class="project-create-notes" aria-label="项目创建说明">
-          <div class="project-create-note">
-            <Circle :size="8" />
-            <span>仅登记本地目录，不修改项目文件</span>
-          </div>
-          <div class="project-create-note">
-            <Circle :size="8" />
-            <span>存在 AGENTS.md 时，会在项目会话中作为上下文读取</span>
-          </div>
-        </div>
+        <p class="add-project-note">只登记目录，不修改文件。目录里有 AGENTS.md 时，会作为项目上下文。</p>
       </div>
       <template #footer>
         <NButton size="small" quaternary @click="showAddProject = false">取消</NButton>
-        <NButton size="small" type="primary" @click="onAddProject">新建项目</NButton>
+        <NButton size="small" type="primary" :disabled="!canSubmitNewProject" @click="onAddProject">新建项目</NButton>
       </template>
     </AppModal>
 
@@ -2026,12 +2019,18 @@ onMounted(() => {
 .add-project-form {
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
+  gap: var(--space-4);
 }
 .add-project-lead {
   margin: 0;
   color: var(--text-secondary);
   font-size: 12.5px;
+  line-height: 1.5;
+}
+.add-project-note {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
   line-height: 1.5;
 }
 .form-field {
@@ -2053,37 +2052,41 @@ onMounted(() => {
 }
 .path-row {
   display: flex;
-  gap: var(--space-2);
-  align-items: center;
+  align-items: stretch;
   min-width: 0;
+  border: var(--control-border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  overflow: hidden;
+}
+.path-row:focus-within {
+  border: var(--control-focus-border);
+  box-shadow: var(--control-focus-ring);
 }
 .path-input { flex: 1; min-width: 0; }
+.path-row :deep(.n-input) {
+  --n-border: 1px solid transparent;
+  --n-border-hover: 1px solid transparent;
+  --n-border-focus: 1px solid transparent;
+  --n-box-shadow-focus: none;
+  --n-color: transparent;
+  --n-color-focus: transparent;
+}
 .path-browse {
-  flex-shrink: 0;
-  height: var(--control-height) !important;
-  padding: 0 var(--space-3);
-}
-.project-create-notes {
-  display: grid;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-2) 82%, transparent);
-}
-.project-create-note {
-  display: flex;
+  flex: 0 0 var(--control-height);
+  width: var(--control-height);
+  display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.45;
-}
-.project-create-note svg {
-  flex: 0 0 auto;
+  justify-content: center;
+  border: none;
+  border-left: var(--control-border);
+  background: transparent;
   color: var(--text-tertiary);
-  fill: currentColor;
+  cursor: pointer;
+}
+.path-browse:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
 }
 .field-hint {
   margin: 0;

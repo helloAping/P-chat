@@ -50,6 +50,10 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V18: stepV18toV19,
 	V19: stepV19toV20,
 	V20: stepV20toV21,
+	V21: stepV21toV22,
+	V22: stepV22toV23,
+	V23: stepV23toV24,
+	V24: stepV24toV25,
 }
 
 // stepV19toV20 creates the messages_fts FTS5 index used by SearchMessages
@@ -71,6 +75,42 @@ func stepV20toV21(db *sql.DB) error {
 	log.Print("[upgrade] V20 → V21: ensuring message_bookmarks")
 	if err := memory.EnsureMessageBookmarks(db); err != nil {
 		return fmt.Errorf("ensure message_bookmarks: %w", err)
+	}
+	return nil
+}
+
+// stepV21toV22 creates the global user memory card table.
+func stepV21toV22(db *sql.DB) error {
+	log.Print("[upgrade] V21 → V22: ensuring user_memories")
+	if err := memory.EnsureUserMemories(db); err != nil {
+		return fmt.Errorf("ensure user_memories: %w", err)
+	}
+	return nil
+}
+
+// stepV22toV23 creates the morning digest schedule table.
+func stepV22toV23(db *sql.DB) error {
+	log.Print("[upgrade] V22 → V23: ensuring morning_digests")
+	if err := memory.EnsureMorningDigests(db); err != nil {
+		return fmt.Errorf("ensure morning_digests: %w", err)
+	}
+	return nil
+}
+
+// stepV23toV24 creates the persisted turn-change summary table.
+func stepV23toV24(db *sql.DB) error {
+	log.Print("[upgrade] V23 → V24: ensuring turn_changes")
+	if err := memory.EnsureTurnChanges(db); err != nil {
+		return fmt.Errorf("ensure turn_changes: %w", err)
+	}
+	return nil
+}
+
+// stepV24toV25 drops the short-lived global memory cards and morning digest table.
+func stepV24toV25(db *sql.DB) error {
+	log.Print("[upgrade] V24 → V25: dropping retired memory cards and morning digests")
+	if err := memory.DropRetiredDelightTables(db); err != nil {
+		return fmt.Errorf("drop retired delight tables: %w", err)
 	}
 	return nil
 }

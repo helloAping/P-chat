@@ -168,9 +168,14 @@ func defaultToolPolicy(name string) ToolPolicy {
 	case name == "todo_write":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryCheckpoint, ToolSideEffectState, ToolRiskLow, ToolParallelExclusive
 		p.TimeoutMS, p.Idempotent = durationMS(CheckpointToolTimeout), true
-	case name == "question":
+	case name == "question" || name == "remember":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryInteractive, ToolSideEffectNone, ToolRiskMedium, ToolParallelExclusive
 		p.TimeoutMS = durationMS(QuestionWaitTimeout)
+		if name == "remember" {
+			p.SideEffect = ToolSideEffectState
+			p.Risk = ToolRiskConfirm
+			p.TimeoutMS = -1
+		}
 	case name == "web_search":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryExternal, ToolSideEffectNetwork, ToolRiskMedium, ToolParallelExclusive
 		p.TimeoutMS = durationMS(WebSearchTimeout)

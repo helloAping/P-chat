@@ -85,7 +85,12 @@ import {
 
 const dialog = useDialog()
 
-const props = defineProps<{ message: Message; streaming?: boolean; bookmarked?: boolean }>()
+const props = defineProps<{
+  message: Message
+  streaming?: boolean
+  bookmarked?: boolean
+  replay?: { tool: string; path?: string; preview?: string }[]
+}>()
 const emit = defineEmits<{
   rollback: []
   fork: []
@@ -1020,11 +1025,24 @@ const cacheHitRate = computed(() => {
   return Math.round((hit / total) * 1000) / 10
 })
 
+const replayItems = computed(() => props.replay || [])
 const turnSummary = computed(() => {
   if (props.message.role !== 'assistant' || props.streaming) return null
   const summary = buildTurnSummary(props.message)
-  return shouldShowTurnSummary(summary) ? summary : null
+  if (shouldShowTurnSummary(summary) || replayItems.value.length) return summary
+  return null
 })
+const replayFiles = computed(() => {
+  const seen = new Set(turnSummary.value?.files || [])
+  return replayItems.value
+    .map(item => item.path || '')
+    .filter(path => path && !seen.has(path))
+})
+const replayCommands = computed(() =>
+  replayItems.value
+    .filter(item => !item.path && item.preview)
+    .map(item => item.preview as string),
+)
 const turnFilesOpen = ref(false)
 watch(() => props.message.id, () => { turnFilesOpen.value = false })
 
@@ -1725,15 +1743,15 @@ function findPrecedingUserMessageId(): number {
           <div v-if="turnSummary || hasTokens" class="msg-meta">
             <span v-if="turnSummary" class="msg-meta-turn-block">
               <button
-                v-if="turnSummary.files.length"
+                v-if="turnSummary.files.length || replayFiles.length || replayCommands.length"
                 type="button"
                 class="msg-meta-turn msg-meta-turn--btn"
                 :aria-expanded="turnFilesOpen"
-                title="查看本轮改过的文件"
+                title="查看本轮改过的文件和命令"
                 @click="turnFilesOpen = !turnFilesOpen"
-              >{{ turnSummary.line }}</button>
+              >{{ turnSummary.line || '本回合改动' }}</button>
               <span v-else class="msg-meta-turn" :title="turnSummary.line">{{ turnSummary.line }}</span>
-              <ul v-if="turnFilesOpen && turnSummary.files.length" class="msg-turn-files">
+              <ul v-if="turnFilesOpen && (turnSummary.files.length || replayFiles.length || replayCommands.length)" class="msg-turn-files">
                 <li v-for="file in turnSummary.files" :key="file">
                   <button
                     type="button"
@@ -1742,6 +1760,16 @@ function findPrecedingUserMessageId(): number {
                     @click="openTurnFile(file)"
                   >{{ turnFileLabel(file) }}</button>
                 </li>
+                <li v-for="file in replayFiles" :key="`replay-${file}`">
+                  <button
+                    type="button"
+                    class="msg-turn-file"
+                    :title="file"
+                    @click="openTurnFile(file)"
+                  >{{ turnFileLabel(file) }}</button>
+                </li>
+                <li v-for="command in replayCommands" :key="command" class="msg-turn-file">{{ command }}</li>
+                <li class="msg-turn-note">字节撤销只覆盖最近一轮仍留在内存里的文件快照。</li>
               </ul>
             </span>
             <span v-if="turnSummary && hasTokens" class="msg-meta-sep">·</span>
@@ -2090,21 +2118,26 @@ function findPrecedingUserMessageId(): number {
 }
 .msg.user .bubble--attachments .attachments {
   display: grid;
-  grid-template-columns: minmax(0, min(calc(var(--space-8) * 10), 100%));
+  grid-template-columns: minmax(0, 1fr);
   align-items: start;
   justify-content: end;
-  gap: var(--space-2);
-  margin-bottom: 0;
-  width: 100%;
+  justify-items: end;
+  gap: var(--space-1);
+  margin: 0 0 0 auto;
+  width: min(340px, 100%);
 }
-.msg.user .bubble--attachments .attachments--multi {
-  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
+.msg.user .bubble--attachments .attachments--multi:has(.media-thumbnail) {
+  width: min(420px, 100%);
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
+  justify-items: stretch;
 }
 .msg.user .bubble--attachments .attachments > :only-child {
   grid-column: 1 / -1;
 }
 .msg.user .bubble--attachments .user-message-caption {
   align-self: flex-end;
+  width: fit-content;
+  max-width: min(340px, 100%);
   padding: var(--space-2) var(--space-3);
   background: var(--user-bubble-bg, color-mix(in srgb, var(--brand-500) 10%, var(--surface-1)));
   color: var(--text-primary);
@@ -2587,11 +2620,11 @@ function findPrecedingUserMessageId(): number {
 .attachment-audio-card,
 .attachment-file-card {
   box-sizing: border-box;
-  width: min(calc(var(--space-8) * 12), 100%);
+  width: 100%;
   background: var(--surface-1);
-  border: 1px solid var(--border-default);
+  border: none;
   border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   color: var(--text-primary);
 }
 .attachment-audio-card {
@@ -2606,15 +2639,15 @@ function findPrecedingUserMessageId(): number {
   align-items: center;
   gap: var(--space-2);
 }
-.attachment-file-card { padding: var(--space-2); }
+.attachment-file-card { padding: 6px 8px; }
 .attachment-card-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: var(--space-8);
-  height: var(--space-8);
+  width: 28px;
+  height: 28px;
   background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   flex-shrink: 0;
@@ -2911,6 +2944,10 @@ function findPrecedingUserMessageId(): number {
   cursor: pointer;
 }
 .msg-turn-file:hover { color: var(--text-primary); }
+.msg-turn-note {
+  color: var(--text-quaternary);
+  font-size: 11px;
+}
 .msg-meta-sep { color: var(--text-quaternary); }
 .msg-meta-tokens { display: inline-flex; align-items: center; gap: 1px; }
 .msg-meta-cache { color: var(--accent); }

@@ -30,7 +30,7 @@ import {
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash, Folder,
   Cpu, Activity, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
-  Check,
+  Check, Bookmark,
 } from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
@@ -38,6 +38,7 @@ import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
 import WebFetchSettings from './WebFetchSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
+import BookmarkSettings from './BookmarkSettings.vue'
 import KnowledgeRecallPreview from './KnowledgeRecallPreview.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
 import AppModal from './AppModal.vue'
@@ -184,7 +185,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'diagnostics'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'bookmarks' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'diagnostics'>('providers')
 
 // Modal visibility (v-model). The default is `true` so that
 // when App.vue mounts this component (it only mounts when
@@ -206,6 +207,7 @@ const settingsTabs = [
   { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索', group: '能力' },
   { name: 'websearch', label: '网络搜索',      icon: Globe,    description: '搜索与网页抓取渠道', group: '能力' },
   { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制', group: '能力' },
+  { name: 'bookmarks', label: '书签',          icon: Bookmark, description: '按项目、对话和内容查看全部书签。', group: '数据' },
   { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话', group: '数据' },
   { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照', group: '数据' },
 ]
@@ -1791,6 +1793,7 @@ async function confirmPermDelete() {
   try {
     await api.permanentDeleteSession(id)
     archivedSessions.value = archivedSessions.value.filter(s => s.id !== id)
+    window.dispatchEvent(new Event('pchat:bookmarks-changed'))
     showConfirmPermDelete.value = false
     pendingPermDeleteId.value = ''
     message.info('已永久删除')
@@ -3622,6 +3625,10 @@ function kbModelSupportsVision(scanModel: string) {
             <NButton size="small" type="primary" :disabled="!sysDirty" :loading="sysSaving" @click="saveSystemConfig">保存</NButton>
           </div>
         </div>
+    </div>
+
+    <div v-else-if="tab === 'bookmarks'" class="settings-pane settings-pane--scroll">
+      <BookmarkSettings />
     </div>
 
     <div v-else-if="tab === 'archive'" class="settings-pane settings-pane--scroll">

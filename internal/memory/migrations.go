@@ -525,6 +525,68 @@ CREATE TABLE IF NOT EXISTS message_bookmarks (
 );`,
 		Down: `DROP TABLE IF EXISTS message_bookmarks;`,
 	},
+	{
+		// Migration 16: global user memory cards, separate from style memory.
+		Version: 16,
+		Name:    "user_memories",
+		Up: `
+CREATE TABLE IF NOT EXISTS user_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);`,
+		Down: `DROP TABLE IF EXISTS user_memories;`,
+	},
+	{
+		// Migration 17: per-project morning digest schedule.
+		Version: 17,
+		Name:    "morning_digests",
+		Up: `
+CREATE TABLE IF NOT EXISTS morning_digests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_path TEXT NOT NULL UNIQUE,
+    weekdays TEXT NOT NULL DEFAULT '1,2,3,4,5',
+    time_of_day TEXT NOT NULL DEFAULT '09:00',
+    style TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    last_fired TEXT NOT NULL DEFAULT '',
+    last_missed TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);`,
+		Down: `DROP TABLE IF EXISTS morning_digests;`,
+	},
+	{
+		// Migration 18: persisted turn-change summaries. Byte snapshots stay in memory.
+		Version: 18,
+		Name:    "turn_changes",
+		Up: `
+CREATE TABLE IF NOT EXISTS turn_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    tool TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    preview TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_changes_conv ON turn_changes(conversation_id, message_id);`,
+		Down: `
+DROP INDEX IF EXISTS idx_turn_changes_conv;
+DROP TABLE IF EXISTS turn_changes;`,
+	},
+	{
+		// Migration 19: global memory cards and morning digests were retired.
+		// Facts belong on a speaking style. Drop both tables if a dev build created them.
+		Version: 19,
+		Name:    "drop_retired_delight_tables",
+		Up: `
+DROP TABLE IF EXISTS user_memories;
+DROP TABLE IF EXISTS morning_digests;`,
+		Down: `SELECT 1;`,
+	},
 }
 
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (

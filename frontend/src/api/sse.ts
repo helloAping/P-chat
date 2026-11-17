@@ -30,6 +30,11 @@ export interface SSEConsumerOptions<T extends StreamEventLike> {
   // fires, and an "idle" error is thrown (not retried — the caller
   // recovers missing parts from the server instead). 0 disables.
   idleTimeoutMs?: number
+  // paintEvery bounds how many frames are applied before yielding so
+  // a buffered burst can reach the screen. 0 uses the default.
+  paintEvery?: number
+  // paintYield is the macrotask used between batches. Tests replace it.
+  paintYield?: () => Promise<void>
 }
 
 // nextStreamIdleTimeoutMs stretches the GUI idle watchdog while a
@@ -319,6 +324,11 @@ export async function consumeSSEStream<T extends StreamEventLike>(
       buffer += decoder.decode(result.value, { stream: true })
     }
 
+    const paintEvery = options.paintEvery && options.paintEvery > 0 ? options.paintEvery : 8
+    const paintYield = options.paintYield || (() => new Promise<void>(resolve => {
+      setTimeout(resolve, 0)
+    }))
+    let sincePaint = 0
     let frameEnd: number
     while ((frameEnd = buffer.indexOf('\n\n')) >= 0) {
       const block = buffer.slice(0, frameEnd)
@@ -348,6 +358,12 @@ export async function consumeSSEStream<T extends StreamEventLike>(
         sawDone = true
         done = true
         break
+      }
+      sincePaint++
+      if (sincePaint >= paintEvery) {
+        sincePaint = 0
+        await paintYield()
+        if (options.signal?.aborted) return
       }
     }
   }

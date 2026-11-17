@@ -102,7 +102,20 @@ const (
 	// V21 — message bookmarks table.
 	V21 AppVersion = 21
 
+	// V22 — global user memory cards, separate from style memory.
+	V22 AppVersion = 22
+
+	// V23 — per-project morning digest schedule.
+	V23 AppVersion = 23
+
+	// V24 — persisted turn-change summaries.
+	V24 AppVersion = 24
+
+	// V25 — drop retired global memory cards and morning digest schedules.
+	// Remembered facts live on speaking styles instead.
+	V25 AppVersion = 25
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V21
+	Current AppVersion = V25
 )

@@ -33,6 +33,7 @@
 | 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作速查 / 常见问题」 | [完整图文指南](../../docs/p-chat-article-2026-09.md), agent.md, tool.md, frontend.md |
 | 梳理项目目录、模块职责、运行流 | [../../docs/project-structure.md](../../docs/project-structure.md) | 本索引 + 对应模块文档 |
 | 查看当前项目现状与可做事项 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) | — |
+| 风格记忆 / 风格对照 / 回合改动摘要 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) §1.8 | memory.md, tool.md, frontend.md |
 | **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
 | **P3-3 端到端 trace id** | [trace 包](../../internal/trace/trace.go) | [server.md](server.md) §8, [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
 | **P3-2 工具 hot-reload** | [tool.md](tool.md) §8 | [P3-2 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |

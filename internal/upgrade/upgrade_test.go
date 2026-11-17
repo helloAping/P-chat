@@ -88,6 +88,43 @@ func TestRun_V20ToV21CreatesBookmarks(t *testing.T) {
 	}
 }
 
+func TestRun_V21ToV24CreatesDelightTables(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V21); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V21: %v", err)
+	}
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want current", got)
+	}
+	var turnChanges string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='turn_changes'`).Scan(&turnChanges); err != nil {
+		t.Fatalf("turn_changes missing: %v", err)
+	}
+	for _, name := range []string{"user_memories", "morning_digests"} {
+		var got string
+		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&got)
+		if err == nil {
+			t.Fatalf("%s should have been dropped, still present", name)
+		}
+	}
+	if err := stepV23toV24(db); err != nil {
+		t.Fatalf("repeat V24 step: %v", err)
+	}
+}
+
 func TestRun_V18ToV19MergesWindowsSandboxBaselines(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("USERPROFILE", dir)

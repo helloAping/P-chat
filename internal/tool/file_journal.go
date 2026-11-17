@@ -6,10 +6,11 @@ import (
 	"os"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const (
-	maxJournalTurns       = 5
+	maxJournalTurns         = 5
 	maxJournalSnapshotBytes = 10 << 20 // match writeFile cap
 )
 
@@ -30,6 +31,15 @@ type fileTurnBatch struct {
 	StartedAt time.Time
 	byPath    map[string]int
 	entries   []FileChangeEntry
+	previews  []TurnPreview
+}
+
+// TurnPreview is a durable summary of one file or command touch.
+// It does not include file bytes.
+type TurnPreview struct {
+	Tool    string
+	Path    string
+	Preview string
 }
 
 // FileChangeEntry is one path's first snapshot in a turn.
@@ -122,6 +132,63 @@ func (j *FileJournal) RecordBeforeMutation(sessionID, toolName, path string) {
 	}
 	turn.byPath[path] = len(turn.entries)
 	turn.entries = append(turn.entries, entry)
+	turn.previews = append(turn.previews, TurnPreview{Tool: toolName, Path: path, Preview: path})
+}
+
+// RecordCommandPreview appends a command summary to the current turn.
+// It does not create an undo snapshot.
+func (j *FileJournal) RecordCommandPreview(sessionID, command string) {
+	if j == nil || sessionID == "" || command == "" {
+		return
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	sj := j.sessions[sessionID]
+	if sj == nil || len(sj.turns) == 0 {
+		return
+	}
+	turn := sj.turns[len(sj.turns)-1]
+	turn.previews = append(turn.previews, TurnPreview{
+		Tool:    "exec_command",
+		Preview: clipPreview(command, 160),
+	})
+}
+
+// CurrentTurnPreviews copies summaries from the turn opened by the latest BeginTurn.
+func (j *FileJournal) CurrentTurnPreviews(sessionID string) []TurnPreview {
+	if j == nil || sessionID == "" {
+		return nil
+	}
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	sj := j.sessions[sessionID]
+	if sj == nil || len(sj.turns) == 0 {
+		return nil
+	}
+	turn := sj.turns[len(sj.turns)-1]
+	if len(turn.previews) == 0 {
+		return nil
+	}
+	out := make([]TurnPreview, len(turn.previews))
+	copy(out, turn.previews)
+	return out
+}
+
+func clipPreview(text string, maxRunes int) string {
+	if utf8.RuneCountInString(text) <= maxRunes {
+		return text
+	}
+	runes := []rune(text)
+	return string(runes[:maxRunes]) + "…"
+}
+
+// RecordCommandPreviewFromCtx records a command on the journal attached to ctx.
+func RecordCommandPreviewFromCtx(ctx context.Context, command string) {
+	j := journalFromCtx(ctx)
+	if j == nil {
+		return
+	}
+	j.RecordCommandPreview(SessionIDFromCtx(ctx), command)
 }
 
 // PeekLastTurn returns a copy of the latest non-empty turn's entries

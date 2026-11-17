@@ -18,9 +18,13 @@ import {
   getDiagnosticsConfig,
   updateDiagnosticsConfig,
   downloadDiagnosticsSnapshot,
+  previewStorageGC,
+  runStorageGC,
   type MemorySnapshot,
   type DiagnosticsConfig,
+  type StorageGCReport,
 } from '../api/client'
+import { loadSessions } from '../stores/chat'
 
 const message = useMessage()
 
@@ -30,6 +34,10 @@ const loadingMem = ref(false)
 const loadingCfg = ref(false)
 const saving = ref(false)
 const downloading = ref<'heap' | 'goroutine' | null>(null)
+const gcReport = ref<StorageGCReport | null>(null)
+const gcLoading = ref(false)
+const gcRunning = ref(false)
+const gcSelected = ref<string[]>([])
 
 // Editable draft. `loaded` mirrors the last server snapshot so we can
 // compute dirty state (mirrors WebSearchSettings' form/settings split).
@@ -133,10 +141,53 @@ async function onDownload(kind: 'heap' | 'goroutine') {
   }
 }
 
+function formatBytes(n: number): string {
+  if (!n) return '0 B'
+  if (n < 1024) return `${n} B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
+  return `${(n / 1024 / 1024).toFixed(1)} MB`
+}
+
+async function refreshGC() {
+  gcLoading.value = true
+  try {
+    gcReport.value = await previewStorageGC()
+    const reclaim = (gcReport.value.items || [])
+      .filter(item => item.id !== 'vacuum' && (item.count > 0 || item.bytes > 0))
+      .map(item => item.id)
+    gcSelected.value = reclaim.length ? [...reclaim, 'vacuum'] : []
+  } catch (e) {
+    message.error(`扫描存储失败: ${(e as Error).message}`)
+  } finally {
+    gcLoading.value = false
+  }
+}
+
+async function runGC() {
+  if (gcSelected.value.length === 0) return
+  gcRunning.value = true
+  try {
+    const report = await runStorageGC(gcSelected.value)
+    gcReport.value = report
+    const saved = formatBytes(report.total_bytes)
+    if (report.vacuum_error) {
+      message.warning(`已回收 ${saved}，压缩文件失败：${report.vacuum_error}`)
+    } else {
+      message.success(report.vacuumed ? `已回收 ${saved}，并压缩了数据库文件` : `已回收 ${saved}`)
+    }
+    await loadSessions()
+    await refreshGC()
+  } catch (e) {
+    message.error(`回收失败: ${(e as Error).message}`)
+  } finally {
+    gcRunning.value = false
+  }
+}
 let timer: number | undefined
 onMounted(() => {
   refreshMem()
   refreshConfig()
+  void refreshGC()
   timer = window.setInterval(() => {
     // Skip polling while the document is hidden (e.g. a background
     // conversation) — a monitor panel doesn't need live data then, and
@@ -152,6 +203,48 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="diagnostics-body">
+    <div class="settings-card">
+      <div class="card-head">
+        <span class="card-title">存储清理</span>
+        <NButton size="tiny" quaternary :loading="gcLoading" @click="refreshGC">
+          重新扫描
+        </NButton>
+      </div>
+      <p class="form-hint gc-lead">
+        回收的是库里的重复大字段，不是把聊天记录整段删掉。用户原文和助手最终回复会留下；每个对话最近 40 条的工具输出和思考过程也会留下。
+      </p>
+      <label v-for="item in gcReport?.items || []" :key="item.id" class="gc-row">
+        <input
+          v-model="gcSelected"
+          type="checkbox"
+          :value="item.id"
+          :disabled="gcRunning || (item.id !== 'vacuum' && item.count === 0 && item.bytes === 0)"
+        />
+        <span class="gc-copy">
+          <span class="gc-label">{{ item.label }}</span>
+          <span class="gc-detail">{{ item.detail }}</span>
+        </span>
+        <span class="gc-stat">
+          <template v-if="item.id === 'vacuum'">压缩文件</template>
+          <template v-else>{{ item.count }} 项 · {{ formatBytes(item.bytes) }}</template>
+        </span>
+      </label>
+      <div class="save-row">
+        <NButton
+          size="small"
+          type="primary"
+          :loading="gcRunning"
+          :disabled="gcLoading || gcSelected.length === 0"
+          @click="runGC"
+        >
+          开始回收
+        </NButton>
+        <span class="form-hint">
+          预计可回收 {{ formatBytes(gcReport?.total_bytes || 0) }}。回收后重新打开对话即可看到结果。
+        </span>
+      </div>
+    </div>
+
     <!-- Live memory status -->
     <div class="settings-card">
       <div class="card-head">
@@ -273,6 +366,49 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
+}
+
+.gc-lead {
+  margin: 0 0 var(--space-3);
+}
+
+.gc-row {
+  display: grid;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
+  gap: var(--space-3);
+  align-items: start;
+  padding: var(--space-2) 0;
+  border-top: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+}
+
+.gc-row input {
+  margin-top: 3px;
+}
+
+.gc-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.gc-label {
+  font-size: 12.5px;
+  font-weight: 600;
+}
+
+.gc-detail {
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+
+.gc-stat {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .settings-card {

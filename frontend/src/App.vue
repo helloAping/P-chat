@@ -687,7 +687,12 @@ function openAbout() {
   sidebarRef.value?.openAbout?.()
 }
 
+function onOpenInspector() {
+  inspectorOpen.value = true
+}
+
 onMounted(async () => {
+  window.addEventListener('pchat:open-inspector', onOpenInspector)
   // Theme bootstrap: localStorage > OS preference > dark.
   let initial: 'dark' | 'light' | null = null
   try {
@@ -747,6 +752,7 @@ onMounted(async () => {
 })
 
 onUnmounted(() => {
+  window.removeEventListener('pchat:open-inspector', onOpenInspector)
   removeSidebarResizeListeners()
   removeInspectorResizeListeners()
   if (typeof window !== 'undefined') {

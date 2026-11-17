@@ -40,6 +40,10 @@ type ConfirmResponse struct {
 	ConfirmID string `json:"confirm_id,omitempty"`
 	Approved  bool   `json:"approved"`
 	Action    string `json:"action,omitempty"`
+	// StyleID and NewStyleLabel are set when the user confirms remember.
+	// Exactly one is used: an existing persona, or the name of a new one.
+	StyleID       string `json:"style_id,omitempty"`
+	NewStyleLabel string `json:"new_style_label,omitempty"`
 }
 
 // ConfirmSubmission describes the pending confirmation that accepted a
@@ -496,4 +500,25 @@ func RequireExplicitConfirm(ctx context.Context, req ConfirmRequest) (bool, erro
 		return false, err
 	}
 	return resp.Approved, nil
+}
+
+// WaitExplicitConfirm is RequireExplicitConfirm with the full response,
+// so callers can read a style choice the user attached to the approval.
+func WaitExplicitConfirm(ctx context.Context, req ConfirmRequest) (ConfirmResponse, error) {
+	if ctx == nil {
+		return ConfirmResponse{}, fmt.Errorf("explicit confirm unavailable (nil context)")
+	}
+	if ParentAuthorityOnlyFromCtx(ctx) {
+		return ConfirmResponse{}, fmt.Errorf("explicit confirm requires parent conversation approval")
+	}
+	sid, _ := ctx.Value(SessionIDKey{}).(string)
+	emit := confirmEmitterFromCtx(ctx)
+	if emit == nil || sid == "" {
+		return ConfirmResponse{}, fmt.Errorf("explicit confirm unavailable (session or emitter missing)")
+	}
+	if err := PrepareConfirmRequest(&req); err != nil {
+		return ConfirmResponse{}, err
+	}
+	emit(req)
+	return waitForConfirmResponse(ctx, sid, req, true)
 }

@@ -965,6 +965,8 @@ func RegisterBuiltin(r *Registry) {
 			},
 		}, []string{"questions"}),
 	}, handleQuestion)
+
+	RegisterRemember(r)
 }
 
 type execArgs struct {
@@ -1047,6 +1049,7 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		return &CallResult{Content: preview, Summary: "Dry run: would execute " + a.Command, NextAction: "review"}, nil
 	}
 
+	RecordCommandPreviewFromCtx(ctx, a.Command)
 	if a.Background || looksPersistentCommand(a.Command) {
 		return startManagedProcess(ctx, a.Command, a.WorkDir)
 	}

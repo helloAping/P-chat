@@ -17,6 +17,7 @@ import {
   pendingTodoCount,
 } from '../utils/streamInterrupt'
 import { basenameFromPath, sameProjectPath } from '../utils/projectPath'
+import { findOpenToolCard, settleOpenToolCards } from '../utils/toolCards'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -234,7 +235,7 @@ export const state = reactive({
     resolvedPath?: string
     pathClass?: string
     riskLevel?: string
-    resolve: (action: api.ConfirmAction) => void
+    resolve: (decision: api.ConfirmDecision) => void
   }>>,
   pendingPlanText: {} as Record<string, string>,
   turnPlanReview: {} as Record<string, boolean>,
@@ -1247,14 +1248,31 @@ export function completeSearchJump(requestID: number, error?: string) {
   else pending.resolve()
 }
 
-// jumpToSearchResult 切换会话并按真实分页游标加载，直到命中行映射到可见气泡。
-// jumpToSearchResult switches sessions and follows real pagination cursors
-// until the matched database row maps to a visible bubble. There is no fixed
-// page cap; stale/deleted hits and stalled cursors fail explicitly.
+let historyJumpDepth = 0
+
+// historyJumpInProgress is true while a bookmark or guide click is
+// loading older pages. Chat scroll followers must not snap to the
+// bottom during that walk.
+export function historyJumpInProgress(): boolean {
+  return historyJumpDepth > 0
+}
+
+// jumpToBookmarkedMessage opens the pin's project and session, then scrolls
+// to that message even when it lives on an older history page.
+export async function jumpToBookmarkedMessage(sessionID: string, messageID: number, projectPath: string): Promise<void> {
+  const target = projectPath || ''
+  if (target !== (state.activeProjectPath || '')) {
+    await setActiveProject(target)
+  }
+  await jumpToSearchResult(sessionID, messageID)
+}
+
 export async function jumpToSearchResult(sessionID: string, messageID: number): Promise<void> {
   if (!sessionID || !messageID || messageID <= 0) {
     throw new Error('搜索结果缺少有效的消息定位信息')
   }
+  historyJumpDepth++
+  try {
   await switchSession(sessionID)
   if (state.currentID !== sessionID) {
     throw new Error('定位期间会话已切换，请重试')
@@ -1303,6 +1321,10 @@ export async function jumpToSearchResult(sessionID: string, messageID: number): 
   })
   state.searchJumpTarget = { sessionID, messageID: anchorID, requestID }
   await completion
+  await nextTick()
+  } finally {
+    historyJumpDepth--
+  }
 }
 
 // refreshLatestMessages merges the newest server-side rows into an already
@@ -1501,7 +1523,7 @@ export async function deleteSessionById(id: string) {
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
-    for (const pc of cfms) pc.resolve('reject')
+    for (const pc of cfms) pc.resolve({ action: 'reject' })
     delete state.pendingConfirm[id]
   }
   if (state.streaming[id]) {
@@ -2707,76 +2729,48 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         break
       }
       if (ev.tool_status === 'start') {
-        // When tool_id is present, use it as the unique key
-        // and never reuse the last part (two calls to the
-        // same tool name are distinct). For legacy streams
-        // without tool_id, fall back to name-based reuse.
-        if (ev.tool_id) {
-          if (parts.length > 0) {
-            const last = parts[parts.length - 1]
-            if (last.kind === 'tool' && last.status === 'start' && last.tool_id === ev.tool_id) {
-              last.args = ev.tool_args
-            } else {
-              parts.push({
-                kind: 'tool',
-                id: ev.tool_name,
-                tool_id: ev.tool_id,
-                name: ev.tool_name,
-                args: ev.tool_args,
-                status: 'start',
-              })
-            }
-          } else {
-            parts.push({
-              kind: 'tool',
-              id: ev.tool_name,
-              tool_id: ev.tool_id,
-              name: ev.tool_name,
-              args: ev.tool_args,
-              status: 'start',
-            })
-          }
+        // The preview card is created as soon as the model starts a
+        // call. Later tools in the same batch sit after it, so the
+        // final start must find that card by id instead of only
+        // looking at the last part. A miss used to insert a second
+        // "执行中" card that never received the result.
+        const open = findOpenToolCard(parts, ev.tool_id, ev.tool_name)
+        if (open) {
+          if (ev.tool_args) open.args = ev.tool_args
         } else {
-          const last = parts[parts.length - 1]
-          if (last && last.kind === 'tool' && last.status === 'start' && last.name === ev.tool_name) {
-            last.args = ev.tool_args
-          } else {
-            parts.push({
-              kind: 'tool',
-              id: ev.tool_name,
-              name: ev.tool_name,
-              args: ev.tool_args,
-              status: 'start',
-            })
-          }
+          parts.push({
+            kind: 'tool',
+            id: ev.tool_name,
+            tool_id: ev.tool_id,
+            name: ev.tool_name,
+            args: ev.tool_args,
+            status: 'start',
+          })
         }
       } else {
         // 'ok' / 'warn' / 'error' — exact match by tool_id,
         // fall back to name for legacy streams.
-        let found = false
-        for (let i = parts.length - 1; i >= 0; i--) {
-          const p = parts[i]
-          if (p.kind !== 'tool') continue
-          if ((ev.tool_id && p.tool_id === ev.tool_id) ||
-              (!ev.tool_id && p.name === ev.tool_name)) {
-            p.status = (ev.tool_status as any) || 'ok'
-            // New screenshots are compact asset JSON; legacy screenshot data
-            // URLs are converted before entering the reactive map.
-            p.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
-            p.error = ev.tool_error
-            p.elapsed = ev.tool_elapsed
-              if (ev.tool_args) p.args = ev.tool_args
-              if (ev.tool_context_refs) p.context_refs = ev.tool_context_refs
-              // Server-side truncation marker: the full body (>32
-            // KiB) must be fetched on demand, never stored here.
-            if (ev.tool_result_truncated) {
-              ;(p as any).result_truncated = true
-              ;(p as any).result_full_len = ev.tool_result_full_len
-            }
-            found = true
-            break
+        const found = settleOpenToolCards(parts, {
+          tool_id: ev.tool_id,
+          tool_name: ev.tool_name,
+          tool_args: ev.tool_args,
+          tool_status: ev.tool_status,
+          tool_elapsed: ev.tool_elapsed,
+          tool_result_truncated: ev.tool_result_truncated,
+          tool_result_full_len: ev.tool_result_full_len,
+          tool_context_refs: ev.tool_context_refs,
+        }, (card) => {
+          card.status = (ev.tool_status as ToolPart['status']) || 'ok'
+          card.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
+          card.error = ev.tool_error
+          card.elapsed = ev.tool_elapsed
+          if (ev.tool_args) card.args = ev.tool_args
+          if (ev.tool_context_refs) card.context_refs = ev.tool_context_refs
+          if (ev.tool_result_truncated) {
+            card.result_truncated = true
+            card.result_full_len = ev.tool_result_full_len
           }
-        }
+        })
         if (!found) {
           parts.push({
             kind: 'tool',
@@ -3146,7 +3140,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             path_class?: string
             risk_level?: string
           }
-          new Promise<api.ConfirmAction>((resolve) => {
+          new Promise<api.ConfirmDecision>((resolve) => {
             if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
             state.pendingConfirm[id].push({
               confirmID: cfm.confirm_id,
@@ -3158,8 +3152,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
               riskLevel: cfm.risk_level,
               resolve,
             })
-          }).then((action) => {
-            submitConfirmResponseInner(id, cfm.confirm_id, action)
+          }).then((decision) => {
+            submitConfirmResponseInner(id, cfm.confirm_id, decision)
           })
           notifyManager.play('confirm')
           notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
@@ -3754,9 +3748,12 @@ export function submitQuestionAnswer(answers: Record<string, string>) {
   }
 }
 
-async function submitConfirmResponseInner(id: string, confirmID: string | undefined, action: api.ConfirmAction) {
+async function submitConfirmResponseInner(id: string, confirmID: string | undefined, decision: api.ConfirmDecision) {
   try {
-    const result = await api.submitConfirmResponse(id, action !== 'reject', action, confirmID)
+    const result = await api.submitConfirmResponse(id, decision.action !== 'reject', decision.action, confirmID, {
+      styleId: decision.styleId,
+      newStyleLabel: decision.newStyleLabel,
+    })
     if (result.action === 'always' && !result.explicit) {
       state.sessionMeta[id] = {
         ...state.sessionMeta[id],
@@ -3770,12 +3767,16 @@ async function submitConfirmResponseInner(id: string, confirmID: string | undefi
   }
 }
 
-export function submitToolConfirm(action: api.ConfirmAction) {
+export function submitToolConfirm(action: api.ConfirmAction, style?: { styleId?: string; newStyleLabel?: string }) {
   const items = state.pendingConfirm[state.currentID]
   if (items && items.length > 0) {
     const pc = items.shift()!
     if (items.length === 0) delete state.pendingConfirm[state.currentID]
-    pc.resolve(action)
+    pc.resolve({
+      action,
+      styleId: style?.styleId,
+      newStyleLabel: style?.newStyleLabel,
+    })
   }
 }
 

@@ -222,6 +222,29 @@ test('nextStreamIdleTimeoutMs stretches while a tool or sub-agent is running', (
   assert.equal(afterToolOk, STREAM_IDLE_AFTER_LLM_MS)
 })
 
+test('consumeSSEStream lets a buffered burst paint before the rest arrives', async () => {
+  const frames = Array.from({ length: 5 }, (_, i) =>
+    `data: ${JSON.stringify({ type: 'content', content: String(i) })}\nid: ${i + 1}\n\n`,
+  ).join('')
+  const seen: number[] = []
+  const yieldsAt: number[] = []
+
+  await consumeSSEStream({
+    reader: readerFromChunks([frames]),
+    label: 'test',
+    paintEvery: 2,
+    paintYield: async () => {
+      yieldsAt.push(seen.length)
+    },
+    onEvent: (event) => {
+      if (typeof event.seq === 'number') seen.push(event.seq)
+    },
+  })
+
+  assert.deepEqual(seen, [1, 2, 3, 4, 5])
+  assert.deepEqual(yieldsAt, [2, 4])
+})
+
 test('consumeSSEStream drops buffered events after cancellation', async () => {
   const controller = new AbortController()
   const events: StreamEventLike[] = []

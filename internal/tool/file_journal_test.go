@@ -94,3 +94,23 @@ func TestFileJournalKeepsFirstSnapshotOnly(t *testing.T) {
 		t.Fatalf("want original one, got %q", got)
 	}
 }
+
+func TestCurrentTurnPreviewsKeepCommandsOutOfUndo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "a.txt")
+	if err := os.WriteFile(path, []byte("one"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	j := NewFileJournal()
+	j.BeginTurn("s")
+	j.RecordBeforeMutation("s", "edit_file", path)
+	j.RecordCommandPreview("s", "go test ./...")
+	previews := j.CurrentTurnPreviews("s")
+	if len(previews) != 2 || previews[1].Tool != "exec_command" || previews[1].Path != "" {
+		t.Fatalf("previews = %#v", previews)
+	}
+	summary, err := j.UndoLastTurn("s")
+	if err != nil || summary.Count != 1 {
+		t.Fatalf("undo count = %d %v", summary.Count, err)
+	}
+}

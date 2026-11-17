@@ -154,7 +154,7 @@ test('new project modal matches project-aware workflow without fake controls', (
   assert.match(source, /size="md"/)
   assert.match(source, /label for="add-project-path"[\s\S]*项目路径/)
   assert.match(source, /label for="add-project-name"[\s\S]*项目名称/)
-  assert.match(source, /仅登记本地目录，不修改项目文件/)
+  assert.match(source, /只登记目录，不修改文件/)
   assert.match(source, /新建项目<\/NButton>/)
   assert.doesNotMatch(source, /加载 AGENTS\.md[\s\S]*NCheckbox/)
   assert.doesNotMatch(source, /初始化工作区[\s\S]*NCheckbox/)
