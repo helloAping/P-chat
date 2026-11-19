@@ -3183,6 +3183,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.trace_id) {
         m.traceId = ev.trace_id
       }
+      if (ev.elapsed) m.elapsed = ev.elapsed
       // 提示音：对话出错
       expirePendingQuestion(id)
       notifyManager.play('error')
@@ -3862,13 +3863,14 @@ export const currentRollbackBanner = computed(() => {
 export const currentFileChangeBanner = computed(() => {
   const summary = state.fileChangeUndo[state.currentID]
   if (!summary || !summary.count) return null
-  const names = (summary.entries || [])
-    .slice(0, 3)
-    .map((e) => basenameFromPath(e.path) || e.path)
   return {
     count: summary.count,
-    preview: names.join('、'),
-    more: summary.count > names.length,
+    entries: (summary.entries || []).map((entry) => ({
+      path: entry.path,
+      name: basenameFromPath(entry.path) || entry.path,
+      added: entry.added || 0,
+      deleted: entry.deleted || 0,
+    })),
   }
 })
 

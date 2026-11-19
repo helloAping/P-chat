@@ -782,10 +782,14 @@ type MessageResponse struct {
 	// can do so without a separate schema.
 	IsArchived bool `json:"is_archived"`
 	// AE-03: turn token + cache usage restored from message metadata.
-	TokensIn        int  `json:"tokens_in,omitempty"`
-	TokensOut       int  `json:"tokens_out,omitempty"`
-	CacheHitTokens  *int `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens *int `json:"cache_miss_tokens,omitempty"`
+	TokensIn        int    `json:"tokens_in,omitempty"`
+	TokensOut       int    `json:"tokens_out,omitempty"`
+	CacheHitTokens  *int   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens *int   `json:"cache_miss_tokens,omitempty"`
+	// Elapsed is the turn duration ("3.6s"), restored so every
+	// reloaded assistant bubble shows the same footer time as the
+	// live done event.
+	Elapsed string `json:"elapsed,omitempty"`
 }
 
 // MessagePart is one block of a structured assistant message.

@@ -3,7 +3,7 @@ import { ref, nextTick, watch, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useMessage } from 'naive-ui'
 import {
   ArrowDown, ArrowUp, MessageSquare, Loader2,
-  Code2, FlaskConical, ImageIcon, Lightbulb, RotateCcw,
+  Code2, FlaskConical, ImageIcon, Lightbulb, RotateCcw, File, Undo2, X,
 } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
@@ -16,7 +16,7 @@ import QuestionModal from './QuestionModal.vue'
 // race where the user could submit via the inline panel while
 // the modal still showed "open" (or vice versa). The modal
 // in App.vue is the single source of truth for question UI.
-import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments, currentMeta, activeProjectName, jumpToSearchResult, historyJumpInProgress } from '../stores/chat'
+import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments, currentMeta, activeProjectName, jumpToSearchResult, historyJumpInProgress, currentFileChangeBanner, undoFileChanges, dismissFileChangeUndo } from '../stores/chat'
 import { EMPTY_GUIDES, sceneById, type SceneId } from '../utils/scenePresets'
 import { pickContinueSession } from '../utils/continueSession'
 import { buildMinimapMarks } from '../utils/sessionMinimap'
@@ -105,6 +105,37 @@ async function jumpBookmark(id: number) {
 
 const messagesEl = ref<HTMLElement | null>(null)
 const message = useMessage()
+const undoingFiles = ref(false)
+const fileChangeExpanded = ref(false)
+const fileChangePreviewLimit = 6
+
+const visibleFileChanges = computed(() => {
+  const entries = currentFileChangeBanner.value?.entries || []
+  if (fileChangeExpanded.value || entries.length <= fileChangePreviewLimit) return entries
+  return entries.slice(0, fileChangePreviewLimit)
+})
+
+const hiddenFileChangeCount = computed(() => {
+  const total = currentFileChangeBanner.value?.entries.length || 0
+  if (fileChangeExpanded.value || total <= fileChangePreviewLimit) return 0
+  return total - fileChangePreviewLimit
+})
+
+async function onUndoFileChanges() {
+  const sessionID = state.currentID
+  if (!sessionID || undoingFiles.value) return
+  undoingFiles.value = true
+  try {
+    const result = await undoFileChanges(sessionID)
+    const n = result?.summary?.count ?? 0
+    message.success(n > 0 ? `已还原 ${n} 个文件` : '已还原文件改动')
+  } catch (err: unknown) {
+    const text = err instanceof Error ? err.message : '还原文件失败'
+    message.error(text)
+  } finally {
+    undoingFiles.value = false
+  }
+}
 
 const emptyGuides = EMPTY_GUIDES
 const continueSession = computed(() => pickContinueSession(state.sessions, state.currentID))
@@ -618,6 +649,14 @@ watch(() => currentMessages.value.length, (newLen, oldLen) => {
   }
 })
 
+watch(
+  () => (currentFileChangeBanner.value?.entries || []).map(entry => entry.path).join('\n'),
+  () => {
+    fileChangeExpanded.value = false
+    if (isAtBottom.value) scrollToBottom()
+  },
+)
+
 // streamRevision changes once per applied stream event. Watching it
 // avoids a deep traversal through every message and nested part on
 // each token while preserving sticky-bottom behavior.
@@ -895,6 +934,56 @@ function messageKey(m: any, i: number): string | number {
           @fork="handleFork(i)"
           @toggle-bookmark="onToggleBookmark(m.id)"
         />
+        <section
+          v-if="currentFileChangeBanner"
+          class="file-change-list"
+          aria-label="最近一轮改动的文件"
+        >
+          <div class="file-change-list-head">
+            <span>最近改动 {{ currentFileChangeBanner.count }} 个文件</span>
+            <span class="file-change-list-actions">
+              <button
+                type="button"
+                class="file-change-list-undo"
+                :disabled="undoingFiles"
+                title="撤销文件改动"
+                aria-label="撤销文件改动"
+                @click="onUndoFileChanges"
+              >
+                <Undo2 :size="14" />
+              </button>
+              <button
+                type="button"
+                class="file-change-list-dismiss"
+                title="关闭"
+                aria-label="关闭改动列表"
+                @click="dismissFileChangeUndo(state.currentID)"
+              >
+                <X :size="14" />
+              </button>
+            </span>
+          </div>
+          <ul class="file-change-list-items">
+            <li
+              v-for="entry in visibleFileChanges"
+              :key="entry.path"
+              :title="entry.path"
+            >
+              <File :size="14" class="file-change-list-icon" />
+              <span class="file-change-list-name">{{ entry.name }}</span>
+              <span v-if="entry.added || entry.deleted" class="file-change-stats">
+                <span v-if="entry.added" class="file-change-add">+{{ entry.added }}</span>
+                <span v-if="entry.deleted" class="file-change-del">-{{ entry.deleted }}</span>
+              </span>
+            </li>
+          </ul>
+          <button
+            v-if="hiddenFileChangeCount"
+            type="button"
+            class="file-change-list-more"
+            @click="fileChangeExpanded = true"
+          >还有 {{ hiddenFileChangeCount }} 个</button>
+        </section>
       </div>
       </div>
       <Transition name="view-loading">
@@ -1207,6 +1296,116 @@ function messageKey(m: any, i: number): string | number {
   color: var(--text-primary);
   border-color: color-mix(in srgb, var(--brand-500) 40%, var(--border-default));
 }
+.file-change-list {
+  /* Same column as the assistant text: padding + avatar + gap. */
+  align-self: flex-start;
+  box-sizing: border-box;
+  width: min(720px, calc(100% - (var(--space-4) + 32px + var(--space-3))));
+  max-width: calc(100% - (var(--space-4) + 32px + var(--space-3)));
+  min-width: 0;
+  margin-top: var(--space-2);
+  margin-left: calc(var(--space-4) + 32px + var(--space-3));
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--text-primary) 2%, transparent);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.file-change-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-width: 0;
+  min-height: var(--control-height);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.file-change-list-head > span:first-child {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-change-list-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+.file-change-list-undo,
+.file-change-list-dismiss,
+.file-change-list-more {
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 0;
+  font: inherit;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.file-change-list-undo,
+.file-change-list-dismiss {
+  width: var(--control-height);
+  height: var(--control-height);
+}
+.file-change-list-more {
+  align-self: flex-start;
+  text-align: left;
+}
+.file-change-list-undo:hover:not(:disabled),
+.file-change-list-dismiss:hover,
+.file-change-list-more:hover {
+  color: var(--text-primary);
+}
+.file-change-list-undo:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.file-change-list-items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.file-change-list-items li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  min-height: var(--control-height);
+}
+.file-change-list-icon {
+  flex-shrink: 0;
+  color: var(--text-tertiary);
+}
+.file-change-list-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.file-change-stats {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  flex-shrink: 0;
+  margin-left: auto;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.file-change-add { color: var(--success-500); }
+.file-change-del { color: var(--error-500); }
 .messages {
   /* No min-height: 100% here — that breaks overflow because
    * the parent doesn't have a defined height for it to

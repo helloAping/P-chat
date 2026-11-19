@@ -33,6 +33,16 @@ func TestFileJournalUndoCreateUpdateDelete(t *testing.T) {
 	if peek.Count != 2 {
 		t.Fatalf("peek count = %d, want 2", peek.Count)
 	}
+	byBase := map[string]FileChangeEntry{}
+	for _, entry := range peek.Entries {
+		byBase[filepath.Base(entry.Path)] = entry
+	}
+	if byBase["new.txt"].Added != 1 || byBase["new.txt"].Deleted != 0 {
+		t.Fatalf("new.txt stats = +%d -%d", byBase["new.txt"].Added, byBase["new.txt"].Deleted)
+	}
+	if byBase["old.txt"].Added != 1 || byBase["old.txt"].Deleted != 1 {
+		t.Fatalf("old.txt stats = +%d -%d", byBase["old.txt"].Added, byBase["old.txt"].Deleted)
+	}
 
 	summary, err := j.UndoLastTurn(sid)
 	if err != nil {

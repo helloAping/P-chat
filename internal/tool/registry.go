@@ -1050,12 +1050,16 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	}
 
 	RecordCommandPreviewFromCtx(ctx, a.Command)
+	cmd, workDir := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
+	// 删除发生在 shell 里，执行前先给现存目标做快照，当前回合才能列出这些文件。
+	// Snapshot delete targets before the shell runs so this turn lists them.
+	deleted := snapshotShellDeletes(ctx, a.Command, workDir)
 	if a.Background || looksPersistentCommand(a.Command) {
 		return startManagedProcess(ctx, a.Command, a.WorkDir)
 	}
 
-	cmd, _ := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
 	out, err := readLimitedOutput(ctx, cmd)
+	forgetUnchangedShellDeletes(ctx, deleted)
 	if err != nil {
 		content := strings.TrimRight(DecodeCommandOutput(out), "\r\n")
 		if content != "" {

@@ -551,6 +551,44 @@ func (s *Store) UpdateChatMessageContentAndMeta(rowID int64, content string, met
 	return err
 }
 
+// MergeMessageMeta 把 patch 合并进一条消息已有的 metadata，不改动正文。
+// MergeMessageMeta folds patch into one row's existing metadata without
+// rewriting the message body. Used to stamp turn elapsed after the
+// assistant row has already been inserted.
+func (s *Store) MergeMessageMeta(rowID int64, patch map[string]string) error {
+	if s == nil || rowID <= 0 || len(patch) == 0 {
+		return nil
+	}
+	if err := s.Flush(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var raw sql.NullString
+	if err := s.db.QueryRow(`SELECT metadata FROM messages WHERE id = ?`, rowID).Scan(&raw); err != nil {
+		return err
+	}
+	meta := map[string]any{}
+	if raw.Valid && strings.TrimSpace(raw.String) != "" {
+		if err := json.Unmarshal([]byte(raw.String), &meta); err != nil {
+			return fmt.Errorf("decode message metadata: %w", err)
+		}
+	}
+	for k, v := range patch {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		meta[k] = v
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE messages SET metadata = ? WHERE id = ?`, string(b), rowID)
+	return err
+}
+
 // AddChatMessageWithMetaToRegen is the P1-4 regen-aware
 // variant of AddChatMessageWithMetaTo. regenGroupID is the
 // string form of the user message id that this assistant

@@ -1,9 +1,11 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
@@ -47,6 +49,9 @@ type FileChangeEntry struct {
 	Path    string `json:"path"`
 	Tool    string `json:"tool"`
 	Existed bool   `json:"existed"`
+	// Added and Deleted are line counts versus the pre-change snapshot.
+	Added   int `json:"added"`
+	Deleted int `json:"deleted"`
 	// Before is omitted from JSON responses (can be large); kept for undo.
 	Before []byte `json:"-"`
 }
@@ -135,6 +140,87 @@ func (j *FileJournal) RecordBeforeMutation(sessionID, toolName, path string) {
 	turn.previews = append(turn.previews, TurnPreview{Tool: toolName, Path: path, Preview: path})
 }
 
+// ForgetUnchanged drops current-turn snapshots whose files still match
+// the saved bytes. Shell delete targets are recorded before the command
+// runs; this removes the ones the command left untouched.
+func (j *FileJournal) ForgetUnchanged(sessionID string, paths []string) {
+	if j == nil || sessionID == "" || len(paths) == 0 {
+		return
+	}
+	want := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		if path != "" {
+			want[path] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	j.mu.Lock()
+	sj := j.sessions[sessionID]
+	if sj == nil || len(sj.turns) == 0 {
+		j.mu.Unlock()
+		return
+	}
+	turn := sj.turns[len(sj.turns)-1]
+	candidates := make([]FileChangeEntry, 0, len(want))
+	for _, entry := range turn.entries {
+		if _, ok := want[entry.Path]; ok {
+			candidates = append(candidates, entry)
+		}
+	}
+	j.mu.Unlock()
+
+	drop := make(map[string]struct{}, len(candidates))
+	for _, entry := range candidates {
+		if snapshotUnchanged(entry) {
+			drop[entry.Path] = struct{}{}
+		}
+	}
+	if len(drop) == 0 {
+		return
+	}
+
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	sj = j.sessions[sessionID]
+	if sj == nil || len(sj.turns) == 0 {
+		return
+	}
+	turn = sj.turns[len(sj.turns)-1]
+	next := make([]FileChangeEntry, 0, len(turn.entries))
+	for _, entry := range turn.entries {
+		if _, ok := drop[entry.Path]; ok {
+			continue
+		}
+		next = append(next, entry)
+	}
+	turn.entries = next
+	turn.byPath = make(map[string]int, len(next))
+	for i, entry := range next {
+		turn.byPath[entry.Path] = i
+	}
+	previews := make([]TurnPreview, 0, len(turn.previews))
+	for _, preview := range turn.previews {
+		if _, ok := drop[preview.Path]; ok && preview.Tool == "exec_command" {
+			continue
+		}
+		previews = append(previews, preview)
+	}
+	turn.previews = previews
+}
+
+func snapshotUnchanged(entry FileChangeEntry) bool {
+	data, err := os.ReadFile(entry.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return !entry.Existed && len(entry.Before) == 0
+		}
+		return false
+	}
+	return entry.Existed && bytes.Equal(data, entry.Before)
+}
+
 // RecordCommandPreview appends a command summary to the current turn.
 // It does not create an undo snapshot.
 func (j *FileJournal) RecordCommandPreview(sessionID, command string) {
@@ -199,9 +285,9 @@ func (j *FileJournal) PeekLastTurn(sessionID string) FileChangeSummary {
 		return FileChangeSummary{}
 	}
 	j.mu.Lock()
-	defer j.mu.Unlock()
 	sj := j.sessions[sessionID]
 	if sj == nil || len(sj.turns) == 0 {
+		j.mu.Unlock()
 		return FileChangeSummary{}
 	}
 	var turn *fileTurnBatch
@@ -212,15 +298,28 @@ func (j *FileJournal) PeekLastTurn(sessionID string) FileChangeSummary {
 		}
 	}
 	if turn == nil {
+		j.mu.Unlock()
 		return FileChangeSummary{}
 	}
-	out := make([]FileChangeEntry, len(turn.entries))
-	for i, e := range turn.entries {
-		out[i] = FileChangeEntry{Path: e.Path, Tool: e.Tool, Existed: e.Existed}
+	copied := append([]FileChangeEntry(nil), turn.entries...)
+	started := turn.StartedAt
+	j.mu.Unlock()
+
+	out := make([]FileChangeEntry, len(copied))
+	for i, e := range copied {
+		after, err := os.ReadFile(e.Path)
+		if err != nil {
+			after = nil
+		}
+		added, deleted := lineChangeCounts(e.Before, after)
+		out[i] = FileChangeEntry{
+			Path: e.Path, Tool: e.Tool, Existed: e.Existed,
+			Added: added, Deleted: deleted,
+		}
 	}
 	return FileChangeSummary{
 		Count:     len(out),
-		StartedAt: turn.StartedAt,
+		StartedAt: started,
 		Entries:   out,
 	}
 }
@@ -280,6 +379,84 @@ func (j *FileJournal) UndoLastTurn(sessionID string) (FileChangeSummary, error) 
 		return summary, fmt.Errorf("partial undo: %s", errs[0])
 	}
 	return summary, nil
+}
+
+// lineChangeCounts reports added and deleted lines between two snapshots.
+// Binary payloads (embedded NUL) report no line stats.
+func lineChangeCounts(before, after []byte) (added, deleted int) {
+	if bytes.IndexByte(before, 0) >= 0 || bytes.IndexByte(after, 0) >= 0 {
+		return 0, 0
+	}
+	b := splitSnapshotLines(before)
+	a := splitSnapshotLines(after)
+	if len(b) == 0 {
+		return len(a), 0
+	}
+	if len(a) == 0 {
+		return 0, len(b)
+	}
+	const maxLines = 2000
+	if len(b) > maxLines || len(a) > maxLines {
+		return bagLineCounts(b, a)
+	}
+	common := lcsLineCount(b, a)
+	return len(a) - common, len(b) - common
+}
+
+func splitSnapshotLines(raw []byte) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	text := string(raw)
+	if strings.HasSuffix(text, "\n") {
+		text = strings.TrimSuffix(text, "\n")
+	}
+	if text == "" {
+		return nil
+	}
+	return strings.Split(text, "\n")
+}
+
+func bagLineCounts(before, after []string) (added, deleted int) {
+	freq := make(map[string]int, len(before))
+	for _, line := range before {
+		freq[line]++
+	}
+	for _, line := range after {
+		if freq[line] > 0 {
+			freq[line]--
+			continue
+		}
+		added++
+	}
+	for _, n := range freq {
+		deleted += n
+	}
+	return added, deleted
+}
+
+func lcsLineCount(a, b []string) int {
+	if len(a) < len(b) {
+		a, b = b, a
+	}
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for _, left := range a {
+		cur[0] = 0
+		for j, right := range b {
+			if left == right {
+				cur[j+1] = prev[j] + 1
+				continue
+			}
+			if cur[j] > prev[j+1] {
+				cur[j+1] = cur[j]
+			} else {
+				cur[j+1] = prev[j+1]
+			}
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)]
 }
 
 // SessionIDFromCtx returns the session id attached via WithSessionID.

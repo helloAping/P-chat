@@ -2376,7 +2376,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		})
 		if err != nil {
 			turnAssistantID = persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, 0, 0, false, req.RegenGroupID)
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true})
+			a.stampTurnElapsed(turnAssistantID, formatElapsed(time.Since(start)))
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true, Duration: formatElapsed(time.Since(start))})
 			return
 		}
 		// 兼容仍发送完整 SKILL.md 正文的旧 GUI/CLI 客户端。
@@ -3331,7 +3332,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
 				sendOrDrop(retryCtx, ch, nextSeq, phaseDone)
-				sendOrDrop(retryCtx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
+				a.emitDone(retryCtx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 				return
 			}
 
@@ -3479,7 +3480,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if pending > 0 {
 					persistRound()
-					sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
+					a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 					return
 				}
 				persistRound()
@@ -3491,7 +3492,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
 				sendOrDrop(ctx, ch, nextSeq, phaseDone)
-				sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
+				a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 				return
 			}
 
@@ -4099,6 +4100,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// 取消时也保留已发出的调用，后续历史修复可补齐中断结果。
 				// Preserve issued calls on cancellation so history repair can mark interrupted results.
 				persistRound()
+				a.stampTurnElapsed(turnAssistantID, formatElapsed(time.Since(start)))
 				return
 			}
 			// All tools completed normally. Drain their final events before
@@ -4108,6 +4110,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				case <-f.done:
 				case <-ctx.Done():
 					persistRound()
+					a.stampTurnElapsed(turnAssistantID, formatElapsed(time.Since(start)))
 					return
 				}
 			}
@@ -4326,7 +4329,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if todoCheckpointAttempts >= MaxTodoCheckpointAttempts {
 						emitTodoIncomplete("todo_write was not completed during the required state check", roundNum)
 						persistRound()
-						sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
+						a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 						return
 					}
 				}
@@ -4397,7 +4400,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				stampCacheUsage(&stuckChunk, totalCacheHit, totalCacheMiss, cacheReported)
 				sendOrDrop(ctx, ch, nextSeq, stuckChunk)
-				sendOrDrop(ctx, ch, nextSeq, makeDoneChunk(totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start))
+				a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 				return
 			}
 
@@ -4640,6 +4643,26 @@ func makeDoneChunk(tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported b
 	}
 	stampCacheUsage(&c, cacheHit, cacheMiss, cacheReported)
 	return c
+}
+
+// emitDone sends the terminal done event and records that same duration
+// on the assistant row. History reloads then show the footer time on
+// every turn, not only the message that just finished streaming.
+func (a *Agent) emitDone(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported bool, start time.Time, assistantID int64) {
+	chunk := makeDoneChunk(tokensIn, tokensOut, cacheHit, cacheMiss, cacheReported, start)
+	a.stampTurnElapsed(assistantID, chunk.Duration)
+	sendOrDrop(ctx, ch, nextSeq, chunk)
+}
+
+// stampTurnElapsed writes the turn duration into message metadata.
+// stampTurnElapsed persists the duration the live footer already shows.
+func (a *Agent) stampTurnElapsed(messageID int64, elapsed string) {
+	if a == nil || a.store == nil || messageID <= 0 || elapsed == "" {
+		return
+	}
+	if err := a.store.MergeMessageMeta(messageID, map[string]string{"elapsed": elapsed}); err != nil {
+		log.Printf("[agent] stamp elapsed: %v", err)
+	}
 }
 
 func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported bool, regenGroupID string) int64 {

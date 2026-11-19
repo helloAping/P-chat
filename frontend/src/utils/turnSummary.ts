@@ -91,12 +91,6 @@ export function turnFileLabel(path: string): string {
   return slash >= 0 ? (normalized.slice(slash + 1) || path) : path
 }
 
-function formatTokens(n: number): string {
-  if (n < 1000) return String(n)
-  if (n < 10_000) return `${(n / 1000).toFixed(1)}k`
-  return `${Math.round(n / 1000)}k`
-}
-
 export function buildTurnSummary(message: Message): TurnSummary {
   const written = new Set<string>()
   const read = new Set<string>()
@@ -138,18 +132,6 @@ export function buildTurnSummary(message: Message): TurnSummary {
   if (searches) bits.push(`检索 ${searches} 次`)
   if (subAgents) bits.push(`子代理 ${subAgents}`)
   if (!bits.length && tools) bits.push(`工具 ${tools} 次`)
-  if (tokensOut || tokensIn) {
-    bits.push(`约 ${formatTokens(tokensOut || tokensIn)} tokens`)
-  }
-  if (message.cache_hit_tokens != null || message.cache_miss_tokens != null) {
-    const hit = message.cache_hit_tokens ?? 0
-    const miss = message.cache_miss_tokens ?? 0
-    const total = hit + miss
-    if (total > 0) {
-      bits.push(`cache ${Math.round((hit / total) * 100)}%`)
-    }
-  }
-  if (message.elapsed) bits.push(message.elapsed)
 
   const line = bits.length ? `本回合 · ${bits.join(' · ')}` : ''
 

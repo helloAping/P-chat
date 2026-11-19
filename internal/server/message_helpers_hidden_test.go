@@ -6,6 +6,20 @@ import (
 	"github.com/p-chat/pchat/internal/llm"
 )
 
+func TestApplyUsageMetaRestoresElapsedWithoutCache(t *testing.T) {
+	resp := &MessageResponse{}
+	applyUsageMeta(resp, `{"tokens_in":"12","tokens_out":"3","elapsed":"3.6s"}`)
+	if resp.Elapsed != "3.6s" {
+		t.Fatalf("Elapsed = %q, want 3.6s", resp.Elapsed)
+	}
+	if resp.TokensIn != 12 || resp.TokensOut != 3 {
+		t.Fatalf("tokens = %d/%d, want 12/3", resp.TokensIn, resp.TokensOut)
+	}
+	if resp.CacheHitTokens != nil {
+		t.Fatalf("cache hit = %v, want nil when cache was not reported", *resp.CacheHitTokens)
+	}
+}
+
 func TestBuildMessageResponseHidesInternalResumeRows(t *testing.T) {
 	resp := buildMessageResponse(
 		llm.ChatMessage{

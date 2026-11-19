@@ -553,6 +553,15 @@ func mergeAssistantRun(run []MessageResponse) MessageResponse {
 
 	base.Parts = reorderAsyncSubAgentsAfterTaskTools(parts)
 	base.SourceMessageIDs = sourceMessageIDs
+	// 多轮合并后气泡取第一行，时长写在最后一行，这里把最后一轮的耗时带到可见气泡上。
+	// Merged bubbles keep the first row; elapsed is stamped on the last
+	// row, so copy the latest duration onto the visible bubble.
+	for i := len(run) - 1; i >= 0; i-- {
+		if run[i].Elapsed != "" {
+			base.Elapsed = run[i].Elapsed
+			break
+		}
+	}
 	// `base.Content` is intentionally NOT regenerated from
 	// parts. The MessageBubble component (frontend/src/components/
 	// MessageBubble.vue) renders assistant messages off
@@ -916,6 +925,9 @@ func applyUsageMeta(resp *MessageResponse, raw string) {
 	}
 	if v, ok := metaInt(meta, "tokens_out"); ok {
 		resp.TokensOut = v
+	}
+	if v, ok := meta["elapsed"].(string); ok {
+		resp.Elapsed = strings.TrimSpace(v)
 	}
 	reported := false
 	switch v := meta["cache_reported"].(type) {

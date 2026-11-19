@@ -44,7 +44,11 @@ func TestMergeAssistantRun_DoesNotRegenerateContent(t *testing.T) {
 			},
 		},
 	}
+	run[1].Elapsed = "3.6s"
 	got := mergeAssistantRun(run)
+	if got.Elapsed != "3.6s" {
+		t.Errorf("Elapsed = %q, want 3.6s from the last round", got.Elapsed)
+	}
 	if got.Content != "round 1 text" {
 		t.Errorf("Content = %q, want %q (must NOT be re-projected; round 1's text only)",
 			got.Content, "round 1 text")

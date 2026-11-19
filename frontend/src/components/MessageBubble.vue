@@ -35,7 +35,7 @@ import {
   ImageIcon, Volume2, Film, FileText, File,
   Clipboard, Download, AlertTriangle, Undo2, GitBranch, Bookmark,
   ArrowDown, ArrowUp, MoreHorizontal, Sparkles,
-  Check, Loader2, XCircle, CornerDownLeft, Maximize2, Play,
+  Check, Loader2, RotateCcw, XCircle, CornerDownLeft, Maximize2, Play,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
 
@@ -1740,7 +1740,7 @@ function findPrecedingUserMessageId(): number {
           </div>
 
           <!-- Footer: turn recap + tokens / cache / elapsed (plain meta, no chip). -->
-          <div v-if="turnSummary || hasTokens" class="msg-meta">
+          <div v-if="turnSummary || hasTokens || message.elapsed" class="msg-meta">
             <span v-if="turnSummary" class="msg-meta-turn-block">
               <button
                 v-if="turnSummary.files.length || replayFiles.length || replayCommands.length"
@@ -1781,7 +1781,7 @@ function findPrecedingUserMessageId(): number {
               class="msg-meta-cache"
               :title="`prompt cache 命中 ${message.cache_hit_tokens ?? 0} / 未命中 ${message.cache_miss_tokens ?? 0}`"
             >· cache {{ cacheHitRate }}%</span>
-            <span v-if="message.elapsed" class="msg-elapsed">· {{ message.elapsed }}</span>
+            <span v-if="message.elapsed" class="msg-elapsed"><template v-if="turnSummary || hasTokens || cacheHitRate != null">· </template>{{ message.elapsed }}</span>
             <span v-if="message.model" class="msg-model">· {{ message.model }}</span>
           </div>
 
@@ -1860,34 +1860,18 @@ function findPrecedingUserMessageId(): number {
           >
             <Bookmark :size="13" class="bubble-action-icon" />
           </button>
-          <!-- P1-3 regenerate. Only shown on the trailing
-               assistant message (we don't allow re-running
-               a reply that's no longer the latest one).
-               Click pops the local bubble, calls the
-               /regenerate endpoint, and re-streams the new
-               reply through the regular chat store path.
-
-               Visual states (see .bubble-action-regenerate
-               + .bubble-action-regenerate--busy in <style>):
-                 - idle: pill shape, brand-coloured surface,
-                   icon + "重答" text (auto-sized to content).
-                 - busy: collapses to a 26×24 icon square with
-                   a transparent surface, so the spinner
-                   doesn't draw the eye away from the
-                   streaming reply. Width transitions smoothly
-                   via the existing --dur-fast easing. -->
+          <!-- Regenerate only the latest assistant reply. Icon only. -->
           <button
             v-if="canRegenerate"
             type="button"
-            class="bubble-action-btn bubble-action-regenerate"
-            :class="{ 'bubble-action-regenerate--busy': regenerating }"
+            class="bubble-action-btn"
             :disabled="regenerating"
             title="重新生成回复"
             aria-label="重新生成回复"
             @click="onRegenerate"
           >
-            <Loader2 :size="13" :class="regenerating ? 'bubble-action-icon bubble-action-icon--spin' : 'bubble-action-icon'" />
-            <span v-if="!regenerating" class="bubble-action-text">重答</span>
+            <Loader2 v-if="regenerating" :size="13" class="bubble-action-icon bubble-action-icon--spin" />
+            <RotateCcw v-else :size="13" class="bubble-action-icon" />
           </button>
           <NDropdown
             v-if="messageActionMenuOptions.length"
@@ -2198,17 +2182,6 @@ function findPrecedingUserMessageId(): number {
   align-items: center;
   gap: var(--space-1);
   padding: 0;
-  opacity: 0;
-  transform: translateY(calc(-1 * var(--space-1)));
-  pointer-events: none;
-  transition: opacity var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
-}
-.msg:hover .bubble-actions,
-.bubble-actions:focus-within {
-  opacity: 1;
-  transform: translateY(0);
-  pointer-events: auto;
 }
 .bubble-action-btn {
   width: var(--control-height);
@@ -2216,20 +2189,17 @@ function findPrecedingUserMessageId(): number {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
+  background: transparent;
   color: var(--text-tertiary);
   box-shadow: none;
   cursor: pointer;
   padding: 0;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
+  transition: color var(--dur-fast) var(--ease-out);
 }
 .bubble-action-btn:hover {
-  background: var(--surface-2);
-  border-color: var(--border-strong);
+  background: transparent;
   color: var(--text-primary);
 }
 .bubble-action-btn:active {
@@ -2249,79 +2219,17 @@ function findPrecedingUserMessageId(): number {
  * colour is bound to --success-50 / --success-500
  * defined in style.css. */
 .bubble-action-btn.is-feedback {
-  background: var(--success-50);
+  background: transparent;
   color: var(--success-500);
   animation: bubble-action-feedback var(--dur-base) var(--ease-out);
 }
 .bubble-action-btn.is-feedback:hover {
-  background: var(--success-50);
+  background: transparent;
   color: var(--success-500);
 }
 .bubble-action-rollback:hover {
-  background: var(--warn-50);
-  color: var(--warn-500);
-}
-
-/* Regenerate is the only "primary action" in the toolbar —
- * the other buttons are icon-only utilities. To mark it as
- * the affordance the user is most likely to want next, it
- * gets a brand-coloured surface in the idle state. The
- * width: auto / padding: 0 8px / gap: 4px makes the pill
- * snug around "重答" + icon, and the min-width: 26px keeps
- * it from collapsing to nothing if the text is ever
- * localised to a wider string. The "transition: width"
- * line is what makes the pill shrink smoothly back to a
- * 26×24 square when it goes busy. */
-.bubble-action-btn.bubble-action-regenerate {
-  width: auto;
-  min-width: 26px;
-  height: 24px;
-  padding: 0 8px;
-  gap: 4px;
-  background: var(--brand-50);
-  color: var(--brand-600);
-  border: 1px solid var(--brand-100);
-  font-size: 12px;
-  font-weight: 500;
-  transition: width var(--dur-fast) var(--ease-out),
-              padding var(--dur-fast) var(--ease-out),
-              background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
-}
-.bubble-action-btn.bubble-action-regenerate:hover {
-  background: var(--brand-100);
-  color: var(--brand-700);
-  border-color: var(--brand-200);
-}
-.bubble-action-btn.bubble-action-regenerate--busy {
-  /* Collapse to the same 26×24 square the other icon-only
-   * buttons use, but keep the surface transparent so the
-   * spinner blends in rather than competing with the
-   * streaming reply. */
-  width: 26px;
-  padding: 0;
   background: transparent;
-  color: var(--text-tertiary);
-  border-color: transparent;
-  gap: 0;
-}
-.bubble-action-btn.bubble-action-regenerate--busy:hover {
-  background: var(--surface-3);
-  color: var(--text-primary);
-}
-.bubble-action-text {
-  line-height: 1;
-  /* Tiny slide+fade when the text reappears after a regen
-   * completes — matches the icon's own fade-in
-   * (bubble-action-icon-in) so the icon+text come back as
-   * a single unit rather than the text popping in late. */
-  animation: bubble-action-text-in var(--dur-fast) var(--ease-out);
-}
-@keyframes bubble-action-text-in {
-  from { opacity: 0; transform: translateX(-2px); }
-  to   { opacity: 1; transform: translateX(0); }
+  color: var(--warn-500);
 }
 /* Press pulse for fork: a tiny scale
  * bump that re-triggers on every :key bump from the

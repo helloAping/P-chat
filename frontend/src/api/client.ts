@@ -1002,6 +1002,8 @@ export interface FileChangeEntry {
   path: string
   tool: string
   existed: boolean
+  added?: number
+  deleted?: number
 }
 
 export interface FileChangeSummary {

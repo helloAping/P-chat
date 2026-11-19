@@ -95,8 +95,9 @@
 
 - 风格记忆：`remember` 不单独建事实表。用户在确认框里选择已有风格（含内置人格）后，事实追加到该风格的 `styles.memory`；也可以填一个新名字，据此新建风格并把事实作为它的记忆。拒绝或未选择都不写。当前会话仍通过原来的风格记忆注入读到它。
 - 风格对照：输入区「换种说法」对当前句子用另外两种人格各做一次无工具补全，结果在检查器里。点「采用」才写成一条普通助手消息。
-- 回合回放：文件和命令摘要写入 `turn_changes`，重启后气泡仍能展开。字节快照仍只留在内存日记的最近 5 轮里，撤销按钮仍只作用于最近一轮。
+- 回合回放：文件和命令摘要写入 `turn_changes`，重启后气泡仍能展开。字节快照仍只留在内存日记的最近 5 轮里。最近一轮的文件竖向列在对话末尾，撤销只作用于这一轮。
 - 晨报和全局记忆卡片已移除。曾经生成过的 `user_memories` / `morning_digests` 表在升级到 V25 时删除。
+- 后续补齐见 [`docs/plans/local-life-followups.md`](plans/local-life-followups.md)：自选人格的换种说法、记忆单条删除、书签备注与范围导出、回合撤销边界、`Ctrl+N` / `Ctrl+B`。流式工具参数与 `Ctrl+K` 命令面板已落地，不在该计划里重做。
 
 ## 2. 可迭代任务明细
 
@@ -195,13 +196,13 @@
 
 | 编号 | 任务点 | 功能描述 | 涉及点 | 修改点 | 逻辑梳理 | 验收点 |
 |---|---|---|---|---|---|---|
-| AE-01 | 流式工具参数上屏 | 工具参数生成期间实时展示进度。 | `internal/agent/agent.go:2947-2960`（只累加 delta）、`:3281-3287`（开始时才发 200 字截断）、`internal/llm/client.go:46-56`（LLM 层已支持增量）。 | 转发 `tool_args_delta`（按 tool_id/index）；前端 ToolCard 实时拼参数；完整参数仍在 start/ok 落盘。 | 长 `write_file`/`edit_file` 参数生成期间 UI 无反馈像卡住；LLM 层增量能力已具备，只差转发。 | 参数流式可见；终态参数与持久化一致；多工具并行不串台。 |
+| AE-01 | 流式工具参数上屏（已落地） | 工具参数生成期间实时展示进度。 | `internal/agent/agent.go`（`ToolCallStatus: "args"`）、`frontend/src/stores/chat.ts`、`ToolCallCard.vue`。 | 已转发 args 片段；完整参数仍在 start/ok 落盘。卡片在 JSON 未闭合时显示「生成中…」。 | 长 `write_file` / `edit_file` 参数生成期间已有卡片和片段。 | 参数流式可见；终态参数与持久化一致；多工具并行不串台。 |
 | AE-02 | 供应商原生 Prompt Cache 断点 | Anthropic `cache_control` 等显式缓存标记。 | `internal/llm/anthropic_adapter.go`（无 cache_control）、`internal/agent/prompt.go:7-8`（本地前缀稳定已做）、`cache_usage.go`（仅解析）。 | 静态 system / 工具 schema / 稳定历史前缀打断点；与现有 signature 失效规则对齐。 | 当前依赖供应商隐式前缀缓存，长会话成本/延迟不稳定。 | Claude 长会话 cache 命中率可见提升；失效场景不错缓存。 |
 | AE-03 | Token / Cache 用量上 UI | Done 事件与 Inspector 展示 cache 命中率与轮次明细。 | `internal/agent/agent.go:2933-2935`（仅 log）、`usage.go:4-18`、`frontend/src/api/client.ts`、上下文检查器。 | Done/phase 事件带 `cache_hit/miss`、按 round 累计；Inspector 展示 `hit/(hit+miss)`。 | 解析与日志已有，用户看不到；区别于 AG-01（续接原因）。 | 每轮结束可见 tokens + cache 命中；历史消息持久化该字段。 |
 | AE-04 | `apply_patch` 多 hunk 编辑 | 支持 unified-diff / 多 hunk / 多文件结构化编辑。 | `internal/tool/edit.go:19-67`（仅单次 old/new）、`write_file`（整文件覆盖）。 | 新增 patch 工具；失败返回精确冲突上下文（行号/期望内容）。 | 大文件多处改动现在逼模型整文件重写，token 浪费且易失败。 | 多 hunk 一次成功；冲突时模型能按上下文自修复。 |
 | AE-05 | 工具参数 JSON 校验闭环 | 参数非法时不执行，短反馈让模型自修。 | `internal/agent/agent.go:3139`（normalizeToolCallArgs）、工具 schema。 | schema 校验失败发结构化 `tool_args_invalid`，限 1 次重试再执行。 | 畸形 JSON 现在直接变工具错误再烧一轮。 | 非法参数不落地执行；自修复成功率可统计。 |
 | AE-06 | 渐进式工具暴露 | 核心工具常驻 + 其余按需加载。 | `internal/agent/agent.go:2225/2779`（每轮全量 toolDefs）、`token_count.go:24-28`（每轮扫 schema）。 | 常驻核心集 + `tool_search` 式加载；或按 `work_mode` 裁剪默认集。 | 工具集含 browser/MCP/动态工具后前缀膨胀，吃 token 与 cache。 | 默认前缀 token 下降；非常用工具仍可被发现调用。 |
-| AE-07 | 文件变更可回滚 | 会话级 file change journal，支持撤销本轮改动。 | `internal/tool/edit.go`、`write_file`、会话 fork/rollback（已有消息级）。 | 记录 path/before/after/tool_id；GUI「撤销本轮文件改动」。 | Agent 改坏代码目前只能靠 git 或手改。 | 撤销后文件字节级还原；跨多工具连续撤销顺序正确。 |
+| AE-07 | 文件变更可回滚（最近一轮已落地） | 内存日记保留最近 5 轮字节，输入区可撤销最近一轮。更早回合只有 `turn_changes` 摘要。 | `internal/tool/file_journal.go`、`turn_changes`、`InputArea.vue`。 | 不把字节落盘。历史回合标明只能看，见 [`local-life-followups.md`](plans/local-life-followups.md) P5。 | 重启后摘要还在，字节撤销失效。 | 最近一轮可还原；旧回合能看出不能撤。 |
 
 ### 2.11 会话管理与前端操作
 
@@ -209,10 +210,10 @@
 |---|---|---|---|---|---|---|
 | SM-01 | 搜索结果跳转高亮（已落地） | 点击搜索结果定位到具体消息。 | `frontend/src/components/SessionSidebar.vue:314-317`（只 switchSession）、`internal/server/sessions.go:69-108`、`internal/memory/memory.go:3449-3477`（已返回 message_id）。 | switchSession 后按 message_id/seq 拉页定位，`ChatWindow` 滚动到 `[data-msg-id]` 并短暂高亮。 | API 已具备定位信息，前端只差滚动与高亮。 | 点击结果后目标消息可见且高亮；跨分页会话也能定位。 |
 | SM-02 | 会话标签 / 分组 | 用户自定义标签组织会话。 | `SessionSidebar.vue:128-158`（仅时间分组）、`internal/memory/migrations.go`（无 tags 列）。 | `conversations.metadata` 或新表存 tags；侧栏筛选 + PATCH meta；走 `internal/upgrade/`。 | 组织维度只有时间 + 本机置顶。 | 标签增删改查；筛选即时生效；升级迁移幂等。 |
-| SM-03 | 全局快捷键 | Ctrl+K 搜索 / Ctrl+N 新建 / Ctrl+B 侧栏等。 | `App.vue`（无全局绑定）、`InputArea.vue:261-268`（仅 slash 命令）。 | App 级统一 keymap + 快捷键帮助面板。 | 桌面聊天应用标配，当前全靠鼠标。 | 主要操作可纯键盘完成；帮助可发现。 |
+| SM-03 | 全局快捷键（部分落地） | `Ctrl+K` 已打开命令面板（新建、继续、项目、侧栏、检查器、主题）。直接键 `Ctrl+N` / `Ctrl+B` 仍未绑。 | `frontend/src/utils/globalCommands.ts`、`App.vue` `onGlobalKeydown`。 | 见 [`local-life-followups.md`](plans/local-life-followups.md) P6。 | 面板已覆盖发现；缺两条不打开面板也能用的键。 | `Ctrl+N` 新建、`Ctrl+B` 折叠侧栏；`Ctrl+K` 行为不变。 |
 | SM-04 | 消息赞 / 踩反馈 | 标记回复质量，沉淀本地信号。 | `MessageBubble.vue` 操作区、`messages` schema（无 feedback 列）。 | 消息 meta 或旁表存 rating；气泡按钮；可选汇总到诊断。 | 无法标记好/坏回复，提示优化无数据。 | 反馈持久化；可按会话导出。 |
 | SM-05 | 置顶服务端持久化 | 置顶状态跨设备/重装保留。 | `SessionSidebar.vue:95-125`（localStorage，注释承认跨浏览器不同步）。 | `conversations.pinned` 或 metadata；与现有菜单对齐。 | 清 WebView 数据/换机后置顶丢失。 | 重装后顺序保留；多客户端一致。 |
-| SM-06 | 消息书签 + 范围导出 | 钉住关键回合；按消息范围导出/复制 Markdown。 | `internal/server/export.go:27-29`（仅整会话）、`MessageBubble.vue`。 | `message_bookmarks(session_id, message_id, note)`；导出支持 `from_seq/to_seq` 或前端多选。 | 长会话回找与片段分享成本高。 | 书签可跳转；范围导出内容正确。 |
+| SM-06 | 消息书签 + 范围导出（书签已落地） | 钉住、跳转、按项目浏览已落地。`note` 列写入时空字符串。导出仍是整段会话。 | `internal/memory/bookmarks.go`、`internal/server/export.go`、`BookmarkSettings.vue`。 | 见 [`local-life-followups.md`](plans/local-life-followups.md) P3、P4。 | 备注和「从这条书签到那条」的 Markdown 还未做。 | 备注可改；`from_seq/to_seq` 的 Markdown 含两端；整段导出不变。 |
 
 ### 2.12 CLI 能力对齐
 
@@ -286,7 +287,7 @@
 1. ~~**低成本高价值修复先行**~~：第一批小步（REL-01 重试叠字、REL-03 日志门控、SEC-03 pprof 默认关、SEC-04 eval_write 拦截、CLI-01 /kb 挂载、SM-01 搜索跳转）已于 2026-09-26 全部落地。
 2. **安全主线**：~~SEC-02~~ / ~~SEC-05 客户端~~ 已落地 → 发布站签包联调 → SEC-01（Runtime Trust 接线）→ SEC-06/07。
 3. **更新渠道**：UPD-01 客户端已接入；发布站需支持渠道筛选并做真实 Beta 联调。更新防伪仍由 SEC-05 跟进。
-4. **体验主线**：AE-01（流式工具参数）+ AE-03（cache 用量）→ PERF-01（SSE 帧合并）→ PERF-02（消息搜索 FTS5）→ SM-02/04/05（会话组织）。
+4. **体验主线**：~~AE-01~~ 已落地 → AE-03（cache 用量）→ PERF-01（SSE 帧合并）→ PERF-02（消息搜索 FTS5）→ SM-02/04/05（会话组织）。本地生命感后续单独走 [`local-life-followups.md`](plans/local-life-followups.md)，不并入安全主线。
 5. **成本主线**：AE-02（prompt cache 断点）+ AE-04（apply_patch），对 coding 场景 token 节省最直接。
 6. 知识库 KB-01 到 KB-05 已落地；KB-06~09 处理媒体接线、失败重试、缓存 TTL 与并发。
 7. 浏览器控制稳定性（BR-01～BR-05）已落地；REF-06 处理扩展 content script 健壮性。
@@ -302,7 +303,7 @@
 - 安全连续增强：`SEC-02` ✅ → `SEC-05` → `SEC-01`（七片接线按 decision-map）→ `SEC-06`/`SEC-07`。
 - 更新渠道：`UPD-01` 客户端勾选、检查、下载和版本锁定已接通；待发布站按 `include_prerelease=1` 返回稳定版/Beta 中的最高可用版本，并完成真实发布联调。
 - 文档结构：`DOC-05` 已落地，后续目录或模块职责变化时同步维护 `docs/project-structure.md`。
-- 第二批能力：`AE-01`、`AE-03`、`PERF-01`、`PERF-02`、`SM-02`，优先提升 agent 实际可用性与前端性能。
+- 第二批能力：`AE-01` 已落地；剩余 `AE-03`、`PERF-01`、`PERF-02`、`SM-02`。本地生命感后续见 [`local-life-followups.md`](plans/local-life-followups.md)。
 - 第三批增强：`AE-02`、`AE-04`、`MCP-01`（先 REF-05）、`SB-01`，这些涉及跨模块协议或运行环境，建议单独写设计文档后再做。
 
 ## 6. 说明
