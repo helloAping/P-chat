@@ -3,14 +3,18 @@
  * BookmarkSettings — global bookmark browser inside app settings.
  * Groups pins as project, then conversation, then the pinned line.
  */
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { useMessage } from 'naive-ui'
 import * as api from '../api/client'
 import { jumpToBookmarkedMessage, state } from '../stores/chat'
+import { copyText } from '../utils/clipboard'
 
 const message = useMessage()
 const items = ref<api.BookmarkIndexItem[]>([])
 const loading = ref(false)
+const rangeFrom = reactive<Record<string, string>>({})
+const rangeTo = reactive<Record<string, string>>({})
+const noteDraft = reactive<Record<string, string>>({})
 
 interface ConversationGroup {
   id: string
@@ -61,6 +65,9 @@ async function load() {
   try {
     const resp = await api.listAllBookmarks()
     items.value = resp.bookmarks || []
+    for (const item of items.value) {
+      noteDraft[noteKey(item)] = item.note || ''
+    }
   } catch (err: unknown) {
     items.value = []
     const text = err instanceof Error ? err.message : '书签加载失败'
@@ -81,6 +88,70 @@ async function openItem(item: api.BookmarkIndexItem) {
   }
 }
 
+function noteKey(item: api.BookmarkIndexItem): string {
+  return `${item.conversation_id}:${item.message_id}`
+}
+
+async function saveNote(item: api.BookmarkIndexItem) {
+  const note = (noteDraft[noteKey(item)] || '').trim()
+  if ([...note].length > 200) {
+    message.error('备注最多 200 字')
+    return
+  }
+  try {
+    await api.updateBookmarkNote(item.conversation_id, item.message_id, note)
+    item.note = note
+    noteDraft[noteKey(item)] = note
+  } catch (err: unknown) {
+    message.error(err instanceof Error ? err.message : '备注保存失败')
+  }
+}
+
+function orderedPins(conversation: ConversationGroup): api.BookmarkIndexItem[] {
+  return [...conversation.items].sort((a, b) => (a.seq || 0) - (b.seq || 0))
+}
+
+async function rangeMarkdown(conversation: ConversationGroup): Promise<string> {
+  const pins = orderedPins(conversation).filter(item => (item.seq || 0) > 0)
+  if (pins.length < 2) throw new Error('至少需要两条带序号的书签')
+  const from = Number(rangeFrom[conversation.id] || pins[0].seq)
+  const to = Number(rangeTo[conversation.id] || pins[pins.length - 1].seq)
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from > to) {
+    throw new Error('请从较早的书签选到较晚的书签')
+  }
+  const path = `/api/v1/sessions/${encodeURIComponent(conversation.id)}/export?format=md&from_seq=${from}&to_seq=${to}`
+  const url = await api.waitForAPIURL(path)
+  const resp = await fetch(url)
+  if (!resp.ok) throw new Error((await resp.text()) || '导出失败')
+  return resp.text()
+}
+
+async function copyRange(conversation: ConversationGroup) {
+  try {
+    const text = await rangeMarkdown(conversation)
+    const ok = await copyText(text)
+    if (!ok) throw new Error('复制失败')
+    message.success('已复制这段 Markdown')
+  } catch (err: unknown) {
+    message.error(err instanceof Error ? err.message : '导出失败')
+  }
+}
+
+async function downloadRange(conversation: ConversationGroup) {
+  try {
+    const text = await rangeMarkdown(conversation)
+    const blob = new Blob([text], { type: 'text/markdown;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${conversation.title || 'bookmarks'}.md`
+    link.click()
+    URL.revokeObjectURL(url)
+  } catch (err: unknown) {
+    message.error(err instanceof Error ? err.message : '导出失败')
+  }
+}
+
 onMounted(() => {
   void load()
   window.addEventListener('pchat:bookmarks-changed', load)
@@ -98,15 +169,37 @@ onUnmounted(() => {
       <h3 class="bookmark-project-title">{{ project.label }}</h3>
       <div v-for="conversation in project.conversations" :key="conversation.id" class="bookmark-conversation">
         <div class="bookmark-conversation-title">{{ conversation.title }}</div>
-        <button
+        <div
           v-for="item in conversation.items"
           :key="`${item.conversation_id}-${item.message_id}`"
-          type="button"
           class="bookmark-line"
-          @click="openItem(item)"
         >
-          {{ item.snippet || '附件' }}
-        </button>
+          <button type="button" class="bookmark-open" @click="openItem(item)">
+            {{ item.snippet || '附件' }}
+          </button>
+          <input
+            v-model="noteDraft[`${item.conversation_id}:${item.message_id}`]"
+            class="bookmark-note"
+            maxlength="200"
+            placeholder="备注"
+            @change="saveNote(item)"
+          />
+        </div>
+        <div v-if="conversation.items.length >= 2" class="bookmark-range">
+          <span>从这条到那条</span>
+          <select v-model="rangeFrom[conversation.id]">
+            <option v-for="item in orderedPins(conversation)" :key="`from-${item.message_id}`" :value="String(item.seq || '')">
+              {{ item.snippet || '附件' }}
+            </option>
+          </select>
+          <select v-model="rangeTo[conversation.id]">
+            <option v-for="item in orderedPins(conversation)" :key="`to-${item.message_id}`" :value="String(item.seq || '')">
+              {{ item.snippet || '附件' }}
+            </option>
+          </select>
+          <button type="button" @click="copyRange(conversation)">复制</button>
+          <button type="button" @click="downloadRange(conversation)">下载</button>
+        </div>
       </div>
     </section>
   </div>
@@ -143,8 +236,13 @@ onUnmounted(() => {
   font-weight: 600;
 }
 .bookmark-line {
-  display: block;
-  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.bookmark-open {
+  flex: 1;
+  min-width: 0;
   margin: 0;
   padding: var(--space-2) var(--space-3);
   border: none;
@@ -157,8 +255,39 @@ onUnmounted(() => {
   text-align: left;
   cursor: pointer;
 }
-.bookmark-line:hover {
+.bookmark-open:hover {
   background: var(--surface-2);
   color: var(--text-primary);
+}
+.bookmark-note {
+  width: 160px;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+}
+.bookmark-note:focus {
+  outline: none;
+  color: var(--text-primary);
+}
+.bookmark-range {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
+.bookmark-range select,
+.bookmark-range button {
+  border: none;
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  border-radius: var(--radius-md);
+  padding: 4px 8px;
+  cursor: pointer;
 }
 </style>

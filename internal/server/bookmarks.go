@@ -3,7 +3,9 @@ package server
 import (
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 )
@@ -21,6 +23,7 @@ type bookmarkIndexResponse struct {
 	Title          string `json:"title"`
 	ProjectPath    string `json:"project_path"`
 	Snippet        string `json:"snippet"`
+	Note           string `json:"note,omitempty"`
 	Seq            int64  `json:"seq,omitempty"`
 	CreatedAt      int64  `json:"created_at"`
 }
@@ -50,6 +53,7 @@ func (h *Handler) ListAllBookmarks(c *gin.Context) {
 			Title:          hit.Title,
 			ProjectPath:    hit.ProjectPath,
 			Snippet:        hit.Snippet,
+			Note:           hit.Note,
 			Seq:            hit.Seq,
 			CreatedAt:      hit.CreatedAt.Unix(),
 		})
@@ -128,4 +132,35 @@ func (h *Handler) ToggleBookmark(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"bookmarked": on, "message_id": messageID, "toggled_at": time.Now().Unix()})
+}
+
+// UpdateBookmarkNote stores a short note on an existing pin.
+func (h *Handler) UpdateBookmarkNote(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	id := c.Param("id")
+	messageID, err := strconv.ParseInt(c.Param("message_id"), 10, 64)
+	if err != nil || messageID <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "message_id is required"})
+		return
+	}
+	var body struct {
+		Note string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid json"})
+		return
+	}
+	note := strings.TrimSpace(body.Note)
+	if utf8.RuneCountInString(note) > 200 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "备注不能超过 200 字"})
+		return
+	}
+	if err := h.store.UpdateBookmarkNote(id, messageID, note); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "bookmark not found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "message_id": messageID, "note": note})
 }

@@ -39,6 +39,7 @@ const emit = defineEmits<{
 
 const message = useMessage()
 const bookmarkItems = ref<api.BookmarkIndexItem[]>([])
+const bookmarkNotes = ref<Record<string, string>>({})
 const bookmarkLoading = ref(false)
 
 async function loadBookmarkIndex() {
@@ -46,6 +47,9 @@ async function loadBookmarkIndex() {
   try {
     const resp = await api.listAllBookmarks()
     bookmarkItems.value = resp.bookmarks || []
+    const notes: Record<string, string> = {}
+    for (const item of bookmarkItems.value) notes[`${item.conversation_id}:${item.message_id}`] = item.note || ''
+    bookmarkNotes.value = notes
   } catch {
     bookmarkItems.value = []
   } finally {
@@ -59,6 +63,21 @@ async function openBookmark(item: api.BookmarkIndexItem) {
   } catch (err: unknown) {
     const text = err instanceof Error ? err.message : String(err)
     message.error(text || '无法打开书签')
+  }
+}
+
+async function saveBookmarkNote(item: api.BookmarkIndexItem) {
+  const key = `${item.conversation_id}:${item.message_id}`
+  const note = (bookmarkNotes.value[key] || '').trim()
+  if ([...note].length > 200) {
+    message.error('备注最多 200 字')
+    return
+  }
+  try {
+    await api.updateBookmarkNote(item.conversation_id, item.message_id, note)
+    bookmarkNotes.value[key] = note
+  } catch (err: unknown) {
+    message.error(err instanceof Error ? err.message : '备注保存失败')
   }
 }
 const tab = ref<'session' | 'project'>('session')
@@ -255,11 +274,20 @@ async function openTerminal() {
   }
 }
 
+const adoptAlsoSwitch = ref(false)
+
 async function adoptCompare(variant: api.StyleCompareVariant) {
   const id = state.currentID
   if (!id || !variant.text) return
   try {
     await api.adoptStyleCompare(id, variant.text, variant.style)
+    if (adoptAlsoSwitch.value && variant.style) {
+      const resp = await api.updateSessionMeta(id, { style: variant.style })
+      state.sessionMeta[id] = {
+        ...(state.sessionMeta[id] || {}),
+        style: resp.style ?? variant.style,
+      }
+    }
     clearStyleCompare()
     await refreshLatestMessages(id)
   } catch (err: any) {
@@ -381,12 +409,16 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
             <div class="section-label">换种说法</div>
             <button type="button" class="bookmark-refresh" @click="clearStyleCompare">关闭</button>
           </div>
-          <div v-if="styleCompareState.loading" class="section-text">另外两种风格正在写…</div>
+          <div v-if="styleCompareState.loading" class="section-text">正在换种说法…</div>
           <div v-else-if="styleCompareState.error" class="section-text">{{ styleCompareState.error }}</div>
           <div v-for="variant in styleCompareState.variants" :key="variant.style" class="compare-card">
             <div class="section-title">{{ variant.label }}</div>
             <div v-if="variant.error" class="section-text">{{ variant.error }}</div>
             <div v-else class="section-text compare-text">{{ variant.text }}</div>
+            <label v-if="variant.text" class="compare-adopt">
+              <input v-model="adoptAlsoSwitch" type="checkbox" />
+              <span>本会话改用这个风格</span>
+            </label>
             <button
               v-if="variant.text"
               type="button"
@@ -636,19 +668,26 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
             <button type="button" class="bookmark-refresh" :disabled="bookmarkLoading" @click="loadBookmarkIndex">刷新</button>
           </div>
           <div v-if="!projectBookmarks.length" class="section-text">{{ state.activeProjectPath ? '这个项目还没有书签' : '全局会话还没有书签' }}</div>
-          <button
+          <div
             v-for="item in projectBookmarks"
             :key="`${item.conversation_id}-${item.message_id}`"
-            type="button"
             class="bookmark-row"
-            @click="openBookmark(item)"
           >
-            <Bookmark :size="13" />
-            <span class="bookmark-copy">
-              <span class="bookmark-where">{{ item.title || '未命名对话' }}</span>
-              <span class="bookmark-snippet">{{ item.snippet || '附件' }}</span>
-            </span>
-          </button>
+            <button type="button" class="bookmark-open" @click="openBookmark(item)">
+              <Bookmark :size="13" />
+              <span class="bookmark-copy">
+                <span class="bookmark-where">{{ item.title || '未命名对话' }}</span>
+                <span class="bookmark-snippet">{{ item.snippet || '附件' }}</span>
+              </span>
+            </button>
+            <input
+              v-model="bookmarkNotes[`${item.conversation_id}:${item.message_id}`]"
+              class="bookmark-note"
+              maxlength="200"
+              placeholder="备注"
+              @change="saveBookmarkNote(item)"
+            />
+          </div>
         </section>
         <section class="section">
           <div class="section-label">AGENTS.md</div>
@@ -910,18 +949,35 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 .bookmark-refresh:hover { color: var(--text-primary); }
 .bookmark-row {
   display: flex;
-  align-items: flex-start;
-  gap: var(--space-2);
+  flex-direction: column;
+  gap: 4px;
   width: 100%;
   margin-top: var(--space-2);
   padding: 0 0 var(--space-2);
-  border: none;
   border-bottom: 1px solid var(--border-subtle);
+}
+.bookmark-open {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
   background: transparent;
   color: var(--text-secondary);
   text-align: left;
   cursor: pointer;
 }
+.bookmark-note {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 12px;
+}
+.bookmark-note:focus { outline: none; color: var(--text-primary); }
 .bookmark-row:last-child { border-bottom: none; padding-bottom: 0; }
 .bookmark-copy {
   min-width: 0;
@@ -1319,6 +1375,13 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 }
 .compare-text {
   white-space: pre-wrap;
+}
+.compare-adopt {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-tertiary);
+  font-size: 12px;
 }
 @media (max-width: 1040px) {
   .inspector {

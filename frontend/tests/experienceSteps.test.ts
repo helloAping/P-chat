@@ -5,10 +5,11 @@ import test from 'node:test'
 import { galleryMedia } from '../src/utils/attachmentArtifacts.ts'
 import {
   buildGlobalCommands,
+  directShortcut,
   filterGlobalCommands,
   isCommandPaletteShortcut,
 } from '../src/utils/globalCommands.ts'
-import { buildMinimapMarks } from '../src/utils/sessionMinimap.ts'
+import { buildBookmarkMarks, buildMinimapMarks } from '../src/utils/sessionMinimap.ts'
 import { buildTurnSummary, resolveTurnPath, turnFileLabel } from '../src/utils/turnSummary.ts'
 import type { Message } from '../src/api/client.ts'
 
@@ -17,6 +18,13 @@ test('command palette shortcut ignores shifted and composing keys', () => {
   assert.equal(isCommandPaletteShortcut({ key: 'K', ctrlKey: false, metaKey: true, altKey: false, shiftKey: false }), true)
   assert.equal(isCommandPaletteShortcut({ key: 'k', ctrlKey: true, metaKey: false, altKey: false, shiftKey: true }), false)
   assert.equal(isCommandPaletteShortcut({ key: 'k', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false, isComposing: true }), false)
+})
+
+test('direct shortcuts are Ctrl+N and Ctrl+B, and ignore composing', () => {
+  assert.equal(directShortcut({ key: 'n', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }), 'new-chat')
+  assert.equal(directShortcut({ key: 'b', ctrlKey: false, metaKey: true, altKey: false, shiftKey: false }), 'sidebar')
+  assert.equal(directShortcut({ key: 'n', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false, isComposing: true }), null)
+  assert.equal(directShortcut({ key: 'k', ctrlKey: true, metaKey: false, altKey: false, shiftKey: false }), null)
 })
 
 test('command palette filters and disables continue when there is no prior chat', () => {
@@ -30,6 +38,17 @@ test('command palette filters and disables continue when there is no prior chat'
   assert.equal(commands.find(item => item.id === 'sidebar')?.label, '折叠侧栏')
   assert.equal(commands.find(item => item.id === 'theme')?.label, '切换到浅色')
   assert.deepEqual(filterGlobalCommands(commands, '检查').map(item => item.id), ['inspector'])
+})
+
+test('bookmark marks stay off the rail when there are no pins', () => {
+  assert.deepEqual(buildBookmarkMarks([], [1, 2]), [])
+  const marks = buildBookmarkMarks(
+    [{ messageId: 9, seq: 4, tip: '这里' }],
+    [1, 8],
+  )
+  assert.equal(marks.length, 1)
+  assert.equal(marks[0]?.kind, 'bookmark')
+  assert.equal(marks[0]?.messageId, 9)
 })
 
 test('turn summary lists written paths and skips dry runs', () => {

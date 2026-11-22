@@ -32,6 +32,22 @@ export function isCommandPaletteShortcut(event: {
   return event.key === 'k' || event.key === 'K'
 }
 
+export function directShortcut(event: {
+  key: string
+  ctrlKey: boolean
+  metaKey: boolean
+  altKey: boolean
+  shiftKey: boolean
+  isComposing?: boolean
+}): 'new-chat' | 'sidebar' | null {
+  if (event.isComposing) return null
+  if (event.altKey || event.shiftKey) return null
+  if (!event.ctrlKey && !event.metaKey) return null
+  if (event.key === 'n' || event.key === 'N') return 'new-chat'
+  if (event.key === 'b' || event.key === 'B') return 'sidebar'
+  return null
+}
+
 export function buildGlobalCommands(ctx: GlobalCommandContext): GlobalCommand[] {
   const continueTitle = (ctx.continueTitle || '').trim()
   return [

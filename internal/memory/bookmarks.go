@@ -75,6 +75,7 @@ type BookmarkHit struct {
 	Title          string
 	ProjectPath    string
 	Snippet        string
+	Note           string
 	Seq            int64
 	CreatedAt      time.Time
 }
@@ -93,7 +94,7 @@ func (s *Store) ListAllBookmarks() ([]BookmarkHit, error) {
 		return nil, nil
 	}
 	rows, err := s.db.Query(`
-		SELECT b.message_id, b.conversation_id, b.created_at,
+		SELECT b.message_id, b.conversation_id, b.created_at, b.note,
 		       COALESCE(c.title, ''),
 		       COALESCE(json_extract(c.metadata, '$.project_path'), ''),
 		       COALESCE(m.content, ''),
@@ -110,7 +111,7 @@ func (s *Store) ListAllBookmarks() ([]BookmarkHit, error) {
 	for rows.Next() {
 		var hit BookmarkHit
 		var created int64
-		if err := rows.Scan(&hit.MessageID, &hit.ConversationID, &created, &hit.Title, &hit.ProjectPath, &hit.Snippet, &hit.Seq); err != nil {
+		if err := rows.Scan(&hit.MessageID, &hit.ConversationID, &created, &hit.Note, &hit.Title, &hit.ProjectPath, &hit.Snippet, &hit.Seq); err != nil {
 			return nil, err
 		}
 		hit.CreatedAt = time.Unix(created, 0)
@@ -218,4 +219,27 @@ func (s *Store) ToggleBookmark(conversationID string, messageID int64) (bool, er
 		return false, err
 	}
 	return true, nil
+}
+
+// UpdateBookmarkNote replaces the note on an existing pin.
+// A missing pin is an error so the caller can return 404.
+func (s *Store) UpdateBookmarkNote(conversationID string, messageID int64, note string) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("memory store not available")
+	}
+	res, err := s.db.Exec(
+		`UPDATE message_bookmarks SET note = ? WHERE conversation_id = ? AND message_id = ?`,
+		note, conversationID, messageID,
+	)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return fmt.Errorf("bookmark not found")
+	}
+	return nil
 }

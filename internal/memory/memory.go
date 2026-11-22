@@ -2185,7 +2185,9 @@ func (s *Store) getMessagesFullByID(sessionID string, fromSeq, toSeq int64) []Me
 	// ASC-ordered result, matching the REPL path's
 	// semantics: a very long session exports the most
 	// recent N messages, not a random middle slice.
-	if limit > 0 && len(rowsList) > limit {
+	// An explicit bookmark window keeps both ends. The recent-history
+	// cap only applies to a whole-session export.
+	if (fromSeq == 0 || toSeq == 0) && limit > 0 && len(rowsList) > limit {
 		rowsList = rowsList[len(rowsList)-limit:]
 	}
 

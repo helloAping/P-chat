@@ -298,6 +298,8 @@ export interface Message {
   // post-stream redactor may rewrite this if the LLM
   // produced a phantom error in the thinking block.
   thinking?: string
+  // Plan kept on the user message that started the turn. History keeps this copy.
+  turn_todos?: TodoItem[]
   created_at?: number
   tool_call_id?: string
   name?: string
@@ -534,6 +536,7 @@ export interface BookmarkIndexItem {
   title: string
   project_path: string
   snippet: string
+  note?: string
   seq?: number
   created_at: number
 }
@@ -557,6 +560,12 @@ export const toggleBookmark = (id: string, messageID: number) =>
     { method: 'POST' },
   )
 
+export const updateBookmarkNote = (id: string, messageID: number, note: string) =>
+  jsonFetch<{ ok: boolean; message_id: number; note: string }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks/${messageID}`,
+    { method: 'PATCH', body: JSON.stringify({ note }) },
+  )
+
 export interface StyleCompareVariant {
   style: string
   label: string
@@ -564,10 +573,10 @@ export interface StyleCompareVariant {
   error?: string
 }
 
-export const styleCompare = (id: string, text: string) =>
+export const styleCompare = (id: string, text: string, styles?: string[]) =>
   jsonFetch<{ source: string; current: string; variants: StyleCompareVariant[] }>(
     `/api/v1/sessions/${encodeURIComponent(id)}/style-compare`,
-    { method: 'POST', body: JSON.stringify({ text }) },
+    { method: 'POST', body: JSON.stringify({ text, ...(styles && styles.length ? { styles } : {}) }) },
   )
 
 export const adoptStyleCompare = (id: string, text: string, style: string) =>
@@ -1204,6 +1213,12 @@ export const updateStyle = (id: string, req: UpdateStyleRequest) =>
   jsonFetch<{ ok: boolean; id: string }>(`/api/v1/styles/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     body: JSON.stringify(req),
+  })
+
+export const deleteStyleMemoryLine = (id: string, line: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/styles/${encodeURIComponent(id)}/memory-line/delete`, {
+    method: 'POST',
+    body: JSON.stringify({ line }),
   })
 
 export const deleteStyle = (id: string) =>

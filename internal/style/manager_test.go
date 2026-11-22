@@ -252,3 +252,29 @@ func TestAppendMemoryOnBuiltinAndCreateStyle(t *testing.T) {
 		t.Fatalf("new memory = %q %v", got, err)
 	}
 }
+
+func TestDeleteMemoryLineKeepsPromptAndOtherText(t *testing.T) {
+	db := testDB(t)
+	m, err := NewManager(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE styles SET memory = ? WHERE id = 'tech'`, "手写段落\n- 删我\n- 留下"); err != nil {
+		t.Fatal(err)
+	}
+	promptBefore, _ := m.GetSystemPrompt(Tech)
+	if err := m.DeleteMemoryLine("tech", "- 删我"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteMemoryLine("tech", "- 不存在"); err != nil {
+		t.Fatal(err)
+	}
+	mem, err := m.GetMemory(Tech)
+	if err != nil || mem != "手写段落\n- 留下" {
+		t.Fatalf("memory = %q %v", mem, err)
+	}
+	promptAfter, _ := m.GetSystemPrompt(Tech)
+	if promptAfter != promptBefore {
+		t.Fatalf("prompt changed")
+	}
+}

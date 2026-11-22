@@ -130,7 +130,7 @@ function onKeydown(event: KeyboardEvent) {
         </button>
         <div v-if="!filtered.length" class="palette-empty">没有匹配的命令</div>
       </div>
-      <div class="palette-foot">上下键选择 · Enter 执行 · Esc 关闭 · Ctrl+K 开关</div>
+      <div class="palette-foot">Ctrl+N 新建 · Ctrl+B 侧栏 · 上下键选择 · Enter 执行 · Esc 关闭 · Ctrl+K 开关</div>
     </div>
   </div>
 </template>

@@ -93,11 +93,13 @@
 
 ### 1.8 本地生命感
 
-- 风格记忆：`remember` 不单独建事实表。用户在确认框里选择已有风格（含内置人格）后，事实追加到该风格的 `styles.memory`；也可以填一个新名字，据此新建风格并把事实作为它的记忆。拒绝或未选择都不写。当前会话仍通过原来的风格记忆注入读到它。
-- 风格对照：输入区「换种说法」对当前句子用另外两种人格各做一次无工具补全，结果在检查器里。点「采用」才写成一条普通助手消息。
-- 回合回放：文件和命令摘要写入 `turn_changes`，重启后气泡仍能展开。字节快照仍只留在内存日记的最近 5 轮里。最近一轮的文件竖向列在对话末尾，撤销只作用于这一轮。
+- 风格记忆：`remember` 不单独建事实表。用户在确认框里选择已有风格（含内置人格）后，事实追加到该风格的 `styles.memory`；也可以填一个新名字，据此新建风格并把事实作为它的记忆。拒绝或未选择都不写。设置里以 `- ` 开头的条目可以单独删除，其余文字留在原处。
+- 风格对照：输入区「换种说法」可选 1–2 个已有风格做无工具补全；不选时仍用另外两种。结果在检查器里。点「采用」才写成一条普通助手消息，并可勾选改用该风格。草稿非空时可以把当前输入改写成一个风格。
+- 回合回放：文件和命令摘要写入 `turn_changes`，重启后气泡仍能展开。字节快照仍只留在内存日记的最近 5 轮里。最近一轮的文件竖向列在对话末尾，撤销只作用于这一轮。更早的「本回合」写明只能看。
+- 书签：备注最长 200 字，在设置和检查器里改。导轨在用户回合之外为书签再画一种刻度。同一对话可以按两条书签的序号导出 Markdown，整段导出不变。
+- 快捷键：`Ctrl+K` 打开命令面板。`Ctrl+N` 新建当前项目对话，`Ctrl+B` 折叠或展开侧栏。
 - 晨报和全局记忆卡片已移除。曾经生成过的 `user_memories` / `morning_digests` 表在升级到 V25 时删除。
-- 后续补齐见 [`docs/plans/local-life-followups.md`](plans/local-life-followups.md)：自选人格的换种说法、记忆单条删除、书签备注与范围导出、回合撤销边界、`Ctrl+N` / `Ctrl+B`。流式工具参数与 `Ctrl+K` 命令面板已落地，不在该计划里重做。
+- 实现细节见 [`docs/plans/local-life-followups.md`](plans/local-life-followups.md)。流式工具参数与 `Ctrl+K` 命令面板已落地，不在该计划里重做。
 
 ## 2. 可迭代任务明细
 
@@ -210,10 +212,10 @@
 |---|---|---|---|---|---|---|
 | SM-01 | 搜索结果跳转高亮（已落地） | 点击搜索结果定位到具体消息。 | `frontend/src/components/SessionSidebar.vue:314-317`（只 switchSession）、`internal/server/sessions.go:69-108`、`internal/memory/memory.go:3449-3477`（已返回 message_id）。 | switchSession 后按 message_id/seq 拉页定位，`ChatWindow` 滚动到 `[data-msg-id]` 并短暂高亮。 | API 已具备定位信息，前端只差滚动与高亮。 | 点击结果后目标消息可见且高亮；跨分页会话也能定位。 |
 | SM-02 | 会话标签 / 分组 | 用户自定义标签组织会话。 | `SessionSidebar.vue:128-158`（仅时间分组）、`internal/memory/migrations.go`（无 tags 列）。 | `conversations.metadata` 或新表存 tags；侧栏筛选 + PATCH meta；走 `internal/upgrade/`。 | 组织维度只有时间 + 本机置顶。 | 标签增删改查；筛选即时生效；升级迁移幂等。 |
-| SM-03 | 全局快捷键（部分落地） | `Ctrl+K` 已打开命令面板（新建、继续、项目、侧栏、检查器、主题）。直接键 `Ctrl+N` / `Ctrl+B` 仍未绑。 | `frontend/src/utils/globalCommands.ts`、`App.vue` `onGlobalKeydown`。 | 见 [`local-life-followups.md`](plans/local-life-followups.md) P6。 | 面板已覆盖发现；缺两条不打开面板也能用的键。 | `Ctrl+N` 新建、`Ctrl+B` 折叠侧栏；`Ctrl+K` 行为不变。 |
+| SM-03 | 全局快捷键（已落地） | `Ctrl+K` 打开命令面板。`Ctrl+N` 新建当前项目对话，`Ctrl+B` 折叠或展开侧栏。输入法组合中不触发。 | `frontend/src/utils/globalCommands.ts`、`App.vue` `onGlobalKeydown`。 | 见 [`local-life-followups.md`](plans/local-life-followups.md) P6。 | 面板负责发现，这两条键不经过面板。 | `Ctrl+N` 新建、`Ctrl+B` 折叠侧栏；`Ctrl+K` 行为不变。 |
 | SM-04 | 消息赞 / 踩反馈 | 标记回复质量，沉淀本地信号。 | `MessageBubble.vue` 操作区、`messages` schema（无 feedback 列）。 | 消息 meta 或旁表存 rating；气泡按钮；可选汇总到诊断。 | 无法标记好/坏回复，提示优化无数据。 | 反馈持久化；可按会话导出。 |
 | SM-05 | 置顶服务端持久化 | 置顶状态跨设备/重装保留。 | `SessionSidebar.vue:95-125`（localStorage，注释承认跨浏览器不同步）。 | `conversations.pinned` 或 metadata；与现有菜单对齐。 | 清 WebView 数据/换机后置顶丢失。 | 重装后顺序保留；多客户端一致。 |
-| SM-06 | 消息书签 + 范围导出（书签已落地） | 钉住、跳转、按项目浏览已落地。`note` 列写入时空字符串。导出仍是整段会话。 | `internal/memory/bookmarks.go`、`internal/server/export.go`、`BookmarkSettings.vue`。 | 见 [`local-life-followups.md`](plans/local-life-followups.md) P3、P4。 | 备注和「从这条书签到那条」的 Markdown 还未做。 | 备注可改；`from_seq/to_seq` 的 Markdown 含两端；整段导出不变。 |
+| SM-06 | 消息书签 + 范围导出（已落地） | 钉住、跳转、按项目浏览、200 字备注、导轨书签刻度已落地。同一对话可按两条书签导出 Markdown。 | `internal/memory/bookmarks.go`、`internal/server/export.go`、`BookmarkSettings.vue`、`sessionMinimap.ts`。 | 见 [`local-life-followups.md`](plans/local-life-followups.md) P3、P4。 | 备注写在设置和检查器。范围只作用于 Markdown。 | 备注可改；`from_seq/to_seq` 的 Markdown 含两端；整段导出不变。 |
 
 ### 2.12 CLI 能力对齐
 

@@ -31,7 +31,7 @@ import DownloadDock from './components/DownloadDock.vue'
 import GlobalCommandPalette from './components/GlobalCommandPalette.vue'
 import { loadSessions, loadProviders, loadProjects, createSession, switchSession, state as chatState } from './stores/chat'
 import { pickContinueSession } from './utils/continueSession'
-import { buildGlobalCommands, isCommandPaletteShortcut } from './utils/globalCommands'
+import { buildGlobalCommands, directShortcut, isCommandPaletteShortcut } from './utils/globalCommands'
 import { setupTrayEventListeners } from './utils/trayEvents'
 
 const showAppSettings = ref(false)
@@ -346,6 +346,14 @@ const paletteCommands = computed(() => {
 })
 
 function onGlobalKeydown(event: KeyboardEvent) {
+  const direct = directShortcut(event)
+  if (direct) {
+    event.preventDefault()
+    event.stopPropagation()
+    if (direct === 'new-chat') void createSession()
+    else toggleSidebar()
+    return
+  }
   if (isCommandPaletteShortcut(event)) {
     event.preventDefault()
     event.stopPropagation()

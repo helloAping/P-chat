@@ -2,8 +2,11 @@ package memory
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
+
+	"github.com/p-chat/pchat/internal/llm"
 )
 
 // TurnChange is one persisted file or command touch from an agent turn.
@@ -122,4 +125,50 @@ func (s *Store) LatestAssistantMessageID(conversationID string) int64 {
 		return 0
 	}
 	return id
+}
+
+// LatestVisibleUserMessageID is the newest user row that the transcript shows.
+// Hidden resume rows are skipped so a todo snapshot stays on the message the user sent.
+func (s *Store) LatestVisibleUserMessageID(conversationID string) int64 {
+	if s == nil || s.db == nil || conversationID == "" {
+		return 0
+	}
+	_ = s.Flush()
+	rows, err := s.db.Query(
+		`SELECT id, COALESCE(metadata, '') FROM messages WHERE conversation_id = ? AND role = ? ORDER BY id DESC LIMIT 12`,
+		conversationID, llm.RoleUser,
+	)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id int64
+		var meta string
+		if err := rows.Scan(&id, &meta); err != nil {
+			return 0
+		}
+		if searchMessageHidden(meta, llm.RoleUser, "") {
+			continue
+		}
+		return id
+	}
+	return 0
+}
+
+// StampTurnTodos stores one plan on the user message that started the turn.
+// The session table still holds only the live plan. This copy stays after that plan is cleared.
+func (s *Store) StampTurnTodos(conversationID string, todos []TodoItem) error {
+	if s == nil || len(todos) == 0 {
+		return nil
+	}
+	id := s.LatestVisibleUserMessageID(conversationID)
+	if id == 0 {
+		return nil
+	}
+	raw, err := json.Marshal(todos)
+	if err != nil {
+		return err
+	}
+	return s.MergeMessageMeta(id, map[string]string{"turn_todos": string(raw)})
 }

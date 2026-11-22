@@ -177,6 +177,7 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		api.POST("/styles", h.CreateStyle)
 		api.GET("/styles/:id", h.GetStyle)
 		api.PATCH("/styles/:id", h.UpdateStyle)
+		api.POST("/styles/:id/memory-line/delete", h.DeleteStyleMemoryLine)
 		api.DELETE("/styles/:id", h.DeleteStyle)
 		// stylegen: generate / optimize an AI style from the current
 		// conversation. POST submits a background job (202 {job_id}),
@@ -278,6 +279,7 @@ func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *m
 		api.GET("/sessions/:id/bookmarks", h.ListBookmarks)
 		api.GET("/sessions/:id/user-turns", h.ListUserTurns)
 		api.POST("/sessions/:id/bookmarks/:message_id", h.ToggleBookmark)
+		api.PATCH("/sessions/:id/bookmarks/:message_id", h.UpdateBookmarkNote)
 		// P1-3 / P1-4: regenerate the assistant reply for a
 		// given user message. P1-3 physically deleted
 		// everything after that user message; P1-4

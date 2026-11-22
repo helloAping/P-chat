@@ -238,6 +238,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 		_ = memStore.SaveTodos(sessionID, memTodos)
 	}
+	tool.SnapshotTurnTodos = func(sessionID string, todos []tool.TodoItem) {
+		memTodos := make([]memory.TodoItem, len(todos))
+		for i, t := range todos {
+			memTodos[i] = memory.TodoItem{ID: t.ID, Content: t.Content, Status: t.Status}
+		}
+		_ = memStore.StampTurnTodos(sessionID, memTodos)
+	}
 
 	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
 	generatedStore := generation.NewLocalAssetStore(paths.GeneratedDir(), "/api/v1/generated")

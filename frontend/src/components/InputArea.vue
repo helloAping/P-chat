@@ -9,6 +9,7 @@
 import { h, onMounted, onUnmounted, ref, computed, watch, nextTick } from 'vue'
 import { NInput, NButton, NSpace, NScrollbar, NPopover, NTooltip, NDropdown, NSelect, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
+import HeaderCat from './HeaderCat.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
   Paperclip, Send, Square, Clipboard, Volume2, Hammer,
@@ -176,14 +177,46 @@ async function togglePlanMode() {
   await setTurnModePolicy(nextTurnModePolicy(turnModePolicy.value))
 }
 
+const showStyleCompare = ref(false)
+const compareStyleIDs = ref<string[]>([])
+
+const compareStyleOptions = computed(() => styleOptions.value.filter(option => option.value !== 'off'))
+
+function toggleCompareStyle(id: string) {
+  const selected = compareStyleIDs.value
+  if (selected.includes(id)) {
+    compareStyleIDs.value = selected.filter(item => item !== id)
+    return
+  }
+  if (selected.length >= 2) return
+  compareStyleIDs.value = [...selected, id]
+}
+
 async function onStyleCompare() {
   const id = state.currentID
   if (!id || isStreaming.value) return
+  showStyleCompare.value = false
   window.dispatchEvent(new Event('pchat:open-inspector'))
   try {
-    await runStyleCompare(id, inputText.value.trim())
+    await runStyleCompare(id, inputText.value.trim(), compareStyleIDs.value)
   } catch (err: any) {
     message.error(err?.message || '换种说法失败')
+  }
+}
+
+async function onRewriteDraft() {
+  const id = state.currentID
+  const original = inputText.value
+  if (!id || isStreaming.value || !original.trim() || compareStyleIDs.value.length !== 1) return
+  showStyleCompare.value = false
+  try {
+    const resp = await api.styleCompare(id, original.trim(), compareStyleIDs.value)
+    const text = resp.variants?.[0]?.text || ''
+    if (!text) throw new Error(resp.variants?.[0]?.error || '没有改写结果')
+    inputText.value = text
+  } catch (err: any) {
+    inputText.value = original
+    message.error(err?.message || '改写草稿失败')
   }
 }
 
@@ -2033,6 +2066,11 @@ const currentConversationBusy = computed(() =>
   currentSessionWorking.value ||
   !!state.turnQueueDraining[state.currentID],
 )
+// Composer mascot riding the input box's top edge. Always present; the
+// `working` prop tells it whether a turn is running, and it runs its own
+// sleep → wake → walk → groom → jump → goHome → sleep state machine.
+const catWorking = currentConversationBusy
+const catVisible = computed(() => !!state.currentID)
 // 队列 draining 本身属于 currentConversationBusy，用于输入区状态。
 // Queue draining is itself part of currentConversationBusy for composer UI.
 // 监听该聚合状态会让 drain 完成后再次触发 drain。
@@ -2522,16 +2560,50 @@ watch([() => state.currentID, queueSignature], () => {
 		          <component :is="turnModeIcon" :size="13" />
 		          <span class="ctrl-btn-label">{{ turnModeLabel }}</span>
 		        </button>
-        <button
-          type="button"
-          class="scene-capsule"
+        <NPopover
+          v-model:show="showStyleCompare"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
           :disabled="!state.currentID || isStreaming"
-          title="用另外两种风格重写当前这句话，采用后才写入会话"
-          @click="onStyleCompare"
+          style="padding: 0; background: transparent; box-shadow: none;"
         >
-          <Palette :size="13" />
-          <span class="ctrl-btn-label">换种说法</span>
-        </button>
+          <template #trigger>
+            <button
+              type="button"
+              class="scene-capsule"
+              :disabled="!state.currentID || isStreaming"
+              title="选一种或两种风格对照，或用一种风格改写草稿"
+            >
+              <Palette :size="13" />
+              <span class="ctrl-btn-label">换种说法</span>
+            </button>
+          </template>
+          <div class="perm-popover perm-popover--compare" role="listbox" aria-label="换种说法">
+            <div class="perm-popover-label">换种说法</div>
+            <button
+              v-for="opt in compareStyleOptions"
+              :key="opt.value"
+              type="button"
+              class="perm-popover-item"
+              :class="{ 'perm-popover-item--active': compareStyleIDs.includes(opt.value) }"
+              @click="toggleCompareStyle(opt.value)"
+            >
+              <span class="perm-popover-radio" />
+              <span class="perm-popover-name">{{ opt.label }}</span>
+            </button>
+            <div class="style-compare-actions">
+              <button type="button" class="scene-capsule" @click="onStyleCompare">对照</button>
+              <button
+                type="button"
+                class="scene-capsule"
+                :disabled="!inputText.trim() || compareStyleIDs.length !== 1"
+                title="选一个风格，把结果填回输入框"
+                @click="onRewriteDraft"
+              >改写草稿</button>
+            </div>
+          </div>
+        </NPopover>
     </div>
   </div>
 
@@ -2696,6 +2768,12 @@ watch([() => state.currentID, queueSignature], () => {
       @dragleave="onDragLeave"
       @drop="onDrop"
     >
+      <!-- Composer mascot riding the input box's top-left edge. Runs the
+           sleep → wake → walk → groom → jump → goHome → sleep cycle based
+           on whether a turn is running. Feet straddle the top border. -->
+      <span v-if="catVisible" class="composer-cat" aria-hidden="true">
+        <HeaderCat :working="catWorking" />
+      </span>
       <div class="input-row">
         <textarea
           ref="inputEl"
@@ -3177,7 +3255,34 @@ watch([() => state.currentID, queueSignature], () => {
  * sit on top of the textarea with no gap (the strip's bottom
  * padding + textarea's top margin provides the spacing, and
  * the box's outer border wraps both). */
+/* Idle/empty mascot riding the input box's top-left border: vertically
+ * centered on the border line so the toolbar pills floating above the
+ * composer never cover it. Body straddles the edge (half in, half out). */
+.composer-cat {
+  position: absolute;
+  /* Span the whole input box width so the walking lane reaches both
+   * edges; the cat walks back and forth inside and never leaves the box.
+   * transform lifts the lane so the cat's body straddles the top border. */
+  left: var(--space-3);
+  right: var(--space-3);
+  top: 0;
+  transform: translateY(-50%);
+  height: 14px;
+  z-index: 4;
+  pointer-events: none;
+  /* No overflow clip: the jump frames rise above the lane and must not
+   * be cut. Horizontal containment is enforced by the walk logic, which
+   * clamps the cat's center to [walkMin, walkMax] inside this lane. */
+}
+.composer-cat :deep(.header-cat) {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 14px;
+}
 .input-wrap {
+  position: relative;
   background: var(--surface-input, var(--surface-1));
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
@@ -4153,6 +4258,20 @@ watch([() => state.currentID, queueSignature], () => {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.perm-popover--compare {
+  width: max-content;
+  min-width: 196px;
+  max-width: 280px;
+}
+.style-compare-actions {
+  display: flex;
+  gap: var(--space-1);
+  padding: var(--space-1) 2px 2px;
+}
+.style-compare-actions .scene-capsule {
+  flex: 1;
+  justify-content: center;
 }
 .perm-popover-label {
   font-size: 10.5px;

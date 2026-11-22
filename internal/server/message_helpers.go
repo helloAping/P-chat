@@ -200,6 +200,9 @@ func mergeUserAttachmentRows(msgs []MessageResponse) []MessageResponse {
 			if strings.TrimSpace(prev.Content) == "" && strings.TrimSpace(msg.Content) != "" {
 				prev.Content = msg.Content
 			}
+			if len(prev.TurnTodos) == 0 && len(msg.TurnTodos) > 0 {
+				prev.TurnTodos = msg.TurnTodos
+			}
 			continue
 		}
 		merged = append(merged, msg)
@@ -929,6 +932,7 @@ func applyUsageMeta(resp *MessageResponse, raw string) {
 	if v, ok := meta["elapsed"].(string); ok {
 		resp.Elapsed = strings.TrimSpace(v)
 	}
+	applyTurnTodos(resp, meta)
 	reported := false
 	switch v := meta["cache_reported"].(type) {
 	case bool:
@@ -945,6 +949,29 @@ func applyUsageMeta(resp *MessageResponse, raw string) {
 	miss, _ := metaInt(meta, "cache_miss_tokens")
 	resp.CacheHitTokens = &hit
 	resp.CacheMissTokens = &miss
+}
+
+func applyTurnTodos(resp *MessageResponse, meta map[string]any) {
+	raw, ok := meta["turn_todos"]
+	if !ok || raw == nil {
+		return
+	}
+	var payload []byte
+	switch v := raw.(type) {
+	case string:
+		payload = []byte(v)
+	default:
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return
+		}
+		payload = encoded
+	}
+	var items []TurnTodo
+	if err := json.Unmarshal(payload, &items); err != nil || len(items) == 0 {
+		return
+	}
+	resp.TurnTodos = items
 }
 
 func metaInt(meta map[string]any, key string) (int, bool) {

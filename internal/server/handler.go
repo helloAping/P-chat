@@ -790,6 +790,15 @@ type MessageResponse struct {
 	// reloaded assistant bubble shows the same footer time as the
 	// live done event.
 	Elapsed string `json:"elapsed,omitempty"`
+	// TurnTodos is the plan snapshot for the user message that started the turn.
+	TurnTodos []TurnTodo `json:"turn_todos,omitempty"`
+}
+
+// TurnTodo is one item of a plan kept on the user message.
+type TurnTodo struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
+	Status  string `json:"status"`
 }
 
 // MessagePart is one block of a structured assistant message.

@@ -171,11 +171,38 @@ const exampleActiveScene = ref<Record<string, string>>({
   memory: '编程',
 })
 
+function splitStyleMemory(raw: string): { rest: string; bullets: string[] } {
+  const bullets: string[] = []
+  const rest: string[] = []
+  for (const line of (raw || '').split('\n')) {
+    if (line.startsWith('- ')) bullets.push(line)
+    else rest.push(line)
+  }
+  return { bullets, rest: rest.join('\n').replace(/^\n+|\n+$/g, '') }
+}
+
+function composeStyleMemory(rest: string, bullets: string[]): string {
+  const prose = rest.trim()
+  const lines = bullets.join('\n')
+  if (prose && lines) return `${prose}\n${lines}`
+  return prose || lines
+}
+
+const memoryRest = ref('')
+const memoryBullets = ref<string[]>([])
+
+function applyMemoryDraft(raw: string) {
+  const split = splitStyleMemory(raw)
+  memoryRest.value = split.rest
+  memoryBullets.value = split.bullets
+  newStyleMemory.value = composeStyleMemory(split.rest, split.bullets)
+}
+
 function fillExample(field: 'prompt' | 'memory') {
   const scene = exampleActiveScene.value[field]
   const tpl = EXAMPLE_TEMPLATES[field]?.[scene] || ''
   if (field === 'prompt') newStylePrompt.value = tpl
-  else if (field === 'memory') newStyleMemory.value = tpl
+  else if (field === 'memory') applyMemoryDraft(tpl)
 }
 
 // ID 唯一性校验（仅在新增时检查，编辑时 ID 只读）
@@ -1661,6 +1688,8 @@ function resetNewStyle() {
   newStyleLabel.value = ''
   newStylePrompt.value = ''
   newStyleMemory.value = ''
+  memoryRest.value = ''
+  memoryBullets.value = []
   isEdit.value = false
   editingStyle.value = null
 }
@@ -1676,6 +1705,7 @@ async function onCreateStyle() {
     return
   }
   try {
+    newStyleMemory.value = composeStyleMemory(memoryRest.value, memoryBullets.value)
     await api.createStyle({
       id: newStyleId.value.trim(),
       label: newStyleLabel.value.trim(),
@@ -1698,7 +1728,7 @@ async function onEditStyle(id: string) {
     newStyleId.value = s.id
     newStyleLabel.value = s.label || ''
     newStylePrompt.value = s.prompt || ''
-    newStyleMemory.value = s.memory || ''
+    applyMemoryDraft(s.memory || '')
     isEdit.value = true
     showAddStyle.value = true
   } catch (e: any) {
@@ -1706,9 +1736,22 @@ async function onEditStyle(id: string) {
   }
 }
 
+async function removeMemoryBullet(index: number) {
+  const line = memoryBullets.value[index]
+  if (!line) return
+  memoryBullets.value = memoryBullets.value.filter((_, i) => i !== index)
+  if (!isEdit.value || !editingStyle.value) return
+  try {
+    await api.deleteStyleMemoryLine(editingStyle.value.id, line)
+  } catch (e: any) {
+    message.error(e?.message || '删除记忆失败')
+  }
+}
+
 async function onUpdateStyle() {
   if (!editingStyle.value) return
   try {
+    newStyleMemory.value = composeStyleMemory(memoryRest.value, memoryBullets.value)
     await api.updateStyle(editingStyle.value.id, {
       label: newStyleLabel.value,
       prompt: newStylePrompt.value,
@@ -4550,7 +4593,15 @@ function kbModelSupportsVision(scanModel: string) {
               </div>
             </NPopover>
           </div>
-          <NInput v-model:value="newStyleMemory" placeholder="背景资料、项目信息、用户偏好，每行一条"
+          <ul v-if="memoryBullets.length" class="memory-bullets">
+            <li v-for="(line, index) in memoryBullets" :key="`${line}-${index}`">
+              <span>{{ line.slice(2) }}</span>
+              <button type="button" aria-label="删除这条记忆" title="删除这条记忆" @click="removeMemoryBullet(index)">
+                <X :size="14" />
+              </button>
+            </li>
+          </ul>
+          <NInput v-model:value="memoryRest" placeholder="其余背景资料。以 - 开头的条目显示在上面，可以单独删除"
             type="textarea" :rows="5" size="small" class="editor-textarea" />
         </div>
       </div>
@@ -5554,6 +5605,31 @@ function kbModelSupportsVision(scanModel: string) {
 .editor-content { display: flex; gap: 16px; }
 .editor-col { flex: 1; display: flex; flex-direction: column; gap: 6px; }
 .editor-memory { display: flex; flex-direction: column; gap: 6px; }
+.memory-bullets {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.memory-bullets li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.memory-bullets li span { flex: 1; }
+.memory-bullets button {
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 2px;
+}
+.memory-bullets button:hover { color: var(--text-primary); }
 .editor-textarea { flex: 1; }
 .editor-actions {
   display: flex;

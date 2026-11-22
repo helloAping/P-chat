@@ -2859,8 +2859,15 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         if (payload) {
           try {
             const todos: TodoItem[] = JSON.parse(payload)
-            if (Array.isArray(todos)) {
+            if (Array.isArray(todos) && todos.length) {
               state.sessionTodos[id] = todos
+              const thread = state.sessionMessages[id] || []
+              for (let i = thread.length - 1; i >= 0; i--) {
+                if (thread[i].role === 'user') {
+                  thread[i].turn_todos = todos
+                  break
+                }
+              }
             }
           } catch { /* not JSON, ignore */ }
         }

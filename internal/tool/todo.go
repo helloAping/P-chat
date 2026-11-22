@@ -273,6 +273,10 @@ func normalizeTodoStatus(status string) string {
 // itself doesn't depend on the memory package.
 var PersistTodos func(sessionID string, todos []TodoItem)
 
+// SnapshotTurnTodos stores the full plan, including a finished one, on the
+// user message. PersistTodos drops a finished plan from the live session table.
+var SnapshotTurnTodos func(sessionID string, todos []TodoItem)
+
 type todoWriteArgs struct {
 	Todos []TodoItem `json:"todos"`
 }
@@ -289,6 +293,9 @@ func handleTodoWrite(ctx context.Context, argsRaw json.RawMessage) (*CallResult,
 	}
 	args.Todos = normalizeTodoItems(args.Todos)
 	args.Todos = mergeTodoStatusOntoPlan(GetSessionTodos(sid), args.Todos)
+	if snap := SnapshotTurnTodos; snap != nil && sid != "" && len(args.Todos) > 0 {
+		snap(sid, args.Todos)
+	}
 
 	if persist := todoPersisterFromCtx(ctx); persist != nil {
 		stored := todosForStorage(args.Todos)

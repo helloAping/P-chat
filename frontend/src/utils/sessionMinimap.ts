@@ -13,6 +13,13 @@ export interface MinimapMark {
   /** 1 = earliest (longest bar), 0 = latest. */
   span: number
   tip: string
+  kind?: 'turn' | 'bookmark'
+}
+
+export interface BookmarkMarkInput {
+  messageId: number
+  seq?: number
+  tip: string
 }
 
 const TIP_LIMIT = 80
@@ -43,5 +50,29 @@ export function buildMinimapMarks(messages: Message[]): MinimapMark[] {
     position: item.index / listSpan,
     span: 1 - order / ageSpan,
     tip: tipFor(item.message),
+    kind: 'turn' as const,
+  }))
+}
+
+/** Bookmark ticks sit beside user-turn ticks. Seq places them on the same rail. */
+export function buildBookmarkMarks(
+  bookmarks: BookmarkMarkInput[],
+  seqs: number[],
+): MinimapMark[] {
+  const pins = bookmarks.filter(item => item.messageId > 0)
+  if (!pins.length) return []
+  const scale = seqs.filter(seq => seq > 0)
+  for (const pin of pins) {
+    if ((pin.seq || 0) > 0) scale.push(pin.seq as number)
+  }
+  const min = scale.length ? Math.min(...scale) : 0
+  const max = scale.length ? Math.max(...scale) : 1
+  const span = Math.max(1, max - min)
+  return pins.map(pin => ({
+    messageId: pin.messageId,
+    position: (pin.seq || 0) > 0 ? ((pin.seq as number) - min) / span : 1,
+    span: 0.35,
+    tip: pin.tip || '书签',
+    kind: 'bookmark' as const,
   }))
 }

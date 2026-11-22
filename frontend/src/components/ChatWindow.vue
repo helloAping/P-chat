@@ -7,7 +7,6 @@ import {
 } from './icons'
 import MessageBubble from './MessageBubble.vue'
 import InputArea from './InputArea.vue'
-import TodoPanel from './TodoPanel.vue'
 import SubAgentJobsPanel from './SubAgentJobsPanel.vue'
 import StreamingBar from './StreamingBar.vue'
 import QuestionModal from './QuestionModal.vue'
@@ -19,21 +18,24 @@ import QuestionModal from './QuestionModal.vue'
 import { state, currentMessages, isStreaming, switchSession, loadMoreMessages, rollbackTo, forkSession, setUIMessageHandler, currentRecoveryBanner, refreshLatestMessages, setSessionBackgroundHookMerging, completeSearchJump, prefillComposer, registerProjectAndOpen, addAttachments, currentMeta, activeProjectName, jumpToSearchResult, historyJumpInProgress, currentFileChangeBanner, undoFileChanges, dismissFileChangeUndo } from '../stores/chat'
 import { EMPTY_GUIDES, sceneById, type SceneId } from '../utils/scenePresets'
 import { pickContinueSession } from '../utils/continueSession'
-import { buildMinimapMarks } from '../utils/sessionMinimap'
+import { buildBookmarkMarks, buildMinimapMarks } from '../utils/sessionMinimap'
+import * as api from '../api/client'
 import { inspectDataTransfer } from '../utils/dropActions'
 import {
   styleGreeting,
   isStyleGreetingHidden,
   setStyleGreetingHidden,
 } from '../utils/styleGreetings'
-import * as api from '../api/client'
 
 // isRecoveringCurrent mirrors state.isRecovering[currentID].
 // Watched reactively by the recovery-in-progress banner
 // template below.
 const isRecoveringCurrent = computed(() => !!state.isRecovering[state.currentID])
 
-const bookmarks = ref<{ message_id: number; seq?: number }[]>([])
+// The composer mascot (InputArea) owns the working/idle cat cycle now;
+// the StreamingBar zone no longer hosts a cat.
+
+const bookmarks = ref<{ message_id: number; seq?: number; note?: string }[]>([])
 const bookmarkedIds = computed(() => new Set(bookmarks.value.map(item => item.message_id)))
 const turnChanges = ref<api.TurnChangeItem[]>([])
 const replayByMessage = computed(() => {
@@ -506,7 +508,7 @@ function scrollToBottom(smooth = false) {
 // for any in-flight streaming chunks — otherwise the smooth
 // scroll would race with each new chunk's auto-scroll and
 // the user would see a stuttering animation.
-const guideTurns = ref<{ id: number; content: string }[]>([])
+const guideTurns = ref<{ id: number; content: string; seq: number }[]>([])
 
 async function loadGuideTurns(id: string) {
   if (!id) {
@@ -519,6 +521,7 @@ async function loadGuideTurns(id: string) {
     guideTurns.value = (resp.turns || []).map(turn => ({
       id: turn.message_id,
       content: turn.content || '',
+      seq: turn.seq || 0,
     }))
   } catch {
     if (state.currentID === id) guideTurns.value = []
@@ -535,6 +538,14 @@ watch(() => {
   return 0
 }, () => { void loadGuideTurns(state.currentID) })
 
+const bookmarkMarks = computed(() => buildBookmarkMarks(
+  bookmarks.value.map(pin => ({
+    messageId: pin.message_id,
+    seq: pin.seq,
+    tip: pin.note?.trim() || '书签',
+  })),
+  guideTurns.value.map(turn => turn.seq),
+))
 const minimapMarks = computed(() => {
   if (guideTurns.value.length) {
     return buildMinimapMarks(guideTurns.value.map(turn => ({
@@ -545,6 +556,9 @@ const minimapMarks = computed(() => {
   }
   return buildMinimapMarks(currentMessages.value)
 })
+const railMarks = computed(() =>
+  [...minimapMarks.value, ...bookmarkMarks.value].sort((a, b) => a.position - b.position),
+)
 
 async function scrollToMark(messageId: number) {
   const el = messagesEl.value?.querySelector(
@@ -695,11 +709,16 @@ watch(isStreaming, (streaming, was) => {
   if (was && !streaming) void loadTurnChanges(state.currentID)
 })
 
+function onBookmarksChanged() {
+  void loadBookmarks(state.currentID)
+}
+
 onMounted(() => {
   scrollToBottom()
   nextTick(attachMessageVisibility)
   void loadBookmarks(state.currentID)
   void loadTurnChanges(state.currentID)
+  window.addEventListener('pchat:bookmarks-changed', onBookmarksChanged)
   // Bridge Naive UI's useMessage() to the chat store. The store
   // can't call useMessage() itself (no component context), so it
   // publishes errors here and we surface them as toasts. Without
@@ -713,6 +732,7 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  window.removeEventListener('pchat:bookmarks-changed', onBookmarksChanged)
   const searchTarget = state.searchJumpTarget
   if (searchTarget) {
     completeSearchJump(searchTarget.requestID, '聊天视图已关闭，未能完成消息定位')
@@ -790,10 +810,13 @@ function messageKey(m: any, i: number): string | number {
     @dragleave="onChatDragLeave"
     @drop="onChatDrop"
   >
-    <!-- Conversation-in-progress loading bar. Thin indeterminate
-         strip at the top of the chat page; visible from the moment
-         a turn starts until it ends (isStreaming || sessionWorking). -->
-    <StreamingBar />
+    <!-- Conversation-in-progress loading bar. The zone always reserves
+         the bar's 3px so the layout never jumps when a turn starts; the
+         sweep itself mounts only while streaming (see StreamingBar). The
+         walking mascot now lives on the composer edge (see InputArea). -->
+    <div class="stream-bar-zone">
+      <StreamingBar />
+    </div>
     <!-- P0-1: transient banner shown when the recovery
          flow successfully merged server-side parts into
          the trailing assistant message. currentRecoveryBanner
@@ -998,18 +1021,21 @@ function messageKey(m: any, i: number): string | number {
         </div>
       </Transition>
       <div
-        v-if="minimapMarks.length"
+        v-if="railMarks.length"
         class="minimap"
-        :class="{ 'minimap--fade-top': minimapMarks.length > 10 }"
+        :class="{ 'minimap--fade-top': railMarks.length > 10 }"
         aria-label="会话刻度"
       >
         <button
-          v-for="mark in minimapMarks"
-          :key="mark.messageId"
+          v-for="mark in railMarks"
+          :key="`${mark.kind || 'turn'}-${mark.messageId}`"
           type="button"
           class="minimap-mark"
-          :class="{ 'minimap-mark--active': visibleMsgIds.has(mark.messageId) }"
-          :style="{ '--mark-span': String(mark.span) }"
+          :class="{
+            'minimap-mark--active': mark.kind !== 'bookmark' && visibleMsgIds.has(mark.messageId),
+            'minimap-mark--bookmark': mark.kind === 'bookmark',
+          }"
+          :style="mark.kind === 'bookmark' ? undefined : { '--mark-span': String(mark.span) }"
           :aria-label="mark.tip"
           @click="scrollToMark(mark.messageId)"
         >
@@ -1021,7 +1047,6 @@ function messageKey(m: any, i: number): string | number {
     <InputArea>
       <template #composer-docks>
         <QuestionModal @locate-question="locateOpenQuestion" />
-        <TodoPanel />
         <SubAgentJobsPanel
           :session-id="state.currentID"
           @job-terminal="handleSubAgentJobTerminal"
@@ -1071,6 +1096,15 @@ function messageKey(m: any, i: number): string | number {
 </template>
 
 <style scoped>
+/* StreamingBar + header cat zone. Always reserves the bar's 3px so
+ * the cat's baseline is identical between idle (bar hidden by
+ * StreamingBar's own v-if) and active (bar visible) — switching
+ * states never makes the cat jump. */
+.stream-bar-zone {
+  position: relative;
+  min-height: 3px;
+  flex-shrink: 0;
+}
 /* P0-1 recovery banner. Sits at the top of the chat
  * main area and animates in/out via Vue's <Transition>.
  * Uses brand accent for the icon and a soft surface
@@ -1218,6 +1252,12 @@ function messageKey(m: any, i: number): string | number {
 .minimap-mark:hover .minimap-tip,
 .minimap-mark:focus-visible .minimap-tip {
   display: block;
+}
+.minimap-mark--bookmark .minimap-bar {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: var(--brand-500);
 }
 .minimap-mark--active .minimap-bar {
   background: var(--text-secondary);

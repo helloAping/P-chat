@@ -8,13 +8,13 @@ export const styleCompareState = reactive({
   variants: [] as api.StyleCompareVariant[],
 })
 
-export async function runStyleCompare(sessionId: string, text: string) {
+export async function runStyleCompare(sessionId: string, text: string, styles?: string[]) {
   styleCompareState.loading = true
   styleCompareState.error = ''
   styleCompareState.variants = []
   styleCompareState.source = text
   try {
-    const resp = await api.styleCompare(sessionId, text)
+    const resp = await api.styleCompare(sessionId, text, styles)
     styleCompareState.source = resp.source || text
     styleCompareState.variants = resp.variants || []
     if (!styleCompareState.variants.length) {

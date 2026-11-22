@@ -241,6 +241,43 @@ func (m *Manager) AppendMemory(id, line string) error {
 	return err
 }
 
+// DeleteMemoryLine removes one exact `- ` memory line. A missing line
+// is a no-op. The speaking prompt is left untouched, and deletion is
+// allowed on built-in personas the same way AppendMemory is.
+func (m *Manager) DeleteMemoryLine(id, line string) error {
+	if m == nil || m.db == nil {
+		return fmt.Errorf("style manager unavailable")
+	}
+	id = normaliseStyleID(id)
+	if id == "" || !m.exists(id) {
+		return fmt.Errorf("unknown style: %s", id)
+	}
+	line = strings.TrimSpace(line)
+	if line == "" || !strings.HasPrefix(line, "- ") {
+		return nil
+	}
+	cur, err := m.GetMemory(Style(id))
+	if err != nil {
+		return err
+	}
+	found := false
+	kept := make([]string, 0)
+	for _, row := range strings.Split(cur, "\n") {
+		if !found && strings.TrimSpace(row) == line {
+			found = true
+			continue
+		}
+		kept = append(kept, row)
+	}
+	if !found {
+		return nil
+	}
+	next := strings.TrimSpace(strings.Join(kept, "\n"))
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = m.db.Exec(`UPDATE styles SET memory=?, updated_at=? WHERE id=?`, next, now, id)
+	return err
+}
+
 // CreateFromMemory makes a new persona whose memory is this one fact.
 func (m *Manager) CreateFromMemory(label, line string) (string, error) {
 	if m == nil {

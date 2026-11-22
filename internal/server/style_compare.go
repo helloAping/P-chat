@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -34,6 +36,47 @@ func CompareStyleIDs(current string, all []style.Style) []style.Style {
 	return out
 }
 
+// ResolveCompareStyles picks the personas for one compare call.
+// An empty request keeps the previous "two other styles" default.
+// One or two ids must already exist and must not be off. The current
+// session style is allowed so a draft can be rewritten in place.
+func ResolveCompareStyles(current string, requested []string, all []style.Style) ([]style.Style, error) {
+	cleaned := make([]string, 0, len(requested))
+	for _, id := range requested {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			cleaned = append(cleaned, id)
+		}
+	}
+	if len(cleaned) == 0 {
+		return CompareStyleIDs(current, all), nil
+	}
+	if len(cleaned) > 2 {
+		return nil, fmt.Errorf("最多选择 2 个风格")
+	}
+	known := make(map[string]style.Style, len(all))
+	for _, item := range all {
+		known[string(item)] = item
+	}
+	out := make([]style.Style, 0, len(cleaned))
+	seen := map[string]struct{}{}
+	for _, id := range cleaned {
+		item, ok := known[id]
+		if !ok || item.IsOff() {
+			return nil, fmt.Errorf("未知风格: %s", id)
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, item)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("未知风格")
+	}
+	return out, nil
+}
+
 // StyleCompare answers the same sentence in two other personas.
 // Nothing is written to the session.
 func (h *Handler) StyleCompare(c *gin.Context) {
@@ -47,7 +90,8 @@ func (h *Handler) StyleCompare(c *gin.Context) {
 		return
 	}
 	var body struct {
-		Text string `json:"text"`
+		Text   string   `json:"text"`
+		Styles []string `json:"styles"`
 	}
 	_ = c.ShouldBindJSON(&body)
 	text := strings.TrimSpace(body.Text)
@@ -75,11 +119,22 @@ func (h *Handler) StyleCompare(c *gin.Context) {
 		return
 	}
 	current := h.sessionStyle(id)
-	alts := CompareStyleIDs(current, h.styleMgr.ListAll())
-	variants := make([]styleCompareVariant, 0, len(alts))
-	for _, alt := range alts {
-		variants = append(variants, h.oneStyleTake(c.Request.Context(), provider, model, alt, text))
+	alts, err := ResolveCompareStyles(current, body.Styles, h.styleMgr.ListAll())
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
 	}
+	variants := make([]styleCompareVariant, len(alts))
+	var wg sync.WaitGroup
+	parent := c.Request.Context()
+	for i, alt := range alts {
+		wg.Add(1)
+		go func(i int, alt style.Style) {
+			defer wg.Done()
+			variants[i] = h.oneStyleTake(parent, provider, model, alt, text)
+		}(i, alt)
+	}
+	wg.Wait()
 	c.JSON(http.StatusOK, gin.H{
 		"source":   text,
 		"current":  current,

@@ -127,14 +127,14 @@ const themeToggleTitle = computed(() =>
         </div>
         <span v-if="sessionTitle" class="separator" aria-hidden="true">/</span>
       </template>
-      <div
-        v-if="sessionTitle"
-        class="session-title"
-        :title="sessionTitle"
-      >{{ sessionTitle }}</div>
-      <template v-else-if="!projectName">
-        <div class="session-title">全局会话</div>
-      </template>
+      <div v-if="sessionTitle || !projectName" class="title-block">
+        <div
+          v-if="sessionTitle"
+          class="session-title"
+          :title="sessionTitle"
+        >{{ sessionTitle }}</div>
+        <div v-else class="session-title">全局会话</div>
+      </div>
     </div>
 
     <!-- Right section: mute, theme, and inspector. Session controls
@@ -190,6 +190,7 @@ const themeToggleTitle = computed(() =>
 .topbar {
   height: 40px;
   flex-shrink: 0;
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -234,6 +235,11 @@ const themeToggleTitle = computed(() =>
   font-size: 13.5px;
   color: var(--text-primary);
 }
+.title-block {
+  min-width: 0;
+}
+/* The idle/empty mascot lives above the composer (see InputArea);
+ * the top bar no longer hosts a cat. */
 .session-title {
   font-weight: 500;
   white-space: nowrap;
@@ -301,6 +307,9 @@ const themeToggleTitle = computed(() =>
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+  /* Pin to the far right even when topbar-center isn't rendered
+   * (brand-new untitled session has no title, so center is absent). */
+  margin-left: auto;
 }
 
 @media (max-width: 960px) {

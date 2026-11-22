@@ -57,8 +57,9 @@ const renderMd = renderMarkdown
 import { NDropdown, useMessage, useDialog, type DropdownMenuProps, type DropdownOption } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import * as api from '../api/client'
-import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
+import { state, regenerateMessage, fetchReplies, activateReply, currentFileChangeBanner } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
+import TurnTodoCard from './TurnTodoCard.vue'
 import SkillCallCard from './SkillCallCard.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import ToolCallGroup from './ToolCallGroup.vue'
@@ -1189,6 +1190,10 @@ const isLast = computed(() => {
 const canRegenerate = computed(() =>
   props.message.role === 'assistant' && isLast.value && !props.streaming
 )
+const byteUndoHere = computed(() =>
+  props.message.role === 'assistant' && isLast.value && !!currentFileChangeBanner.value
+)
+const turnTodos = computed(() => props.message.turn_todos || [])
 // P1-4: regen siblings are loaded on demand the first
 // time the user hovers a paginated bubble. The fetch
 // is debounced via a per-bubble ref so rapid hover
@@ -1769,7 +1774,7 @@ function findPrecedingUserMessageId(): number {
                   >{{ turnFileLabel(file) }}</button>
                 </li>
                 <li v-for="command in replayCommands" :key="command" class="msg-turn-file">{{ command }}</li>
-                <li class="msg-turn-note">字节撤销只覆盖最近一轮仍留在内存里的文件快照。</li>
+                <li v-if="!byteUndoHere" class="msg-turn-note">摘要会留下。字节撤销只作用于最近一轮，重启后不可用。</li>
               </ul>
             </span>
             <span v-if="turnSummary && hasTokens" class="msg-meta-sep">·</span>
@@ -1821,6 +1826,11 @@ function findPrecedingUserMessageId(): number {
           </div>
         </div>
       </div>
+
+      <TurnTodoCard
+        v-if="message.role === 'user' && turnTodos.length"
+        :todos="turnTodos"
+      />
 
       <!-- 消息级操作统一停靠在正文下方；附件只保留预览、复制和下载。
            Message-level actions share one quiet footer below the content;
