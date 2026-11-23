@@ -383,6 +383,68 @@ func TestListSessions(t *testing.T) {
 	}
 }
 
+func TestListSessions_ProjectFilterAppliesBeforeLimit(t *testing.T) {
+	s, _ := newTestServer(t)
+	targetPath := filepath.Join(t.TempDir(), "target-project")
+	targetID := s.handler.store.CurrentConversationID()
+	if err := s.handler.store.UpdateConversationMeta(targetID, sessionProjectMetaJSON(t, targetPath)); err != nil {
+		t.Fatal(err)
+	}
+	globalID, err := s.handler.store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(t.TempDir(), "other-project")
+
+	for i := 0; i < 200; i++ {
+		id, err := s.handler.store.NewConversation()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.handler.store.UpdateConversationMeta(id, sessionProjectMetaJSON(t, otherPath)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sessions?project_path="+url.QueryEscape(targetPath), nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Sessions []SessionResponse `json:"sessions"`
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Sessions) != 1 || body.Sessions[0].ID != targetID {
+		t.Fatalf("project sessions = %+v, want only %q beyond the first global 200", body.Sessions, targetID)
+	}
+
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/sessions?project_path=", nil)
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("global status = %d, body=%s", w.Code, w.Body.String())
+	}
+	if err := json.NewDecoder(w.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Sessions) != 1 || body.Sessions[0].ID != globalID {
+		t.Fatalf("global sessions = %+v, want only %q", body.Sessions, globalID)
+	}
+}
+
+func sessionProjectMetaJSON(t *testing.T, projectPath string) string {
+	t.Helper()
+	b, err := json.Marshal(map[string]string{"project_path": projectPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
 func TestCreateSession_ReuseEmptyWithinProject(t *testing.T) {
 	s, _ := newTestServer(t)
 	projectPath := filepath.Join(t.TempDir(), "repo")
@@ -1043,6 +1105,70 @@ func TestSendMessage_ClientMessageIDRejectsDifferentPayload(t *testing.T) {
 	}
 	if body.Code != "client_message_id_conflict" {
 		t.Fatalf("code = %q, want client_message_id_conflict", body.Code)
+	}
+}
+
+func TestSendMessage_ClientMessageIDRejectsDifferentAttachmentsBeforeValidation(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientMsgID int64 = 1_730_000_000_001_125
+	original := []agent.Attachment{{UploadID: "aaaaaaaaaaaaaaaa", ID: "aaaaaaaaaaaaaaaa", Name: "a.pdf", Kind: "file", MIME: "application/pdf"}}
+	store.AddChatMessageToWithID(convID, llm.ChatMessage{
+		Role: llm.RoleUser, Type: llm.TypeText, Content: "same text", MsgType: llm.MsgTypeText, SubmitToLLM: 1,
+		Meta: map[string]any{"attachment_signature": agent.AttachmentSignature(original)},
+	}, clientMsgID)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+convID+"/messages", bytes.NewBufferString(`{
+		"message":"same text","client_msg_id":1730000000001125,
+		"attachments":[{"upload_id":"bbbbbbbbbbbbbbbb","name":"b.pdf","kind":"file","mime":"application/pdf"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "client_message_id_conflict") {
+		t.Fatalf("status=%d body=%s, want attachment identity conflict", w.Code, w.Body.String())
+	}
+}
+
+func TestSendMessage_ExactInlineAttachmentRetryDoesNotMaterializeAgain(t *testing.T) {
+	s, _ := newTestServer(t)
+	store := s.store
+	convID, err := store.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientMsgID int64 = 1_730_000_000_001_126
+	atts := []agent.Attachment{{Name: "notes.txt", Kind: "text", MIME: "text/plain", Data: "same inline body"}}
+	store.AddChatMessageToWithID(convID, llm.ChatMessage{
+		Role: llm.RoleUser, Type: llm.TypeText, Content: "same text", MsgType: llm.MsgTypeText, SubmitToLLM: 1,
+		Meta: map[string]any{"attachment_signature": agent.AttachmentSignature(atts)},
+	}, clientMsgID)
+	if err := store.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.MkdirAll(UploadDir(), 0o755)
+	before, _ := os.ReadDir(UploadDir())
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/sessions/"+convID+"/messages", bytes.NewBufferString(`{
+		"message":"same text","client_msg_id":1730000000001126,
+		"attachments":[{"name":"notes.txt","kind":"text","mime":"text/plain","data":"same inline body"}]
+	}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.engine.ServeHTTP(w, req)
+	after, _ := os.ReadDir(UploadDir())
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "duplicate_client_message") {
+		t.Fatalf("status=%d body=%s, want exact duplicate", w.Code, w.Body.String())
+	}
+	if len(after) != len(before) {
+		t.Fatalf("exact retry materialized uploads: before=%d after=%d", len(before), len(after))
 	}
 }
 

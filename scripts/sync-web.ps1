@@ -25,15 +25,28 @@ if (-not (Test-Path -LiteralPath $dst)) {
     New-Item -ItemType Directory -Path $dst -Force | Out-Null
 }
 
-# robocopy returns non-zero exit codes even on success (1=files copied,
-# 2=extras, 3=both). We only treat >=8 as a real error.
-$robocopyLog = Join-Path $env:TEMP "pchat-robocopy-$(Get-Random).log"
-cmd.exe /c "robocopy `"$src`" `"$dst`" /MIR /NJH /NJS /NDL /NFL /NP > `"$robocopyLog`" 2>&1"
-$rc = $LASTEXITCODE
-if ($rc -ge 8) {
-    Get-Content -LiteralPath $robocopyLog -ErrorAction SilentlyContinue
-    throw "robocopy failed (exit $rc)"
+# PowerShell 7 把 $IsWindows 做成只读变量，不能赋值。
+# PowerShell 7 reserves $IsWindows as a read-only automatic variable.
+$useRobocopy = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+    [System.Runtime.InteropServices.OSPlatform]::Windows)
+if ($useRobocopy) {
+    # robocopy returns non-zero exit codes even on success (1=files copied,
+    # 2=extras, 3=both). We only treat >=8 as a real error.
+    # Use GetTempPath: $env:TEMP is unset in PowerShell on Linux and macOS.
+    $tempDir = [System.IO.Path]::GetTempPath()
+    if ([string]::IsNullOrWhiteSpace($tempDir)) { throw "temp directory is not available" }
+    $robocopyLog = Join-Path $tempDir "pchat-robocopy-$(Get-Random).log"
+    cmd.exe /c "robocopy `"$src`" `"$dst`" /MIR /NJH /NJS /NDL /NFL /NP > `"$robocopyLog`" 2>&1"
+    $rc = $LASTEXITCODE
+    if ($rc -ge 8) {
+        Get-Content -LiteralPath $robocopyLog -ErrorAction SilentlyContinue
+        throw "robocopy failed (exit $rc)"
+    }
+    Remove-Item -LiteralPath $robocopyLog -ErrorAction SilentlyContinue
+} else {
+    Get-ChildItem -LiteralPath $src -Force | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $dst -Recurse -Force
+    }
 }
-Remove-Item -LiteralPath $robocopyLog -ErrorAction SilentlyContinue
 
 Write-Host "[sync-web] $src -> $dst"

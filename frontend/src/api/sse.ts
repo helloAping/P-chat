@@ -13,10 +13,11 @@ export interface StreamEventLike {
 // interrupt.
 export const STREAM_IDLE_AFTER_LLM_MS = 210_000
 // STREAM_IDLE_AFTER_TOOL_MS covers long-running tools (exec 5m,
-// question 10m, sub-agent 30m) that emit a start event then go
-// silent until they finish. A 150s idle here cancelled the reader,
-// the server write-timeout killed the turn, and in-progress todos
-// stopped with no error in the bubble.
+// sub-agent 30m) that emit a start event then go silent until they
+// finish. A 150s idle here cancelled the reader, the server
+// write-timeout killed the turn, and in-progress todos stopped with
+// no error in the bubble. An open `question` disables this watchdog
+// (returns 0) until the user submits or the tool call ends.
 export const STREAM_IDLE_AFTER_TOOL_MS = 35 * 60 * 1000
 
 export interface SSEConsumerOptions<T extends StreamEventLike> {
@@ -30,12 +31,19 @@ export interface SSEConsumerOptions<T extends StreamEventLike> {
   // fires, and an "idle" error is thrown (not retried — the caller
   // recovers missing parts from the server instead). 0 disables.
   idleTimeoutMs?: number
+  // paintEvery bounds how many frames are applied before yielding so
+  // a buffered burst can reach the screen. 0 uses the default.
+  paintEvery?: number
+  // paintYield is the macrotask used between batches. Tests replace it.
+  paintYield?: () => Promise<void>
 }
 
 // nextStreamIdleTimeoutMs stretches the GUI idle watchdog while a
 // tool / sub-agent is in flight, then snaps back after it completes.
 // Heartbeats and other phase events keep the current budget so a
 // long exec_command is not cut short by a keep-alive frame.
+// An open question returns 0, which disables the watchdog until the
+// question tool call finishes.
 export function nextStreamIdleTimeoutMs(
   event: StreamEventLike | undefined,
   current: number,
@@ -46,6 +54,13 @@ export function nextStreamIdleTimeoutMs(
   const type = String(event.type || '')
   const toolStatus = String(event.tool_status || '')
   const subStatus = String(event.sub_agent_status || '')
+  const toolName = String(event.tool_name || '')
+  // question 一直等到用户提交，空闲看门狗不能把这条流判死。
+  // An open question waits until the user submits; the idle watchdog
+  // must not treat that silence as a stuck turn.
+  if (type === 'question' || (type === 'tool' && toolName === 'question' && (toolStatus === 'start' || toolStatus === ''))) {
+    return 0
+  }
   if ((type === 'tool' && toolStatus === 'start') || subStatus === 'start') {
     return Math.max(current, STREAM_IDLE_AFTER_TOOL_MS)
   }
@@ -115,6 +130,7 @@ export function emitStreamEvent<T extends StreamEventLike>(
 }
 
 export function streamErrorStatus(error: unknown): number | null {
+  if (error instanceof StreamHTTPError) return error.status
   const message = String((error as any)?.message ?? error ?? '')
   const match = message.match(/\bHTTP\s+(\d{3})\b/)
   if (!match) return null
@@ -123,7 +139,41 @@ export function streamErrorStatus(error: unknown): number | null {
 }
 
 export function shouldRetryStreamError(error: unknown): boolean {
-  return streamErrorStatus(error) !== 409
+  const status = streamErrorStatus(error)
+  return status === null || status === 408 || status === 429 || status >= 500
+}
+
+// 非 2xx 的首个 HTTP 响应尚未进入 SSE；保留状态和服务端错误码以区别断流。
+// A non-2xx initial response has not entered SSE; preserve its status and server code separately from stream drops.
+export class StreamHTTPError extends Error {
+  readonly status: number
+  readonly code: string
+  readonly detail: string
+
+  constructor(label: string, status: number, body: string, statusText: string) {
+    let code = ''
+    let detail = body || statusText || `HTTP ${status}`
+    try {
+      const parsed: unknown = JSON.parse(body)
+      if (parsed && typeof parsed === 'object') {
+        const response = parsed as Record<string, unknown>
+        if (typeof response.code === 'string') code = response.code
+        if (typeof response.error === 'string' && response.error) detail = response.error
+      }
+    } catch { /* A proxy may return plain text instead of JSON. */ }
+    super(`${label}: HTTP ${status}: ${detail}`)
+    this.name = 'StreamHTTPError'
+    this.status = status
+    this.code = code
+    this.detail = detail
+  }
+}
+
+export function isRejectedMessageRequest(error: unknown): error is StreamHTTPError {
+  return error instanceof StreamHTTPError
+    && error.status >= 300 && error.status < 500
+    && error.status !== 408 && error.status !== 429
+    && !(error.status === 409 && error.code === 'duplicate_client_message')
 }
 
 // isDuplicateClientMessageError reports whether `error` is the
@@ -144,6 +194,7 @@ export function shouldRetryStreamError(error: unknown): boolean {
 export function isDuplicateClientMessageError(error: unknown): boolean {
   const status = streamErrorStatus(error)
   if (status !== 409) return false
+  if (error instanceof StreamHTTPError) return error.code === 'duplicate_client_message'
   const message = String((error as any)?.message ?? error ?? '')
   return message.includes('"duplicate_client_message"')
 }
@@ -283,6 +334,11 @@ export async function consumeSSEStream<T extends StreamEventLike>(
       buffer += decoder.decode(result.value, { stream: true })
     }
 
+    const paintEvery = options.paintEvery && options.paintEvery > 0 ? options.paintEvery : 8
+    const paintYield = options.paintYield || (() => new Promise<void>(resolve => {
+      setTimeout(resolve, 0)
+    }))
+    let sincePaint = 0
     let frameEnd: number
     while ((frameEnd = buffer.indexOf('\n\n')) >= 0) {
       const block = buffer.slice(0, frameEnd)
@@ -312,6 +368,12 @@ export async function consumeSSEStream<T extends StreamEventLike>(
         sawDone = true
         done = true
         break
+      }
+      sincePaint++
+      if (sincePaint >= paintEvery) {
+        sincePaint = 0
+        await paintYield()
+        if (options.signal?.aborted) return
       }
     }
   }

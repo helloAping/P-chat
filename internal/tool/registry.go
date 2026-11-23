@@ -697,6 +697,22 @@ func StringProp(description string) map[string]any {
 	}
 }
 
+func IntProp(description string) map[string]any {
+	return map[string]any{
+		"type":        "integer",
+		"description": description,
+		"minimum":     0,
+	}
+}
+
+func StringArrayProp(description string) map[string]any {
+	return map[string]any{
+		"type":        "array",
+		"description": description,
+		"items":       map[string]any{"type": "string"},
+	}
+}
+
 // BoolProp is a small JSON-Schema fragment for a boolean
 // parameter. Used by the P2-4 dry-run flag on
 // exec_command / read_file / write_file. Default is
@@ -768,8 +784,8 @@ func RegisterBuiltin(r *Registry) {
 			"DO NOT call read_file on images, audio, video, archives, or other unsupported binary files - " +
 			"those will return a binary error. " +
 			"For a user-uploaded attachment, use read_attachment with its upload_id instead of an on-disk path. " +
-			"Images uploaded by the user are ALREADY available as vision input (image_url) in the user message; " +
-			"just look at them directly, do NOT call read_file on the on-disk copy.",
+			"User-uploaded images may be provided as vision input or recognition text; " +
+			"do NOT call read_file on the on-disk copy.",
 		Parameters: ObjectSchema(map[string]any{
 			"path":    StringProp("Absolute or relative path to the file"),
 			"dry_run": BoolProp("If true, return file size + first 200 chars without reading the full body."),
@@ -783,10 +799,13 @@ func RegisterBuiltin(r *Registry) {
 
 	r.Register(Tool{
 		Name:        "read_attachment",
-		Description: "Extract text from a user-uploaded text, PDF, Word, Excel, or PowerPoint attachment. Pass only an upload_id explicitly shown in this conversation; arbitrary file paths are not accepted.",
+		Description: "Read a bounded page from user-uploaded text, PDF, Word, Excel, or PowerPoint attachments. Pass only upload_id or upload_ids explicitly shown in this conversation; arbitrary file paths are not accepted. At most 8 distinct upload_ids per call; split larger sets into batches. Use offset and limit to continue from the returned next offset.",
 		Parameters: ObjectSchema(map[string]any{
-			"upload_id": StringProp("The upload_id of an attachment in this conversation"),
-		}, []string{"upload_id"}),
+			"upload_id":  StringProp("One upload_id of an attachment in this conversation (legacy-compatible)"),
+			"upload_ids": StringArrayProp("One or more upload_ids of attachments in this conversation"),
+			"offset":     IntProp("Zero-based extracted-text byte offset to begin reading"),
+			"limit":      IntProp("Maximum extracted-text bytes per attachment page"),
+		}, nil),
 	}, handleReadAttachment)
 
 	r.Register(Tool{
@@ -812,6 +831,41 @@ func RegisterBuiltin(r *Registry) {
 	}, handleEditFile)
 
 	r.Register(Tool{
+		Name: "apply_patch",
+		Description: "Apply a multi-file, multi-hunk patch in one call. Prefer this over repeated edit_file/write_file for coordinated edits. " +
+			"Pass either Codex-style patch text (*** Begin Patch / *** Update File / @@ / ± lines / *** End Patch) " +
+			"or structured operations[{op,path,hunks|content}]. Each update hunk must match exactly once; conflicts return expected vs file context.",
+		Parameters: ObjectSchema(map[string]any{
+			"patch": StringProp("Codex-style patch envelope covering one or more Add/Update/Delete File sections"),
+			"operations": map[string]any{
+				"type": "array",
+				"description": "Structured alternative to patch text. op=update|add|delete; update needs hunks[{old_text,new_text}]; add needs content.",
+				"items": map[string]any{
+					"type": "object",
+					"properties": map[string]any{
+						"op":      StringProp("update | add | delete"),
+						"path":    StringProp("Target file path"),
+						"content": StringProp("Full file body when op=add"),
+						"hunks": map[string]any{
+							"type": "array",
+							"items": map[string]any{
+								"type": "object",
+								"properties": map[string]any{
+									"old_text": StringProp("Exact existing text to replace"),
+									"new_text": StringProp("Replacement text"),
+								},
+								"required": []string{"old_text", "new_text"},
+							},
+						},
+					},
+					"required": []string{"op", "path"},
+				},
+			},
+			"dry_run": BoolProp("If true, validate and report without writing"),
+		}, nil),
+	}, handleApplyPatch)
+
+	r.Register(Tool{
 		Name:        "list_files",
 		Description: "List files and subdirectories in a directory. Returns names only, not recursive.",
 		Parameters: ObjectSchema(map[string]any{
@@ -829,23 +883,23 @@ func RegisterBuiltin(r *Registry) {
 		}, []string{"url"}),
 	}, handleWebFetch)
 
-		r.Register(Tool{
-			Name:        "media_recognize",
-			Description: "Analyze one or more conversation-owned images, videos, or audio assets through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Assets in one call must share the same media type. Use context_refs/context_mode only when the user asks to continue, merge, or verify earlier media results. Prefer opaque input_ref values explicitly shown in this chat; never pass bytes, URLs, or file paths.",
-			Parameters: ObjectSchema(withMediaContextSchema(map[string]any{
-				"input_ref": StringProp("One opaque upload or tool-asset id from this conversation (preferred)"),
-				"input_refs": map[string]any{
-					"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
+	r.Register(Tool{
+		Name:        "media_recognize",
+		Description: "Analyze one or more conversation-owned images, videos, or audio assets through an allowed recognition route. The host selects the configured media model or, for compatible image follow-ups, the current vision-capable chat model. Assets in one call must share the same media type. Use context_refs/context_mode only when the user asks to continue, merge, or verify earlier media results. Prefer opaque input_ref values explicitly shown in this chat; never pass bytes, URLs, or file paths.",
+		Parameters: ObjectSchema(withMediaContextSchema(map[string]any{
+			"input_ref": StringProp("One opaque upload or tool-asset id from this conversation (preferred)"),
+			"input_refs": map[string]any{
+				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
 				"description": "Opaque ids of same-type media assets to analyze together (preferred)",
 			},
 			"upload_id": StringProp("Backward-compatible alias for one uploaded attachment id"),
 			"upload_ids": map[string]any{
 				"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1,
 				"description": "Backward-compatible aliases for uploaded attachment ids",
-				},
-				"question": StringProp("Optional focused question for the configured recognition model"),
-			}), nil),
-		}, handleMediaRecognize)
+			},
+			"question": StringProp("Optional focused question for the configured recognition model"),
+		}), nil),
+	}, handleMediaRecognize)
 	// 旧工具调用和白名单继续生效，但模型只学习一个 canonical 媒体入口。
 	// Keep old tool calls and allowlists working without teaching the model two
 	// names for the same capability. The alias is callable but absent from
@@ -911,6 +965,8 @@ func RegisterBuiltin(r *Registry) {
 			},
 		}, []string{"questions"}),
 	}, handleQuestion)
+
+	RegisterRemember(r)
 }
 
 type execArgs struct {
@@ -941,10 +997,12 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 	log.Printf("%s[tool/exec_command] start cmd=%q dry_run=%t", TraceIDFromCtx(ctx), a.Command, a.DryRun)
 
 	if sb := sandboxFromCtx(ctx); sb != nil && !sb.CheckExecBool(a.Command) {
-		return &CallResult{
-			Content: fmt.Sprintf("E_SANDBOX: command blocked by sandbox policy\n  command: %s\n  tip: use /unsafe once to allow this single call, or set sandbox.exec_dangerous_patterns in config", a.Command),
-			IsError: true,
-		}, nil
+		msg := fmt.Sprintf("E_SANDBOX: command blocked by sandbox policy\n  command: %s", a.Command)
+		if matched := sb.MatchedPattern(a.Command); matched != "" {
+			msg += fmt.Sprintf("\n  matched: %s", matched)
+		}
+		msg += "\n  tip: use /unsafe once to allow this single call, or adjust sandbox.exec_dangerous_patterns in config"
+		return &CallResult{Content: msg, IsError: true}, nil
 	}
 
 	// Block commands that try to read uploaded files. The
@@ -991,12 +1049,17 @@ func handleExecCommand(ctx context.Context, args json.RawMessage) (*CallResult, 
 		return &CallResult{Content: preview, Summary: "Dry run: would execute " + a.Command, NextAction: "review"}, nil
 	}
 
+	RecordCommandPreviewFromCtx(ctx, a.Command)
+	cmd, workDir := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
+	// 删除发生在 shell 里，执行前先给现存目标做快照，当前回合才能列出这些文件。
+	// Snapshot delete targets before the shell runs so this turn lists them.
+	deleted := snapshotShellDeletes(ctx, a.Command, workDir)
 	if a.Background || looksPersistentCommand(a.Command) {
 		return startManagedProcess(ctx, a.Command, a.WorkDir)
 	}
 
-	cmd, _ := buildExecCommand(ctx, a.Command, a.WorkDir, projectRootFromCtx(ctx))
 	out, err := readLimitedOutput(ctx, cmd)
+	forgetUnchangedShellDeletes(ctx, deleted)
 	if err != nil {
 		content := strings.TrimRight(DecodeCommandOutput(out), "\r\n")
 		if content != "" {
@@ -1374,6 +1437,7 @@ func handleWriteFile(ctx context.Context, args json.RawMessage) (*CallResult, er
 		return &CallResult{Content: preview, Summary: "Dry run: would write " + a.Path, NextAction: "review"}, nil
 	}
 
+	RecordBeforeMutationFromCtx(ctx, "write_file", a.Path)
 	if err := writeFile(a.Path, []byte(a.Content)); err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}
@@ -1540,6 +1604,14 @@ func handleWebFetch(ctx context.Context, args json.RawMessage) (*CallResult, err
 	}
 	if method != "GET" && method != "POST" {
 		return &CallResult{Content: "E_ARGS: method must be GET or POST", IsError: true}, nil
+	}
+
+	// Vendor fetch runs only for a public GET with no body. POST stays
+	// on this machine, and a vendor miss falls through to the local client.
+	if method == "GET" && a.Body == "" {
+		if result, handled := fetchViaVendor(ctx, a.URL); handled {
+			return result, nil
+		}
 	}
 
 	var reqBody io.Reader

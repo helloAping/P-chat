@@ -23,21 +23,22 @@
 
 import { computed, h, onBeforeUnmount, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
-  NModal, NCard, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
-  NTag, NTabs, NTabPane, NDataTable, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree,
-  NRadioGroup, NRadioButton, NCheckbox, NCheckboxGroup, useMessage,
+  NModal, NSelect, NButton, NSpace, NInput, NInputNumber, NSwitch,
+  NTag, NPopconfirm, NPopover, NCollapse, NCollapseItem, NTree,
+  NRadioGroup, NRadioButton, NCheckbox, NCheckboxGroup, useMessage, useNotification,
 } from 'naive-ui'
 import {
   X, Pencil, Star, Trash2, RotateCw, Eye, Clipboard, FileText, File, Hash, Folder,
   Cpu, Activity, Palette, Archive, Settings as SettingsIcon, Wrench, Terminal, Database, Globe, Monitor,
-  MessageSquare,
+  Check, Bookmark,
 } from './icons'
 import * as api from '../api/client'
 import { loadProviders, loadSessions, bumpKBConfigVersion, state as chatState } from '../stores/chat'
 import type { Session } from '../api/client'
 import WebSearchSettings from './WebSearchSettings.vue'
-import IMSettings from './IMSettings.vue'
+import WebFetchSettings from './WebFetchSettings.vue'
 import DiagnosticsSettings from './DiagnosticsSettings.vue'
+import BookmarkSettings from './BookmarkSettings.vue'
 import KnowledgeRecallPreview from './KnowledgeRecallPreview.vue'
 import AppSettingsLayout from './AppSettingsLayout.vue'
 import AppModal from './AppModal.vue'
@@ -53,6 +54,7 @@ import {
 } from '../utils/byteSize'
 
 const message = useMessage()
+const notification = useNotification()
 
 // Two-way bind for the modal's open/close state. App.vue
 // passes `show` and listens to `update:show` so toggling the
@@ -169,11 +171,38 @@ const exampleActiveScene = ref<Record<string, string>>({
   memory: '编程',
 })
 
+function splitStyleMemory(raw: string): { rest: string; bullets: string[] } {
+  const bullets: string[] = []
+  const rest: string[] = []
+  for (const line of (raw || '').split('\n')) {
+    if (line.startsWith('- ')) bullets.push(line)
+    else rest.push(line)
+  }
+  return { bullets, rest: rest.join('\n').replace(/^\n+|\n+$/g, '') }
+}
+
+function composeStyleMemory(rest: string, bullets: string[]): string {
+  const prose = rest.trim()
+  const lines = bullets.join('\n')
+  if (prose && lines) return `${prose}\n${lines}`
+  return prose || lines
+}
+
+const memoryRest = ref('')
+const memoryBullets = ref<string[]>([])
+
+function applyMemoryDraft(raw: string) {
+  const split = splitStyleMemory(raw)
+  memoryRest.value = split.rest
+  memoryBullets.value = split.bullets
+  newStyleMemory.value = composeStyleMemory(split.rest, split.bullets)
+}
+
 function fillExample(field: 'prompt' | 'memory') {
   const scene = exampleActiveScene.value[field]
   const tpl = EXAMPLE_TEMPLATES[field]?.[scene] || ''
   if (field === 'prompt') newStylePrompt.value = tpl
-  else if (field === 'memory') newStyleMemory.value = tpl
+  else if (field === 'memory') applyMemoryDraft(tpl)
 }
 
 // ID 唯一性校验（仅在新增时检查，编辑时 ID 只读）
@@ -183,7 +212,7 @@ const idConflict = computed(() => {
   if (!v) return false
   return styles.value.some(s => s.id === v)
 })
-const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'im' | 'diagnostics'>('providers')
+const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'bookmarks' | 'skills' | 'mcp' | 'knowledge' | 'websearch' | 'browser' | 'diagnostics'>('providers')
 
 // Modal visibility (v-model). The default is `true` so that
 // when App.vue mounts this component (it only mounts when
@@ -194,22 +223,18 @@ const tab = ref<'providers' | 'styles' | 'system' | 'archive' | 'skills' | 'mcp'
 const show = ref(true)
 
 // settingsTabs feeds AppSettingsLayout's left nav. The order
-// here is also the visual order in the nav. Each entry binds
-// a tab name (the same name used in NTabPane) to a lucide
-// icon + label. Adding a new settings section means adding
-// a tab here, a NTabPane below, and the corresponding
-// content — the rest of the layout picks it up
-// automatically.
+// here is also the visual order in the nav. Adding a section
+// means adding a tab here and a matching v-if pane below.
 const settingsTabs = [
   { name: 'providers', label: 'LLM 提供商',  icon: Cpu,      description: 'API key 与模型管理', group: '对话' },
-  { name: 'styles',    label: '风格',          icon: Palette,  description: '人格与记忆模板', group: '对话' },
-  { name: 'system',    label: '系统',          icon: SettingsIcon, description: '限额、子代理、行为', group: '对话' },
+  { name: 'styles',    label: '风格',          icon: Palette,  description: '当前会话在输入区选风格，自定义风格在此编辑，生成入口在检查器。', group: '对话' },
+  { name: 'system',    label: '系统',          icon: SettingsIcon, description: '工作模式、媒体默认模型和窗口行为。修改后点页面底部「保存」。', group: '对话' },
   { name: 'skills',    label: '技能',          icon: Wrench,   description: '可加载的技能包', group: '能力' },
   { name: 'mcp',       label: 'MCP',           icon: Terminal, description: 'Model Context Protocol 服务器', group: '能力' },
   { name: 'knowledge', label: '知识库',        icon: Database, description: 'RAG 文档检索', group: '能力' },
-  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: 'Tavily / Brave 等搜索提供商', group: '能力' },
+  { name: 'websearch', label: '网络搜索',      icon: Globe,    description: '搜索与网页抓取渠道', group: '能力' },
   { name: 'browser',   label: '浏览器',        icon: Monitor,  description: '浏览器扩展与自动化控制', group: '能力' },
-  { name: 'im',        label: 'IM 桥接',      icon: MessageSquare, description: '飞书 / Telegram / 企微 / QQ / 微信', group: '能力' },
+  { name: 'bookmarks', label: '书签',          icon: Bookmark, description: '按项目、对话和内容查看全部书签。', group: '数据' },
   { name: 'archive',   label: '归档',          icon: Archive,  description: '已归档的会话', group: '数据' },
   { name: 'diagnostics', label: '诊断',        icon: Activity, description: '内存监控与快照', group: '数据' },
 ]
@@ -229,14 +254,16 @@ const editStrategyVariant = ref('')
 const editProtocol = ref<api.ProviderProtocol>('openai_chat')
 const editBaseURL = ref('')
 const editAPIKey = ref('')
+const editHasAPIKey = ref(false)
+const editClearAPIKey = ref(false)
 type ProviderHeaderRow = { id: string; name: string; value: string }
 const editCustomHeaders = ref<ProviderHeaderRow[]>([])
 const editIsDefault = ref(false)
 
 // Track which fields the user actually touched so we only PATCH
-// the dirty ones. The backend treats non-empty values as "set"
-// and empty values as "leave alone", so this list is the
-// source of truth for the request body.
+// the dirty ones. API key uses the Secret Redaction Contract
+// (omit / clear_api_key / non-empty replace); other fields still
+// treat non-empty as set.
 const dirty = ref<Set<string>>(new Set())
 
 // Add-provider form (shown in NModal)
@@ -307,6 +334,7 @@ const showAddModel = ref(false)
 // unused `editModel*` family).
 const editingModelName = ref<string | null>(null)
 const editModelName = ref('')
+const editModelProtocol = ref<api.ProviderProtocol | ''>('')
 const editModelAPIEndpoint = ref('')
 const editModelDisplay = ref('')
 const editModelCtx = ref<number | null>(null)
@@ -346,11 +374,20 @@ function isCompleteHTTPURL(value: string | undefined): boolean {
   }
 }
 
-function defaultLLMAPIEndpoint(protocol = selected.value?.protocol): string {
+function defaultLLMAPIEndpoint(protocol: api.ProviderProtocol | '' | undefined = editModelProtocol.value || selected.value?.protocol): string {
   const normalized = normalizeProviderProtocol(protocol)
   if (normalized === 'anthropic_messages') return '/messages'
   if (normalized === 'openai_responses') return '/responses'
   return '/chat/completions'
+}
+
+function onModelProtocolUpdate(value: api.ProviderProtocol | null) {
+  const currentEndpoint = normalizeEndpointSuffix(editModelAPIEndpoint.value)
+  const previousDefault = defaultLLMAPIEndpoint(editModelProtocol.value || selected.value?.protocol)
+  editModelProtocol.value = value || ''
+  if (!currentEndpoint || currentEndpoint === previousDefault) {
+    editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
+  }
 }
 
 function normalizeProviderProtocol(protocol?: string): api.ProviderProtocol {
@@ -742,6 +779,12 @@ const modelCapabilityOptions: Array<CapabilityOption<api.MediaKind>> = [
   { label: '音频识别', value: 'audio', hint: '支持语音、音频文件输入' },
 ]
 
+function recognitionHasDeclaredModel(kind: api.MediaKind) {
+  return providers.value.some(provider =>
+    (provider.models || []).some(model => (model.type || 'llm') === 'llm' && modelSupportsCapability(model, kind)),
+  )
+}
+
 function modelSupportsCapability(model: api.ModelInfo, capability: api.MediaKind): boolean {
   const configured = model.capabilities?.input_modalities
   if (configured !== undefined) return configured.includes(capability)
@@ -819,6 +862,7 @@ const sysRecognitionSizeUnits = ref<Record<api.MediaKind, ByteSizeUnit>>({
 const sysWorkMode = ref('coding')
 const sysCloseBehavior = ref<'exit' | 'tray'>('exit')
 const sysDirty = ref(false)
+const sysExpanded = ref<string[]>(['work-mode', 'window', 'vision', 'generation'])
 const sysSaving = ref(false)
 
 function normalizeCloseBehavior(v?: string): 'exit' | 'tray' {
@@ -1081,7 +1125,7 @@ async function selectProvider(name: string) {
     const idx = providers.value.findIndex(x => x.name === name)
     if (idx >= 0) providers.value[idx] = rich
     // Now re-hydrate the form with the rich view (which
-    // carries base_url + api_key).
+    // carries base_url + has_api_key).
     hydrateEditForm(name, rich)
   } catch (e: any) {
     message.error(`加载 provider "${name}" 失败: ${e.message}`)
@@ -1181,9 +1225,10 @@ function cancelAddProvider() {
 // hydrateEditForm copies the server-resolved fields into the
 // edit form. dirty is reset so an out-of-band server change
 // doesn't get clobbered. The second `p` argument lets the
-// caller pass the rich per-provider view (which has
-// base_url + api_key); if omitted, we fall back to whatever
-// is in the providers cache.
+// caller pass the rich per-provider view (base_url +
+// has_api_key); if omitted, we fall back to the providers cache.
+// API key plaintext is never returned — the input stays empty
+// and has_api_key drives the "已配置" UX.
 function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   const src = p || providers.value.find(x => x.name === name)
   if (!src) return
@@ -1192,7 +1237,9 @@ function hydrateEditForm(name: string, p?: api.ProviderInfo) {
   editStrategyVariant.value = normalizeStrategyVariant(src.strategy_variant)
   editProtocol.value = normalizeProviderProtocol(src.protocol)
   editBaseURL.value = src.base_url || src.api_url || ''
-  editAPIKey.value = src.api_key || ''
+  editAPIKey.value = ''
+  editHasAPIKey.value = !!src.has_api_key
+  editClearAPIKey.value = false
   editCustomHeaders.value = providerHeadersToRows(src.custom_headers)
   editIsDefault.value = !!src.is_default
   dirty.value = new Set()
@@ -1255,12 +1302,8 @@ async function onSaveProvider() {
     message.warning('Base URL 必须是完整的 http(s) URL')
     return
   }
-  // Build a PATCH body with only the dirty fields. The server
-  // treats empty strings as "leave alone" for every field
-  // except api_key, which we always send when the user
-  // touched the form (even if they only "re-typed" the same
-  // value — the user explicitly edited the field, so we
-  // honour that). The rename is a separate concern.
+  // Build a PATCH body with only the dirty fields.
+  // API key: clear_api_key / non-empty replace / omit to keep.
   const body: api.UpdateProviderRequest = {}
   if (dirty.value.has('name') && editName.value.trim() && editName.value.trim() !== name) {
     body.name = editName.value.trim()
@@ -1278,7 +1321,11 @@ async function onSaveProvider() {
     body.base_url = editBaseURL.value.trim()
   }
   if (dirty.value.has('api_key')) {
-    body.api_key = editAPIKey.value
+    if (editClearAPIKey.value) {
+      body.clear_api_key = true
+    } else if (editAPIKey.value.trim() !== '') {
+      body.api_key = editAPIKey.value.trim()
+    }
   }
   if (dirty.value.has('custom_headers')) {
     try {
@@ -1298,8 +1345,7 @@ async function onSaveProvider() {
     notifyGenerationConfigChanged()
     // If renamed, the new name is in the response; select it
     // so the user can keep editing. selectProvider also
-    // fetches the rich per-provider view, which re-hydrates
-    // the form with the up-to-date base_url / api_key.
+    // fetches the rich per-provider view and re-hydrates.
     await selectProvider(updated.name)
   } catch (e: any) {
     message.error(`保存失败: ${e.message}`)
@@ -1312,6 +1358,7 @@ async function onSaveProvider() {
 function resetModelForm() {
   editingModelName.value = null
   editModelName.value = ''
+  editModelProtocol.value = ''
   editModelAPIEndpoint.value = defaultLLMAPIEndpoint()
   editModelDisplay.value = ''
   editModelCtx.value = null
@@ -1326,6 +1373,51 @@ function resetModelForm() {
 function onShowAddModel() {
   resetModelForm()
   showAddModel.value = true
+}
+
+type MediaSettingsSection = 'vision' | 'generation'
+
+function mediaSettingsJump(type: string, capabilities: string[], operations: string[]): MediaSettingsSection | null {
+  if (type === 'media_generation' && operations.length > 0) return 'generation'
+  if (type === 'llm' && capabilities.length > 0) return 'vision'
+  return null
+}
+
+function openSystemMediaSection(section: MediaSettingsSection) {
+  tab.value = 'system'
+  if (!sysExpanded.value.includes(section)) {
+    sysExpanded.value = [...sysExpanded.value, section]
+  }
+}
+
+function notifyModelSaved(title: string, section: MediaSettingsSection | null) {
+  if (!section) {
+    message.success(title)
+    return
+  }
+  const content = section === 'vision'
+    ? '模型已声明识别能力。到「系统」里选择默认识别模型后，会话才能使用。'
+    : '模型已声明生成能力。到「系统」里选择默认生成模型后，会话才能使用。'
+  let close: (() => void) | null = null
+  const notice = notification.success({
+    title,
+    content,
+    duration: 8000,
+    keepAliveOnHover: true,
+    action: () => h(
+      NButton,
+      {
+        size: 'small',
+        type: 'primary',
+        onClick: () => {
+          close?.()
+          openSystemMediaSection(section)
+        },
+      },
+      { default: () => '去设置默认' },
+    ),
+  })
+  close = () => notice.destroy()
 }
 
 async function onAddModel() {
@@ -1343,10 +1435,14 @@ async function onAddModel() {
   if (editModelType.value === 'media_generation' && !validateMediaGenerationForm()) {
     return
   }
+  const savedType = editModelType.value
+  const savedCaps = [...editModelCapabilities.value]
+  const savedOps = [...editGenerationOperations.value]
   try {
     await api.addModel(providerName, {
       name,
       type: editModelType.value,
+      protocol: editModelType.value === 'llm' ? editModelProtocol.value || undefined : undefined,
       api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value.trim() || undefined,
       max_tokens_context: editModelCtx.value ?? undefined,
@@ -1365,9 +1461,14 @@ async function onAddModel() {
         })
       } catch (capErr: any) {
         message.warning(`模型已添加, 但能力标记失败: ${capErr.message}`)
+        resetModelForm()
+        showAddModel.value = false
+        await refreshProviders()
+        notifyGenerationConfigChanged()
+        return
       }
     }
-    message.success('已添加模型')
+    notifyModelSaved('已添加模型', mediaSettingsJump(savedType, savedCaps, savedOps))
     const upstreamIndex = upstreamModels.value.findIndex(model => model.id === name)
     if (upstreamIndex >= 0) {
       upstreamModels.value[upstreamIndex] = { ...upstreamModels.value[upstreamIndex], added: true }
@@ -1394,7 +1495,8 @@ function onEditModel(m: api.ModelInfo) {
   editingModelName.value = m.name
   editModelName.value = m.name
   editModelType.value = m.type || 'llm'
-  editModelAPIEndpoint.value = m.api_endpoint || defaultLLMAPIEndpoint()
+  editModelProtocol.value = m.protocol || ''
+  editModelAPIEndpoint.value = m.api_endpoint || defaultLLMAPIEndpoint(editModelProtocol.value || selected.value.protocol)
   editModelDisplay.value = m.display_name || ''
   editModelCtx.value = m.max_tokens_context ?? null
   editModelOut.value = m.max_tokens_output ?? null
@@ -1435,6 +1537,9 @@ async function onSaveModel() {
   if (editModelType.value === 'media_generation' && !validateMediaGenerationForm()) {
     return
   }
+  const savedType = editModelType.value
+  const savedCaps = [...editModelCapabilities.value]
+  const savedOps = [...editGenerationOperations.value]
   try {
     // updateModel semantics: 0 / "" in a numeric field means
     // "leave alone" (see internal/config/manager.go
@@ -1445,6 +1550,7 @@ async function onSaveModel() {
     const out = editModelOut.value && editModelOut.value > 0 ? editModelOut.value : 0
     await api.updateModel(provider, model, {
       type: editModelType.value,
+      protocol: editModelType.value === 'llm' ? editModelProtocol.value : undefined,
       api_endpoint: editModelType.value === 'llm' ? normalizeEndpointSuffix(editModelAPIEndpoint.value) : undefined,
       display_name: editModelDisplay.value,
       max_tokens_context: ctx,
@@ -1459,7 +1565,7 @@ async function onSaveModel() {
         context_window: editModelCtx.value ?? 0,
       })
     }
-    message.success('已保存')
+    notifyModelSaved('已保存', mediaSettingsJump(savedType, savedCaps, savedOps))
     resetModelForm()
     showAddModel.value = false
     await refreshProviders()
@@ -1582,6 +1688,8 @@ function resetNewStyle() {
   newStyleLabel.value = ''
   newStylePrompt.value = ''
   newStyleMemory.value = ''
+  memoryRest.value = ''
+  memoryBullets.value = []
   isEdit.value = false
   editingStyle.value = null
 }
@@ -1597,6 +1705,7 @@ async function onCreateStyle() {
     return
   }
   try {
+    newStyleMemory.value = composeStyleMemory(memoryRest.value, memoryBullets.value)
     await api.createStyle({
       id: newStyleId.value.trim(),
       label: newStyleLabel.value.trim(),
@@ -1619,7 +1728,7 @@ async function onEditStyle(id: string) {
     newStyleId.value = s.id
     newStyleLabel.value = s.label || ''
     newStylePrompt.value = s.prompt || ''
-    newStyleMemory.value = s.memory || ''
+    applyMemoryDraft(s.memory || '')
     isEdit.value = true
     showAddStyle.value = true
   } catch (e: any) {
@@ -1627,9 +1736,22 @@ async function onEditStyle(id: string) {
   }
 }
 
+async function removeMemoryBullet(index: number) {
+  const line = memoryBullets.value[index]
+  if (!line) return
+  memoryBullets.value = memoryBullets.value.filter((_, i) => i !== index)
+  if (!isEdit.value || !editingStyle.value) return
+  try {
+    await api.deleteStyleMemoryLine(editingStyle.value.id, line)
+  } catch (e: any) {
+    message.error(e?.message || '删除记忆失败')
+  }
+}
+
 async function onUpdateStyle() {
   if (!editingStyle.value) return
   try {
+    newStyleMemory.value = composeStyleMemory(memoryRest.value, memoryBullets.value)
     await api.updateStyle(editingStyle.value.id, {
       label: newStyleLabel.value,
       prompt: newStylePrompt.value,
@@ -1714,6 +1836,7 @@ async function confirmPermDelete() {
   try {
     await api.permanentDeleteSession(id)
     archivedSessions.value = archivedSessions.value.filter(s => s.id !== id)
+    window.dispatchEvent(new Event('pchat:bookmarks-changed'))
     showConfirmPermDelete.value = false
     pendingPermDeleteId.value = ''
     message.info('已永久删除')
@@ -1864,6 +1987,10 @@ const protocolOptions = [
   { label: 'OpenAI Responses', value: 'openai_responses' },
   { label: 'Anthropic Messages', value: 'anthropic_messages' },
 ]
+const modelProtocolOptions = computed(() => [
+  { label: '跟随供应商（默认）', value: '' },
+  ...protocolOptions,
+])
 const providerPresetOptions = computed(() => {
   const options = providerPresets.value.map(preset => ({
     label: preset.display_name,
@@ -2387,6 +2514,18 @@ async function onToggleKBAutoIndex(v: boolean) {
   try { await api.updateKnowledgeConfig({ auto_index: v }); kbAutoIndex.value = v; bumpKBConfigVersion() } catch (e: any) { message.error(`切换失败: ${e.message}`) }
 }
 
+function openAddKB() {
+  newKBName.value = ''
+  newKBPath.value = ''
+  showAddKB.value = true
+}
+
+function cancelAddKB() {
+  showAddKB.value = false
+  newKBName.value = ''
+  newKBPath.value = ''
+}
+
 async function onAddKB() {
   if (!newKBName.value.trim() || !newKBPath.value.trim()) { message.warning('名称和路径为必填'); return }
   try {
@@ -2603,15 +2742,9 @@ function kbModelSupportsVision(scanModel: string) {
 }
 </script>
 <template>
-  <!-- AppSettingsLayout (PR #8) provides the new shell:
-       200px left nav + sticky header + content area. The
-       old top-tab NTabs is kept INSIDE the layout slot
-       purely as a content container — its tab bar is hidden
-       via the .settings-no-bar class on the wrapper, and
-       the nav column drives the active pane via the same
-       `tab` ref both v-models share. show is v-modeled to
-       App.vue so closing the X actually unmounts the
-       component (rather than just hiding the layout). -->
+  <!-- Left nav drives `tab`. Each pane owns its own scroll.
+       show is v-modeled to App.vue so closing the X unmounts
+       this component. -->
   <AppSettingsLayout
     v-model:show="show"
     v-model:current="tab"
@@ -2619,21 +2752,41 @@ function kbModelSupportsVision(scanModel: string) {
     title="应用设置"
     @close="close"
   >
-    <NTabs
-      v-model:value="tab"
-      type="line"
-      animated
-      class="settings-no-bar"
-    >
-      <NTabPane name="providers" tab="LLM 提供商" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
+    <template #page-actions>
+      <NButton
+        v-if="tab === 'providers'"
+        size="small"
+        type="primary"
+        ghost
+        @click="openAddProvider"
+      >
+        新增
+      </NButton>
+      <NButton
+        v-if="tab === 'styles'"
+        size="small"
+        type="primary"
+        ghost
+        @click="openNewStyleEditor"
+      >
+        新增风格
+      </NButton>
+      <NButton
+        v-if="tab === 'knowledge'"
+        size="small"
+        type="primary"
+        ghost
+        @click="openAddKB"
+      >
+        新增
+      </NButton>
+    </template>
+    <div v-if="tab === 'providers'" class="settings-pane settings-pane--fill">
         <div class="providers-split settings-split">
           <!-- Left: provider list -->
           <aside class="provider-list">
             <div class="provider-list-header">
               <span class="list-title">提供商</span>
-              <NButton size="tiny" type="primary" ghost @click="openAddProvider">
-                + 新增
-              </NButton>
             </div>
             <div class="provider-items">
               <button
@@ -2669,7 +2822,7 @@ function kbModelSupportsVision(scanModel: string) {
                 </div>
               </button>
               <div v-if="providers.length === 0" class="settings-empty provider-list-empty">
-                还没有提供商，点击上方「+ 新增」开始配置
+                还没有提供商，点击页头「新增」开始配置
               </div>
             </div>
           </aside>
@@ -2677,7 +2830,7 @@ function kbModelSupportsVision(scanModel: string) {
           <!-- Right: detail / empty -->
           <div class="provider-detail">
             <div v-if="!selected" class="settings-empty provider-detail-empty">
-              ← 选择左侧提供商，或点击「+ 新增」
+              ← 选择左侧提供商，或点击页头「新增」
             </div>
 
             <template v-else>
@@ -2767,22 +2920,63 @@ function kbModelSupportsVision(scanModel: string) {
                     <span class="settings-form-hint">供应商公共网络地址；实际请求由 Base URL 与各模型的 API 端点后缀拼接。</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
-                    <label class="settings-form-label">API Key</label>
-                    <NInput
-                      v-model:value="editAPIKey"
-                      size="small"
-                      type="password"
-                      show-password-on="click"
-                      placeholder="sk-...（留空保留原值）"
-                      @update:value="markDirty('api_key')"
-                    />
-                    <span class="settings-form-hint">点击眼睛图标可临时显示明文</span>
+                    <label class="settings-form-label">
+                      API Key
+                      <NTag
+                        v-if="editHasAPIKey && !editClearAPIKey"
+                        type="success"
+                        size="small"
+                        :bordered="false"
+                        style="margin-left: 8px"
+                      >已配置</NTag>
+                      <NTag
+                        v-else-if="editClearAPIKey"
+                        type="warning"
+                        size="small"
+                        :bordered="false"
+                        style="margin-left: 8px"
+                      >将删除</NTag>
+                      <NTag
+                        v-else
+                        type="warning"
+                        size="small"
+                        :bordered="false"
+                        style="margin-left: 8px"
+                      >未配置</NTag>
+                    </label>
+                    <div class="settings-form-inline">
+                      <NInput
+                        v-model:value="editAPIKey"
+                        size="small"
+                        type="password"
+                        show-password-on="click"
+                        :disabled="editClearAPIKey"
+                        :placeholder="editHasAPIKey ? '已配置 - 留空保留, 填写替换' : 'sk-...'"
+                        @update:value="markDirty('api_key')"
+                      />
+                      <NButton
+                        v-if="editHasAPIKey"
+                        size="tiny"
+                        quaternary
+                        type="warning"
+                        @click="editClearAPIKey = !editClearAPIKey; markDirty('api_key')"
+                      >
+                        <template v-if="editClearAPIKey">
+                          <Check :size="12" /> 将删除
+                        </template>
+                        <template v-else>
+                          删除 Key
+                        </template>
+                      </NButton>
+                    </div>
+                    <span class="settings-form-hint">密钥永不回传到界面；留空保留原值，填写后替换</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2">
                     <ProviderHeadersEditor
                       :model-value="editCustomHeaders"
                       @update:model-value="(value: ProviderHeaderRow[]) => { editCustomHeaders = value; markDirty('custom_headers') }"
                     />
+                    <span class="settings-form-hint">请求头值不回显；留空保留原值，填写后替换对应项</span>
                   </div>
                   <div class="settings-form-row settings-form-row--span2 settings-form-row--inline">
                     <div class="settings-form-toggle">
@@ -2876,7 +3070,7 @@ function kbModelSupportsVision(scanModel: string) {
                     </div>
                   </div>
                 </div>
-                <div v-else class="settings-empty">还没有模型。可点击「获取模型」选择上游模型，或手动添加模型 ID。</div>
+                <div v-else class="settings-empty">还没有模型。下一步：点击「获取模型」选择上游模型，或「添加模型」手动填写模型 ID。</div>
               </div>
             </template>
           </div>
@@ -3004,6 +3198,16 @@ function kbModelSupportsVision(scanModel: string) {
                 <code v-if="modelEndpointPreview" class="endpoint-preview">{{ modelEndpointPreview }}</code>
                 <template v-else>Base URL + 此后缀</template>。
               </span>
+            </div>
+            <div v-if="editModelType === 'llm'" class="settings-form-row settings-form-row--span2">
+              <label class="settings-form-label">请求协议</label>
+              <NSelect
+                :value="editModelProtocol"
+                :options="modelProtocolOptions"
+                size="small"
+                @update:value="onModelProtocolUpdate"
+              />
+              <span class="settings-form-hint">留空时跟随供应商协议；仅当该模型使用不同请求格式时设置。</span>
             </div>
             <div v-if="editModelType === 'llm'" class="settings-form-row">
               <label class="settings-form-label">上下文 (tokens)</label>
@@ -3207,9 +3411,9 @@ function kbModelSupportsVision(scanModel: string) {
           </div>
         </AppModal>
 
-      </NTabPane>
+    </div>
 
-      <NTabPane name="styles" tab="风格配置">
+    <div v-else-if="tab === 'styles'" class="settings-pane settings-pane--scroll">
         <div class="styles-tab-body">
           <!-- PR #9: section header now uses the unified
                .settings-section pattern. Action buttons
@@ -3218,37 +3422,10 @@ function kbModelSupportsVision(scanModel: string) {
           <div class="settings-section">
             <div class="settings-section-header">
               <h3 class="settings-section-title">已配置的风格</h3>
-              <div class="settings-form-actions">
-                <NButton size="small" type="primary" ghost
-                  @click="openNewStyleEditor">
-                  + 新增风格
-                </NButton>
-              </div>
             </div>
             <p class="settings-section-description">
               风格决定助手的语气、角色和长期备注。内置风格不可编辑，可复制后创建自定义版本。
             </p>
-            <div class="style-usage">
-              <div class="style-usage-title">使用说明</div>
-              <div class="style-usage-grid">
-                <div class="style-usage-item">
-                  <div class="style-usage-item-title">当前会话怎么用</div>
-                  <p>在聊天输入框下方打开“会话设置”，选择一个风格后，只会影响当前会话。</p>
-                </div>
-                <div class="style-usage-item">
-                  <div class="style-usage-item-title">自动生成风格</div>
-                  <p>聊天页右侧检查器的“会话操作”里有“生成风格”入口，可根据当前对话总结出新的回复风格，也可以优化已有风格。</p>
-                </div>
-                <div class="style-usage-item">
-                  <div class="style-usage-item-title">备注会一起保存</div>
-                  <p>生成风格时会同步整理备注/记忆，例如称呼偏好、常用表达和需要长期记住的背景信息。</p>
-                </div>
-                <div class="style-usage-item">
-                  <div class="style-usage-item-title">手动维护</div>
-                  <p>点击“查看/编辑”可以调整风格内容；点击“新增风格”可以从空白模板手动创建。</p>
-                </div>
-              </div>
-            </div>
           </div>
           <div class="style-grid">
             <div v-for="s in styles" :key="s.id" class="style-card">
@@ -3277,18 +3454,14 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
           </div>
 
-          <!-- 旧的「+ 新增风格」按钮已迁到上方 section header (PR #9) -->
         </div>
-      </NTabPane>
+    </div>
 
-      <NTabPane name="system" tab="系统配置">
+    <div v-else-if="tab === 'system'" class="settings-pane settings-pane--system">
         <div class="system-config-shell">
           <div class="system-config-scroll">
             <div class="system-config-body">
-              <p class="settings-section-description sys-lead">
-                上下文、Agent 循环、子代理的全局行为。修改后点击右下「保存」生效。
-              </p>
-              <NCollapse class="settings-collapse" :default-expanded-names="['work-mode', 'vision', 'window', 'context', 'agent', 'subagent']">
+              <NCollapse class="settings-collapse" v-model:expanded-names="sysExpanded">
                 <NCollapseItem title="工作模式" name="work-mode">
                   <div class="sys-form-grid">
                     <div class="sys-form-row">
@@ -3370,7 +3543,10 @@ function kbModelSupportsVision(scanModel: string) {
                           </div>
                         </div>
                       </div>
-                      <span v-if="sysRecognition[capability.kind].enabled && (!sysRecognition[capability.kind].provider || !sysRecognition[capability.kind].model)" class="settings-form-hint settings-form-hint--error">
+                      <span v-if="!recognitionHasDeclaredModel(capability.kind)" class="settings-form-hint">
+                        还没有声明此能力的模型。请到「LLM 提供商」里为模型勾选对应能力。
+                      </span>
+                      <span v-else-if="sysRecognition[capability.kind].enabled && (!sysRecognition[capability.kind].provider || !sysRecognition[capability.kind].model)" class="settings-form-hint settings-form-hint--error">
                         尚未完整配置，当前能力不可用。
                       </span>
                     </section>
@@ -3386,6 +3562,7 @@ function kbModelSupportsVision(scanModel: string) {
                       <div class="generation-default-copy">
                         <strong>{{ item.label }}</strong>
                         <span>{{ item.hint }}</span>
+                        <span v-if="!generationDefaultOptions(item.operation).length">还没有声明此能力的模型。请到「LLM 提供商」里勾选此能力。</span>
                       </div>
                       <NSelect
                         :value="generationTargetKey(sysGenerationDefaults[item.operation])"
@@ -3491,9 +3668,13 @@ function kbModelSupportsVision(scanModel: string) {
             <NButton size="small" type="primary" :disabled="!sysDirty" :loading="sysSaving" @click="saveSystemConfig">保存</NButton>
           </div>
         </div>
-      </NTabPane>
+    </div>
 
-      <NTabPane name="archive" tab="归档" style="flex: 1; min-height: 0; overflow: auto">
+    <div v-else-if="tab === 'bookmarks'" class="settings-pane settings-pane--scroll">
+      <BookmarkSettings />
+    </div>
+
+    <div v-else-if="tab === 'archive'" class="settings-pane settings-pane--scroll">
         <div class="archive-tab">
           <div v-if="!archivedSessions.length && !loadingArchived" class="settings-empty">
             暂无归档对话
@@ -3508,9 +3689,9 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
           </div>
         </div>
-      </NTabPane>
+    </div>
 
-      <NTabPane name="skills" tab="技能" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
+    <div v-else-if="tab === 'skills'" class="settings-pane settings-pane--fill">
         <div class="skills-shell settings-split">
           <div class="skill-repos-bar">
             <span class="skill-hint">官方仓库</span>
@@ -3578,9 +3759,9 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
           </div>
         </div>
-      </NTabPane>
+    </div>
 
-      <NTabPane name="mcp" tab="MCP" style="flex: 1; min-height: 0; overflow: auto">
+    <div v-else-if="tab === 'mcp'" class="settings-pane settings-pane--scroll">
         <!-- PR #9 follow-up: refactored to the unified
              .settings-section + .settings-form pattern. The
              old version had a single flex column with hard-coded
@@ -3723,21 +3904,13 @@ function kbModelSupportsVision(scanModel: string) {
             </div>
           </div>
         </div>
-      </NTabPane>
+    </div>
 
-      <NTabPane name="knowledge" tab="知识库" style="flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column">
+    <div v-else-if="tab === 'knowledge'" class="settings-pane settings-pane--fill">
         <div class="providers-split settings-split">
           <aside class="provider-list">
             <div class="provider-list-header">
               <span class="list-title">知识库 ({{ kbBases.length }})</span>
-              <NButton size="tiny" type="primary" ghost @click="showAddKB = !showAddKB">
-                {{ showAddKB ? '取消' : '+ 新增' }}
-              </NButton>
-            </div>
-            <div v-if="showAddKB" class="add-form">
-              <NInput v-model:value="newKBName" placeholder="名称" size="tiny" />
-              <NInput v-model:value="newKBPath" placeholder="本地路径" size="tiny" />
-              <NButton type="primary" size="tiny" block @click="onAddKB">添加知识库</NButton>
             </div>
             <div class="provider-items">
               <button
@@ -3773,7 +3946,7 @@ function kbModelSupportsVision(scanModel: string) {
               <div v-if="kbBases.length === 0" class="settings-empty provider-list-empty">
                 <Database :size="20" />
                 <span>还没有知识库</span>
-                <span class="settings-form-hint">点击「+ 新增」添加本地目录</span>
+                <span class="settings-form-hint">点击页头「新增」添加本地目录</span>
               </div>
             </div>
           </aside>
@@ -4083,14 +4256,37 @@ function kbModelSupportsVision(scanModel: string) {
             </template>
           </div>
         </div>
-      </NTabPane>
+        <AppModal
+          v-model:show="showAddKB"
+          title="新增知识库"
+          size="md"
+          :mask-closable="false"
+          @close="cancelAddKB"
+        >
+          <p class="modal-lead">填写名称和本地目录。添加后可在右侧扫描索引。</p>
+          <div class="settings-form">
+            <div class="settings-form-row">
+              <label class="settings-form-label">名称 <span class="settings-required">*</span></label>
+              <NInput v-model:value="newKBName" placeholder="例: docs" size="small" />
+            </div>
+            <div class="settings-form-row">
+              <label class="settings-form-label">本地路径 <span class="settings-required">*</span></label>
+              <NInput v-model:value="newKBPath" placeholder="例如 D:\docs" size="small" />
+            </div>
+          </div>
+          <template #footer>
+            <NButton size="small" quaternary @click="cancelAddKB">取消</NButton>
+            <NButton size="small" type="primary" @click="onAddKB">添加</NButton>
+          </template>
+        </AppModal>
+    </div>
 
-
-      <NTabPane name="websearch" tab="网络搜索" style="flex: 1; min-height: 0; overflow: auto">
+    <div v-else-if="tab === 'websearch'" class="settings-pane settings-pane--scroll">
         <WebSearchSettings />
-      </NTabPane>
+        <WebFetchSettings />
+    </div>
 
-      <NTabPane name="browser" tab="浏览器" style="flex: 1; min-height: 0; overflow: auto">
+    <div v-else-if="tab === 'browser'" class="settings-pane settings-pane--scroll">
         <div class="settings-section">
           <div class="settings-section-header">
             <h3 class="settings-section-title">浏览器控制</h3>
@@ -4108,7 +4304,45 @@ function kbModelSupportsVision(scanModel: string) {
           </div>
         </div>
 
-        <div class="settings-section">
+        <div v-if="!browserList.length" class="settings-section">
+          <div class="settings-section-header">
+            <h3 class="settings-section-title">安装扩展</h3>
+            <div class="settings-form-actions">
+              <NButton size="small" type="primary" ghost tag="a" :href="api.apiURL('/api/v1/browser/extension')" download>
+                下载扩展包
+              </NButton>
+            </div>
+          </div>
+          <div class="settings-section-description browser-install-copy">
+            <ol class="browser-install-steps">
+              <li>
+                <a :href="api.apiURL('/api/v1/browser/extension')" download class="browser-ext-download-link">
+                  下载浏览器扩展 zip
+                </a>
+                并解压到本地任意目录
+              </li>
+              <li>Chrome 打开 <code>chrome://extensions</code></li>
+              <li>右上角开启「开发者模式」</li>
+              <li>点击「加载已解包扩展」，选择解压目录</li>
+              <li>
+                在扩展弹窗「服务器」输入框粘贴以下地址：
+                <div class="browser-server-url-box">
+                  <code>{{ browserHTTPURL || 'http://127.0.0.1:15150' }}</code>
+                  <NButton
+                    size="tiny" quaternary
+                    @click="copyBrowserURL"
+                    :disabled="!browserHTTPURL"
+                    title="复制"
+                  >
+                    复制
+                  </NButton>
+                </div>
+              </li>
+            </ol>
+          </div>
+        </div>
+
+        <div v-if="browserList.length" class="settings-section">
           <div class="settings-section-header">
             <h3 class="settings-section-title">已连接浏览器 ({{ browserList.length }})</h3>
           </div>
@@ -4133,10 +4367,7 @@ function kbModelSupportsVision(scanModel: string) {
               最近错误时间：{{ browserLastErrorAt }}
             </div>
           </div>
-          <div v-if="!browserList.length" class="settings-empty">
-            暂无连接的浏览器，请先安装扩展
-          </div>
-          <div v-else-if="browserUpdateRequired > 0" class="browser-update-box">
+          <div v-if="browserUpdateRequired > 0" class="browser-update-box">
             <div class="browser-update-title">
               有 {{ browserUpdateRequired }} 个浏览器扩展需要更新
             </div>
@@ -4218,17 +4449,14 @@ function kbModelSupportsVision(scanModel: string) {
           </div>
         </div>
 
-        <div class="settings-section">
-          <div class="settings-section-header">
-            <h3 class="settings-section-title">安装扩展</h3>
-            <div class="settings-form-actions">
+        <NCollapse v-if="browserList.length" class="settings-collapse" :default-expanded-names="[]">
+          <NCollapseItem title="安装扩展" name="install">
+            <div class="settings-form-actions browser-install-actions">
               <NButton size="small" type="primary" ghost tag="a" :href="api.apiURL('/api/v1/browser/extension')" download>
                 下载扩展包
               </NButton>
             </div>
-          </div>
-          <div class="settings-section-description" style="margin-bottom: 0;">
-            <ol style="padding-left: 18px; line-height: 1.7; margin: 0;">
+            <ol class="browser-install-steps">
               <li>
                 <a :href="api.apiURL('/api/v1/browser/extension')" download class="browser-ext-download-link">
                   下载浏览器扩展 zip
@@ -4253,17 +4481,40 @@ function kbModelSupportsVision(scanModel: string) {
                 </div>
               </li>
             </ol>
-          </div>
-        </div>
-      </NTabPane>
+          </NCollapseItem>
+        </NCollapse>
 
-      <NTabPane name="im" tab="IM 桥接" style="flex: 1; min-height: 0; overflow: auto">
-        <IMSettings />
-      </NTabPane>
-      <NTabPane name="diagnostics" tab="诊断" style="flex: 1; min-height: 0; overflow: auto">
+        <NCollapse v-else class="settings-collapse" :default-expanded-names="[]">
+          <NCollapseItem title="连接诊断" name="diagnostics">
+            <div class="browser-diagnostics">
+              <div
+                v-for="row in browserDiagnosticRows"
+                :key="row.label"
+                class="browser-diagnostic-item"
+              >
+                <span class="browser-diagnostic-label">{{ row.label }}</span>
+                <code
+                  v-if="row.label.includes('地址')"
+                  class="browser-diagnostic-value"
+                >{{ row.value }}</code>
+                <span
+                  v-else
+                  class="browser-diagnostic-value"
+                  :class="{ 'is-error': row.label === '最近错误' && browserLastError }"
+                >{{ row.value }}</span>
+              </div>
+              <div v-if="browserLastErrorAt" class="browser-diagnostic-note">
+                最近错误时间：{{ browserLastErrorAt }}
+              </div>
+            </div>
+            <div class="settings-empty">暂无连接的浏览器，请先按上方步骤安装扩展</div>
+          </NCollapseItem>
+        </NCollapse>
+    </div>
+
+    <div v-else-if="tab === 'diagnostics'" class="settings-pane settings-pane--scroll">
         <DiagnosticsSettings />
-      </NTabPane>
-    </NTabs>
+    </div>
   </AppSettingsLayout>
 
   <NModal
@@ -4342,7 +4593,15 @@ function kbModelSupportsVision(scanModel: string) {
               </div>
             </NPopover>
           </div>
-          <NInput v-model:value="newStyleMemory" placeholder="背景资料、项目信息、用户偏好，每行一条"
+          <ul v-if="memoryBullets.length" class="memory-bullets">
+            <li v-for="(line, index) in memoryBullets" :key="`${line}-${index}`">
+              <span>{{ line.slice(2) }}</span>
+              <button type="button" aria-label="删除这条记忆" title="删除这条记忆" @click="removeMemoryBullet(index)">
+                <X :size="14" />
+              </button>
+            </li>
+          </ul>
+          <NInput v-model:value="memoryRest" placeholder="其余背景资料。以 - 开头的条目显示在上面，可以单独删除"
             type="textarea" :rows="5" size="small" class="editor-textarea" />
         </div>
       </div>
@@ -4569,6 +4828,17 @@ function kbModelSupportsVision(scanModel: string) {
   gap: 8px;
 }
 
+.settings-form-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.settings-form-inline .n-input {
+  flex: 1;
+  min-width: 0;
+}
+
 /* --- Action row ---------------------------------------------------
  * Buttons in their own row, right-aligned. Use when a form
  * needs a save/reset/submit pair at the bottom. The 8px gap
@@ -4648,60 +4918,33 @@ function kbModelSupportsVision(scanModel: string) {
   color: var(--text-quaternary);
 }
 
-/* --- Hide the NTabs top bar (unchanged from PR #8) --------------
- * The new AppSettingsLayout provides a left vertical nav that
- * drives the active tab. The NTabPanes themselves are still
- * rendered (and animated) so transitions stay smooth; we
- * just don't want the top tab strip to take up vertical
- * space. */
-.settings-no-bar :deep(.n-tabs-nav) {
-  display: none !important;
-}
-.settings-no-bar {
-  flex: 1;
+/* Each settings page owns its scroll. Fill pages stretch a
+ * split or shell to the pane; scroll pages pad and scroll. */
+.settings-pane {
+  flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
-  height: 100%;
+  box-sizing: border-box;
+}
+.settings-pane--scroll {
+  overflow: auto;
+  padding: var(--space-5) var(--space-6);
+}
+.settings-pane--fill,
+.settings-pane--system {
   display: flex;
   flex-direction: column;
   overflow: hidden;
-}
-.settings-no-bar :deep(.n-tabs-pane-wrapper) {
-  flex: 1;
-  min-height: 0;
-  overflow: hidden;
-}
-/* PR #9: every tab pane gets the same outer padding so the
- * left/right gutters are consistent across tabs. Tabs that
- * need extra spacing (e.g. providers, with a 2-column
- * inner split) can override with their own wrapper — the
- * 24px/28px gutter is a baseline, not a hard rule. */
-.settings-no-bar :deep(.n-tab-pane) {
-  height: 100%;
-  min-height: 0;
-  overflow: auto;
-  padding: 0 !important;
-  box-sizing: border-box;
-}
-.settings-no-bar :deep(.n-tab-pane) > * {
-  /* Direct children of the pane get the standard gutter
-   * unless they opt out (with .full-bleed or similar). */
-  padding: 24px 28px;
-  max-width: 100%;
-  box-sizing: border-box;
-}
-/* Split / fill tabs own their height so list+detail columns
- * stretch to the pane instead of sitting in a short strip. */
-.settings-no-bar :deep(.n-tab-pane) > .settings-split {
   padding: var(--space-4);
-  height: 100%;
-  min-height: 0;
-  overflow: hidden;
 }
-.settings-no-bar :deep(.n-tab-pane) > .system-config-shell {
+.settings-pane--system {
   padding: var(--space-4) var(--space-5);
-  height: 100%;
+}
+.settings-pane--fill > .settings-split,
+.settings-pane--system > .system-config-shell {
+  flex: 1 1 auto;
   min-height: 0;
+  height: auto;
   overflow: hidden;
 }
 
@@ -5242,56 +5485,9 @@ function kbModelSupportsVision(scanModel: string) {
 
 .muted { color: var(--text-3); font-size: 12px; }
 .empty-hint { padding: 20px; text-align: center; }
-/* Compact inline add form (knowledge-base list). Provider
- * add now uses the right detail pane instead. */
-.add-form {
-  margin: 0 8px 8px;
-  padding: 10px 12px;
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
 .styles-tab-body {
   min-height: 100%;
   overflow: visible;
-}
-.style-usage {
-  margin-top: var(--space-3);
-  padding: 0;
-  background: transparent;
-  border: none;
-}
-.style-usage-title {
-  color: var(--text-primary);
-  font-size: 13px;
-  font-weight: 600;
-  margin-bottom: var(--space-2);
-}
-.style-usage-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-3);
-}
-.style-usage-item {
-  min-width: 0;
-  padding: var(--space-3);
-  background: var(--surface-2);
-  border-radius: var(--radius-md);
-}
-.style-usage-item-title {
-  color: var(--text-primary);
-  font-size: 12.5px;
-  font-weight: 500;
-  margin-bottom: var(--space-1);
-}
-.style-usage-item p {
-  margin: 0;
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-  line-height: 1.5;
 }
 .style-grid {
   display: grid;
@@ -5409,6 +5605,31 @@ function kbModelSupportsVision(scanModel: string) {
 .editor-content { display: flex; gap: 16px; }
 .editor-col { flex: 1; display: flex; flex-direction: column; gap: 6px; }
 .editor-memory { display: flex; flex-direction: column; gap: 6px; }
+.memory-bullets {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.memory-bullets li {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.memory-bullets li span { flex: 1; }
+.memory-bullets button {
+  display: inline-flex;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 2px;
+}
+.memory-bullets button:hover { color: var(--text-primary); }
 .editor-textarea { flex: 1; }
 .editor-actions {
   display: flex;
@@ -6332,6 +6553,18 @@ code {
   flex-shrink: 0;
 }
 
+.browser-install-copy {
+  margin-bottom: 0;
+}
+.browser-install-actions {
+  margin-bottom: var(--space-3);
+}
+.browser-install-steps {
+  margin: 0;
+  padding-left: var(--space-5);
+  line-height: 1.7;
+  color: var(--text-secondary);
+}
 .browser-ext-download-link {
   color: var(--brand-500);
   text-decoration: underline;

@@ -1,12 +1,21 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
+	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
+	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/style"
 )
@@ -63,7 +72,7 @@ func newTestLocalContext(t *testing.T) (cliContext, *REPL) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
-	r := &REPL{llm: llmClient, cfg: cfg, provider: "openai", store: store}
+	r := &REPL{llm: llmClient, cfg: cfg, provider: "openai", store: store, toolCache: newToolResultCache(20)}
 	return r.asContext(), r
 }
 
@@ -130,16 +139,10 @@ func TestHTTPEventToChunk_PreservesRichStreamFields(t *testing.T) {
 	}
 }
 
-// TestIsUnsupported_TrueForHTTPStub verifies that the HTTP context
-// returns *ErrUnsupported for the operations the server doesn't
-// implement, and that errors.As picks them up correctly.
+// TestIsUnsupported_TrueForHTTPStub verifies that errors.As recognizes the
+// remaining HTTP-unsupported local-file operations.
 func TestIsUnsupported_TrueForHTTPStub(t *testing.T) {
 	httpCtx := &httpContext{c: nil, style: "cute", prov: "openai"}
-	if err := httpCtx.AddProvider(ProviderConfigInput{}); err == nil {
-		t.Fatal("httpContext.AddProvider should error")
-	} else if !isUnsupported(err) {
-		t.Errorf("httpContext.AddProvider err = %v, want ErrUnsupported", err)
-	}
 
 	if _, err := httpCtx.ListSkills(); err == nil {
 		t.Fatal("httpContext.ListSkills should error")
@@ -191,6 +194,60 @@ func TestHTTPContext_SandboxNoOp(t *testing.T) {
 	}
 }
 
+func TestHTTPContext_InstructionObservationsUseCurrentSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/sessions/session-1/rules":
+			_ = json.NewEncoder(w).Encode(map[string]any{"rules": []httpcli.RuleInfo{{Name: "global", Scope: "global", Path: "/global/rules/global.md"}, {Name: "project", Scope: "project", Path: "/project/.p-chat/rules/project.md"}}})
+		case "/api/v1/sessions/session-1/agents":
+			_ = json.NewEncoder(w).Encode(httpcli.AgentsContext{Candidates: []httpcli.AgentsCandidate{{Slot: "project_root", Label: "项目根", Path: "/project/AGENTS.md", Exists: true, Selected: true}}, Prompt: "## Agent Instructions\n\n### Project (root)\n\nproject"})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	ctx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "session-1")
+	rules, err := ctx.ListRules()
+	if err != nil || len(rules) != 2 || rules[1].Scope != "project" {
+		t.Fatalf("ListRules = %+v, %v", rules, err)
+	}
+	agents, err := ctx.AgentsContext()
+	if err != nil || len(agents.Candidates) != 1 || !agents.Candidates[0].Selected || !strings.Contains(agents.Prompt, "Project (root)") {
+		t.Fatalf("AgentsContext = %+v, %v", agents, err)
+	}
+}
+
+func TestHTTPContext_ToolsSettingIsSentWithMessages(t *testing.T) {
+	var got httpcli.SendMessageOptions
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+	}))
+	defer srv.Close()
+
+	ctx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "conv-1")
+	ctx.SetToolsEnabled(false)
+	stream, err := ctx.ChatWithTools(context.Background(), agent.ChatRequest{
+		Style:    style.Tech,
+		Messages: []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: "hello"}},
+	})
+	if err != nil {
+		t.Fatalf("ChatWithTools: %v", err)
+	}
+	for range stream {
+	}
+	if ctx.ToolsEnabled() {
+		t.Fatal("ToolsEnabled stayed true after disabling tools")
+	}
+	if got.ToolsEnabled == nil || *got.ToolsEnabled {
+		t.Fatalf("tools_enabled = %v, want explicit false", got.ToolsEnabled)
+	}
+}
+
 // TestLocalContext_ListProviders confirms ListProviders returns the
 // same providers the on-disk config has.
 func TestLocalContext_ListProviders(t *testing.T) {
@@ -214,8 +271,7 @@ func TestLocalContext_ListProviders(t *testing.T) {
 }
 
 // TestLocalContext_ProviderConfig returns the rich view used by
-// /provider, including the APIKey (caller responsibility to mask
-// it before display).
+// /provider, including whether an API key is configured without exposing it.
 func TestLocalContext_ProviderConfig(t *testing.T) {
 	ctx, _ := newTestLocalContext(t)
 	v, err := ctx.ProviderConfig("cs")
@@ -225,8 +281,8 @@ func TestLocalContext_ProviderConfig(t *testing.T) {
 	if v.Protocol != "openai" {
 		t.Errorf("protocol = %q, want openai", v.Protocol)
 	}
-	if v.APIKey != "sk-y" {
-		t.Errorf("APIKey = %q, want sk-y", v.APIKey)
+	if !v.APIKeySet {
+		t.Error("APIKeySet = false, want true")
 	}
 	if v.Model != "doubao" {
 		t.Errorf("Model = %q, want doubao", v.Model)
@@ -292,6 +348,60 @@ func TestLocalContext_ToolsEnabledSetGet(t *testing.T) {
 	}
 }
 
+func TestHTTPContext_ProjectsScopeListsAndCreatesSessions(t *testing.T) {
+	projectPath := "D:/work/my project"
+	var listSeen, createSeen bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method + " " + r.URL.Path {
+		case "GET /api/v1/sessions":
+			listSeen = true
+			if got := r.URL.Query().Get("project_path"); got != projectPath {
+				t.Fatalf("list project_path = %q, want %q", got, projectPath)
+			}
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		case "POST /api/v1/sessions":
+			createSeen = true
+			var opts httpcli.CreateSessionOpts
+			if err := json.NewDecoder(r.Body).Decode(&opts); err != nil {
+				t.Fatal(err)
+			}
+			if opts.ProjectPath != projectPath {
+				t.Fatalf("create project_path = %q, want %q", opts.ProjectPath, projectPath)
+			}
+			_, _ = w.Write([]byte(`{"id":"project-session"}`))
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	ctx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "project-session", projectPath)
+	if _, err := ctx.ListSessions(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ctx.NewSession(context.Background(), httpcli.CreateSessionOpts{}); err != nil {
+		t.Fatal(err)
+	}
+	if !listSeen || !createSeen {
+		t.Fatalf("listSeen=%v createSeen=%v", listSeen, createSeen)
+	}
+}
+
+func TestHTTPContext_RejectsCrossProjectSessionSwitch(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "GET" || r.URL.Path != "/api/v1/sessions/other-project" {
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+		_, _ = w.Write([]byte(`{"id":"other-project","project_path":"D:/other"}`))
+	}))
+	defer srv.Close()
+
+	ctx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "current", "D:/current")
+	if err := ctx.SetCurrentSession("other-project"); err == nil {
+		t.Fatal("SetCurrentSession accepted a session outside the active project")
+	}
+}
+
 // TestLocalContext_SessionLifecycle walks NewSession �?ListSessions
 // �?RenameSession �?SetCurrentSession �?DeleteSession.
 func TestLocalContext_SessionLifecycle(t *testing.T) {
@@ -332,11 +442,158 @@ func TestLocalContext_ExpandCache_Empty(t *testing.T) {
 	if got := ctx.ExpandList(); got != nil {
 		t.Errorf("ExpandList on empty cache = %+v, want nil", got)
 	}
-	if _, ok := ctx.ExpandLast(); ok {
+	if _, ok, err := ctx.ExpandLast(); err != nil || ok {
 		t.Error("ExpandLast on empty cache returned ok=true")
 	}
-	if _, ok := ctx.ExpandByIndex(1); ok {
+	if _, ok, err := ctx.ExpandByIndex(1); err != nil || ok {
 		t.Error("ExpandByIndex on empty cache returned ok=true")
+	}
+}
+
+func TestLocalContext_ExpandCache_RecordsTerminalToolResult(t *testing.T) {
+	ctx, repl := newTestLocalContext(t)
+	lc := asLocalContext(ctx)
+	lc.recordToolChunk("session-a", agent.ChatStreamChunk{ToolID: "call-a", ToolName: "read_file", ToolArgs: `{"path":"a.txt"}`, ToolResult: "file content", ToolElapsed: "12ms"})
+
+	result, ok, err := lc.ExpandLast()
+	if err != nil || !ok {
+		t.Fatalf("ExpandLast = (%+v, %v, %v)", result, ok, err)
+	}
+	if result.Result != "file content" || result.Tool != "read_file" || result.Duration != 12*time.Millisecond {
+		t.Fatalf("result = %+v", result)
+	}
+	if repl.toolCache.len() != 1 {
+		t.Fatalf("cache len = %d", repl.toolCache.len())
+	}
+}
+
+func TestHTTPContext_ExpandLoadsTruncatedResultOnceAndKeepsSession(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.URL.Path != "/api/v1/sessions/session-a/messages/0/tool-result/call-a" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"tool_id":"call-a","content":"complete output","bytes":15}`))
+	}))
+	defer srv.Close()
+
+	ctx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "session-a").(*httpContext)
+	ctx.recordToolChunk("session-a", agent.ChatStreamChunk{ToolID: "call-a", ToolName: "exec_command", ToolResult: "preview", ToolResultTruncated: true, ToolResultFullLen: 15})
+
+	first, ok, err := ctx.ExpandLast()
+	if err != nil || !ok || first.Result != "complete output" {
+		t.Fatalf("first expand = (%+v, %v, %v)", first, ok, err)
+	}
+	second, ok, err := ctx.ExpandLast()
+	if err != nil || !ok || second.Result != "complete output" {
+		t.Fatalf("second expand = (%+v, %v, %v)", second, ok, err)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want 1 after cache backfill", requests)
+	}
+}
+
+func TestHTTPContext_ExpandUsesOwningSessionAndReportsExpiredResult(t *testing.T) {
+	t.Run("owning session", func(t *testing.T) {
+		var paths []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.Path)
+			_, _ = w.Write([]byte(`{"content":"full"}`))
+		}))
+		defer srv.Close()
+
+		ctx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "active").(*httpContext)
+		ctx.recordToolChunk("session-a", agent.ChatStreamChunk{ToolID: "call-a", ToolName: "a", ToolResult: "a", ToolResultTruncated: true})
+		ctx.recordToolChunk("session-b", agent.ChatStreamChunk{ToolID: "call-b", ToolName: "b", ToolResult: "b", ToolResultTruncated: true})
+		if _, ok, err := ctx.ExpandByIndex(2); err != nil || !ok {
+			t.Fatalf("ExpandByIndex = ok=%v err=%v", ok, err)
+		}
+		if len(paths) != 1 || paths[0] != "/api/v1/sessions/session-b/messages/0/tool-result/call-b" {
+			t.Fatalf("paths = %v", paths)
+		}
+	})
+
+	t.Run("expired", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, `{"error":"tool result not found or expired"}`, http.StatusNotFound)
+		}))
+		defer srv.Close()
+
+		ctx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "session-a").(*httpContext)
+		ctx.recordToolChunk("session-a", agent.ChatStreamChunk{ToolID: "call-a", ToolName: "exec", ToolResult: "preview", ToolResultTruncated: true})
+		_, ok, err := ctx.ExpandLast()
+		if ok || err == nil || !strings.Contains(err.Error(), "可能已过期") {
+			t.Fatalf("ExpandLast = ok=%v err=%v", ok, err)
+		}
+	})
+}
+
+func TestREPLHTTPKnowledgeCommandsUseServerWithoutWritingLocalConfig(t *testing.T) {
+	var added httpcli.KnowledgeBase
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/knowledge/bases":
+			if err := json.NewDecoder(r.Body).Decode(&added); err != nil {
+				t.Fatal(err)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/knowledge/config":
+			var patch struct {
+				Enabled *bool `json:"enabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				t.Fatal(err)
+			}
+			if patch.Enabled == nil || !*patch.Enabled {
+				t.Fatalf("knowledge patch = %+v, want enabled=true", patch)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/knowledge/bases":
+			_ = json.NewEncoder(w).Encode([]httpcli.KnowledgeBase{{Name: added.Name, Path: added.Path, Enabled: true, DocCount: 3}})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/scan"):
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/scan/status"):
+			_ = json.NewEncoder(w).Encode(httpcli.KnowledgeScanStatus{Message: "扫描中...", Current: 1, Total: 3, Chunks: 2})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/knowledge/search":
+			_ = json.NewEncoder(w).Encode(httpcli.KnowledgeSearchResponse{Results: []httpcli.KnowledgeSearchResult{{Title: "Guide", Source: "guide.md", Content: "install"}}})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	configPath := filepath.Join(t.TempDir(), "server-overlay.json")
+	httpCtx := NewHTTPContext(httpcli.NewClient(srv.URL), "tech", "coding", "openai", "session-a").(*httpContext)
+	r := NewREPL(httpCtx, &config.Config{}, style.Tech, "openai")
+	r.SetKBManager(NewKBManager(&config.Config{}, configPath))
+	if got := r.asContext(); got != httpCtx {
+		t.Fatalf("asContext() = %T, want original HTTP context", got)
+	}
+
+	dir := t.TempDir()
+	if err := r.asContext().AddKB(dir); err != nil {
+		t.Fatalf("AddKB: %v", err)
+	}
+	if added.Path != dir || added.Name != filepath.Base(dir) || !added.Enabled {
+		t.Fatalf("server base = %+v", added)
+	}
+	if _, err := os.Stat(configPath); !os.IsNotExist(err) {
+		t.Fatalf("CLI wrote local overlay %q: %v", configPath, err)
+	}
+
+	if bases, err := r.asContext().ListKBs(); err != nil || len(bases) != 1 || bases[0].Files != 3 {
+		t.Fatalf("ListKBs = %+v, %v", bases, err)
+	}
+	if started, _, err := r.asContext().ScanKBs(); err != nil || started != 1 {
+		t.Fatalf("ScanKBs = (%d, %v)", started, err)
+	}
+	status, err := r.asContext().GetKBScanStatus(context.Background(), added.Name)
+	if err != nil || status.Message != "扫描中..." || status.Current != 1 || status.Total != 3 {
+		t.Fatalf("GetKBScanStatus = %+v, %v", status, err)
+	}
+	if err := r.asContext().Recall(context.Background(), "install", 5); err != nil {
+		t.Fatalf("Recall: %v", err)
 	}
 }
 

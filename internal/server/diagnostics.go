@@ -12,8 +12,10 @@ package server
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"path/filepath"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -58,6 +60,9 @@ func (h *Handler) DiagnosticsHeapSnapshot(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory monitor not enabled"})
 		return
 	}
+	if !allowDiagnosticsSnapshot(c) {
+		return
+	}
 	path, err := h.memMon.writeHeap()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -74,6 +79,9 @@ func (h *Handler) DiagnosticsGoroutineSnapshot(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory monitor not enabled"})
 		return
 	}
+	if !allowDiagnosticsSnapshot(c) {
+		return
+	}
 	path, err := h.memMon.writeGoroutine()
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -81,4 +89,38 @@ func (h *Handler) DiagnosticsGoroutineSnapshot(c *gin.Context) {
 	}
 	c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, filepath.Base(path)))
 	c.File(path)
+}
+
+// allowDiagnosticsSnapshot 在 SEC-01 管理级鉴权完全接线前提供默认关闭、仅本机的双闸门。
+// allowDiagnosticsSnapshot provides default-off and loopback-only gates until SEC-01 management auth is fully wired.
+func allowDiagnosticsSnapshot(c *gin.Context) bool {
+	if !diagnosticsSnapshotsEnabled() {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":      "diagnostics snapshot downloads are disabled; set PC_DIAGNOSTICS_SNAPSHOTS=1 before server startup to enable them on loopback",
+			"error_kind": "diagnostics_snapshot_disabled",
+		})
+		return false
+	}
+	if !isLoopbackRemoteAddr(c.Request.RemoteAddr) {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":      "diagnostics snapshot downloads are restricted to loopback clients",
+			"error_kind": "diagnostics_snapshot_local_only",
+		})
+		return false
+	}
+	return true
+}
+
+// isLoopbackRemoteAddr 仅信任服务端提供的 TCP 对端地址，绝不信任可伪造的转发头。
+// isLoopbackRemoteAddr only trusts the TCP peer address supplied by the server.
+func isLoopbackRemoteAddr(remoteAddr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(remoteAddr))
+	if err != nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(host), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(strings.TrimSpace(host), "[]"))
+	return ip != nil && ip.IsLoopback()
 }

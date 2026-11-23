@@ -27,8 +27,8 @@ type QuotaTracker struct {
 	limit atomic.Int64
 
 	mu     sync.Mutex
-	day    string // UTC date in YYYY-MM-DD
-	used   int    // count for the current day
+	day    string           // UTC date in YYYY-MM-DD
+	used   int              // count for the current day
 	dateFn func() time.Time // overridable for tests
 }
 
@@ -141,6 +141,7 @@ func (q *QuotaTracker) rolloverLocked() {
 // ====================================================================
 
 var globalQuota atomic.Pointer[QuotaTracker]
+var fetchQuota atomic.Pointer[QuotaTracker]
 
 func init() {
 	// Start unlimited; the server sets the real limit on
@@ -148,6 +149,8 @@ func init() {
 	// changes.
 	q := NewQuotaTracker(0)
 	globalQuota.Store(q)
+	fq := NewQuotaTracker(0)
+	fetchQuota.Store(fq)
 }
 
 // SetQuotaLimit updates the process-wide daily cap. Existing
@@ -170,6 +173,26 @@ func Quota() *QuotaTracker {
 	if q == nil {
 		q = NewQuotaTracker(0)
 		globalQuota.Store(q)
+	}
+	return q
+}
+
+// SetFetchQuotaLimit updates the vendor web_fetch daily cap.
+func SetFetchQuotaLimit(limit int) {
+	q := fetchQuota.Load()
+	if q == nil {
+		q = NewQuotaTracker(0)
+		fetchQuota.Store(q)
+	}
+	q.SetLimit(limit)
+}
+
+// FetchQuota returns the vendor web_fetch tracker. Never returns nil.
+func FetchQuota() *QuotaTracker {
+	q := fetchQuota.Load()
+	if q == nil {
+		q = NewQuotaTracker(0)
+		fetchQuota.Store(q)
 	}
 	return q
 }

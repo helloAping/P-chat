@@ -64,10 +64,11 @@
   --text-tertiary:    #6B7180;
   --text-quaternary:  #4A4F5C;
 
-  /* 2.3 Borders */
-  --border-subtle:    rgba(255, 255, 255, 0.06);
-  --border-default:   rgba(255, 255, 255, 0.10);
-  --border-strong:    rgba(255, 255, 255, 0.16);
+  /* 2.3 Borders — hairline. Controls rest on subtle;
+   * default is hover / floating edges only. */
+  --border-subtle:    rgba(255, 255, 255, 0.05);
+  --border-default:   rgba(255, 255, 255, 0.08);
+  --border-strong:    rgba(255, 255, 255, 0.12);
 
   /* 2.4 Brand — drives primary CTA, active item highlight, streaming
    * dot, and the Naive UI primaryColor (read via getComputedStyle in
@@ -91,6 +92,10 @@
   /* 2.6 Status */
   --success-50:       rgba(85, 170, 85, 0.16);
   --success-500:      #5AAE5A;
+  /* Question selection only. Does not replace --brand-*. */
+  --question-green:       #8FB59A;
+  --question-green-ink:   #C5DCCB;
+  --question-on-green:    #1C1F26;
   --warn-50:          rgba(234, 170, 85, 0.16);
   --warn-500:         #EAAA55;
   --error-50:         rgba(238, 85, 85, 0.14);
@@ -167,7 +172,7 @@
   /* 2.10b Glass — titlebar / modal mask / lightbox only.
    * Do not use for main reading surfaces (sidebar, messages). */
   --glass-bg:         rgba(20, 23, 31, 0.72);
-  --glass-border:     rgba(255, 255, 255, 0.08);
+  --glass-border:     rgba(255, 255, 255, 0.06);
   --glass-blur:       16px;
   /* Modal / dialog panel: higher opacity than chrome glass so
    * form text stays readable while still picking up a soft blur. */
@@ -198,6 +203,7 @@
   --dur-fast:         120ms;
   --dur-base:         200ms;
   --dur-slow:         320ms;
+  --dur-highlight:    2400ms;
   --transition-colors:
     background-color var(--dur-fast) var(--ease-out),
     color var(--dur-fast) var(--ease-out),
@@ -226,9 +232,9 @@
   --text-tertiary:    #797F8C;
   --text-quaternary:  #9CA1AC;
 
-  --border-subtle:    rgba(0, 0, 0, 0.04);
-  --border-default:   rgba(0, 0, 0, 0.10);
-  --border-strong:    rgba(0, 0, 0, 0.16);
+  --border-subtle:    rgba(0, 0, 0, 0.05);
+  --border-default:   rgba(0, 0, 0, 0.07);
+  --border-strong:    rgba(0, 0, 0, 0.11);
 
   --brand-50:         rgba(64, 66, 230, 0.10);
   --brand-100:        rgba(64, 66, 230, 0.20);
@@ -249,6 +255,10 @@
   --ai-100:           rgba(91, 61, 187, 0.16);
   --ai-500:           #5B3DDB;
   --ai-600:           #4A2EBF;
+  /* Question selection only. Same hue as dark, tuned for a light surface. */
+  --question-green:       #6FA884;
+  --question-green-ink:   #3E6B4C;
+  --question-on-green:    #FFFFFF;
 
   /* 2.7b Code highlight — GitHub-light palette. Dark text on a
    * light grey code surface so code stays readable on white. */
@@ -276,7 +286,7 @@
 
   /* 2.10b Glass — light theme */
   --glass-bg:         rgba(247, 248, 250, 0.78);
-  --glass-border:     rgba(0, 0, 0, 0.08);
+  --glass-border:     rgba(0, 0, 0, 0.06);
   --glass-blur:       16px;
   --glass-panel-bg:   rgba(255, 255, 255, 0.94);
   --titlebar-height:  36px;
@@ -292,6 +302,9 @@
   --inspector-width:  var(--inspector-user-width, var(--inspector-default-width));
   --project-switcher-width: 320px;
   --event-rail-color: var(--border-default);
+
+  /* 搜索命中轮廓的单次停留动画。 / One-shot search-hit outline. */
+  --dur-highlight:    2400ms;
 
   color-scheme: light;
 }
@@ -352,6 +365,14 @@
   --text-4:    var(--text-quaternary);
   --border:    var(--border-default);
   --border-2:  var(--border-strong);
+
+  /* Shared control chrome. Buttons, inputs, checks, and
+   * radios read these so a focus ring is a soft wash,
+   * not a hard brand stroke. */
+  --control-border: 1px solid var(--border-subtle);
+  --control-border-hover: 1px solid var(--border-default);
+  --control-focus-border: 1px solid color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  --control-focus-ring: 0 0 0 3px color-mix(in srgb, var(--brand-500) 10%, transparent);
   --accent:    var(--brand-500);
   --accent-2:  var(--brand-600);
   --accent-soft:   var(--brand-50);
@@ -408,9 +429,19 @@ html, body, #app {
 
 /* --- 8. Focus ring (consistent across the app) -------------------------- */
 :focus-visible {
-  outline: 2px solid var(--brand-500);
+  outline: 2px solid color-mix(in srgb, var(--brand-500) 42%, transparent);
   outline-offset: 2px;
   border-radius: var(--radius-sm);
+}
+
+/* Naive paints a brand stroke on checkbox hover even when
+ * unchecked. Keep the resting hairline until the box is checked. */
+.n-checkbox:not(.n-checkbox--checked):hover .n-checkbox-box__border {
+  border: var(--control-border-hover) !important;
+}
+.n-checkbox--checked .n-checkbox-box__border,
+.n-checkbox--checked:hover .n-checkbox-box__border {
+  border: 1px solid var(--brand-500) !important;
 }
 
 /* --- 8b. Floating Menus ------------------------------------------------
@@ -536,12 +567,12 @@ html, body, #app {
   display: flex !important;
   flex-direction: row !important;
   flex-wrap: nowrap;
-  align-items: center;
+  align-items: center !important;
   gap: 0;
   overflow: hidden;
   border-radius: var(--radius-sm) !important;
   color: var(--text-secondary) !important;
-  line-height: 1.3 !important;
+  line-height: 1 !important;
 }
 
 .app-action-menu .n-dropdown-option .n-dropdown-option-body::before {
@@ -580,12 +611,18 @@ html, body, #app {
 }
 
 .app-action-menu .n-dropdown-option .n-dropdown-option-body__label {
+  display: flex !important;
+  align-items: center !important;
+  align-self: stretch;
+  height: 100%;
   flex: 1 1 auto;
   min-width: 0;
+  margin: 0 !important;
+  padding: 0 !important;
   color: inherit !important;
   font-size: 13px;
   font-weight: 500;
-  line-height: 1.3;
+  line-height: 1 !important;
   white-space: nowrap;
 }
 
@@ -594,6 +631,7 @@ html, body, #app {
   flex-direction: row;
   flex-wrap: nowrap;
   align-items: center;
+  height: 100%;
   gap: var(--space-2);
   min-width: 0;
   width: 100%;

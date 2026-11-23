@@ -30,7 +30,7 @@ test('system and session settings expose independent media capabilities', () => 
   assert.match(settings, /kind: 'image'[\s\S]*?kind: 'video'[\s\S]*?kind: 'audio'/)
   assert.match(settings, /patch\.recognition = \{ routes: sysRecognition\.value \}/)
   assert.match(input, /enabled_recognition_capabilities: value/)
-  assert.match(input, /<span>媒体识别<\/span>[\s\S]*?data-testid="session-recognition-dropdown"/)
+  assert.match(input, /data-testid="session-recognition-dropdown"[\s\S]*?<span>媒体识别<\/span>/)
 })
 
 test('media generation uses app defaults with per-session hard switches', () => {
@@ -101,7 +101,7 @@ test('browser screenshots use the same durable media asset card as generated out
 
 test('all Naive UI selects use the session picker visual language', () => {
   assert.match(app, /Select: \{[\s\S]*?InternalSelection: \{[\s\S]*?color: 'var\(--surface-2\)'/)
-  assert.match(app, /border: '1px solid var\(--border-subtle\)'/)
+  assert.match(app, /InternalSelection: \{[\s\S]*?border: 'var\(--control-border\)'/)
   assert.match(app, /borderRadius: 'var\(--radius-sm\)'/)
   assert.match(app, /InternalSelectMenu: \{[\s\S]*?optionColorPending: 'var\(--surface-3\)'/)
 })

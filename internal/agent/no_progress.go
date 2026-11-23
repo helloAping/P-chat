@@ -29,11 +29,12 @@ const (
 // progress — they change state or wait on the user. Any round containing one
 // resets the no-progress streak.
 var mutatingTools = map[string]bool{
-	"write_file": true,
-	"edit_file":  true,
-	"todo_write": true,
-	"question":   true,
-	"task":       true,
+	"write_file":  true,
+	"edit_file":   true,
+	"apply_patch": true,
+	"todo_write":  true,
+	"question":    true,
+	"task":        true,
 }
 
 // pathLikeTokenRe matches the file-path portion of a shell token: a run of

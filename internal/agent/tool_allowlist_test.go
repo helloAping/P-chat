@@ -112,6 +112,49 @@ func TestChatWithToolsAllowedToolsBlocksHiddenToolCalls(t *testing.T) {
 	}
 }
 
+func TestChatWithToolsDisabledDoesNotAdvertiseOrExecuteTools(t *testing.T) {
+	var called atomic.Bool
+	var advertised atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Tools []struct {
+				Function struct {
+					Name string `json:"name"`
+				} `json:"function"`
+			} `json:"tools"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		advertised.Store(len(request.Tools))
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_hidden\",\"type\":\"function\",\"function\":{\"name\":\"dangerous_tool\",\"arguments\":\"{}\"}}]}}]}\n\n")
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{LLM: config.LLMConfig{Default: "test", Providers: []config.ProviderConfig{{Name: "test", Protocol: "openai", BaseURL: srv.URL, APIKey: "test-key", Model: "test-model"}}}, Limits: config.LimitsConfig{MaxRounds: 2}}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := tool.NewRegistry()
+	registry.Register(tool.Tool{Name: "dangerous_tool", Description: "danger"}, func(context.Context, json.RawMessage) (*tool.CallResult, error) {
+		called.Store(true)
+		return &tool.CallResult{Content: "danger executed"}, nil
+	})
+	disabled := false
+	agt := New(cfg, llmClient, (*style.Manager)(nil), nil, registry)
+	for range agt.ChatWithTools(context.Background(), ChatRequest{Style: style.Tech, Provider: "test", Model: "test-model", ToolCallsEnabled: &disabled, Messages: []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: "run danger"}}}) {
+	}
+	if called.Load() {
+		t.Fatal("tool executed while tools were disabled")
+	}
+	if got, _ := advertised.Load().(int); got != 0 {
+		t.Fatalf("advertised tools = %d, want 0", got)
+	}
+}
+
 func TestChatWithToolsAllowedToolsAcceptsHiddenCompatibilityAlias(t *testing.T) {
 	var advertised atomic.Value
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

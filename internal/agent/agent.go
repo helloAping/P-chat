@@ -65,6 +65,7 @@ type Agent struct {
 	skillManager skill.Manager
 	rules        []rules.Rule
 	sandbox      tool.SandboxChecker // optional; nil disables sandbox enforcement
+	fileJournal  *tool.FileJournal   // optional; AE-07 undo snapshots for file tools
 	options      llm.ChatOptions     // per-request sampling; populated from cfg
 	attach       AttachmentResolver  // optional; turns Attachment IDs into file paths for upload expansion
 	// generationExecutor is invoked only after the request-scoped operation
@@ -140,6 +141,27 @@ func (a *Agent) SetChatOptions(opts llm.ChatOptions) {
 // getStyleMemory 读取当前风格的 Memory 内容。空字符串表示未配置。
 // Memory 存储在数据库 styles.memory 列，是用户自定义的背景知识，
 // 动态注入到每轮对话末尾。
+func (a *Agent) persistTurnReplay(sessionID string, messageID int64) {
+	if a == nil || a.fileJournal == nil || a.store == nil || sessionID == "" || messageID <= 0 {
+		return
+	}
+	previews := a.fileJournal.CurrentTurnPreviews(sessionID)
+	if len(previews) == 0 {
+		return
+	}
+	rows := make([]memory.TurnChange, 0, len(previews))
+	for _, preview := range previews {
+		rows = append(rows, memory.TurnChange{
+			Tool:    preview.Tool,
+			Path:    preview.Path,
+			Preview: preview.Preview,
+		})
+	}
+	if err := a.store.ReplaceTurnChanges(sessionID, messageID, rows); err != nil {
+		log.Printf("[agent] persist turn replay: %v", err)
+	}
+}
+
 func (a *Agent) getStyleMemory(s style.Style) string {
 	if s.IsOff() {
 		return ""
@@ -156,6 +178,17 @@ func (a *Agent) getStyleMemory(s style.Style) string {
 // dangerous operations. Pass nil to disable sandboxing.
 func (a *Agent) SetSandbox(s tool.SandboxChecker) {
 	a.sandbox = s
+}
+
+// SetFileJournal installs the AE-07 file-change journal used to undo
+// write_file / edit_file / apply_patch mutations from the latest turn.
+func (a *Agent) SetFileJournal(j *tool.FileJournal) {
+	a.fileJournal = j
+}
+
+// FileJournal returns the agent's file journal (may be nil).
+func (a *Agent) FileJournal() *tool.FileJournal {
+	return a.fileJournal
 }
 
 func (a *Agent) loadProjectDynamicTools(projectRoot string) {
@@ -272,18 +305,18 @@ func (a *Agent) SetSubAgentConcurrency(max int) {
 	}
 }
 
-// protocolFor returns the configured protocol ("openai" /
-// "anthropic" / ...) for the given provider name. Falls back to
+// protocolFor returns the effective protocol for a provider/model pair.
+// A model-level override wins over the provider protocol. Falls back to
 // "openai" when the provider is unknown — the existing LLM
 // client already falls back to OpenAI shape in that case so
 // attachment expansion does the same.
-func (a *Agent) protocolFor(providerName string) string {
+func (a *Agent) protocolFor(providerName, modelName string) string {
 	if a.cfg == nil {
 		return "openai"
 	}
 	for _, p := range a.cfg.LLM.Providers {
 		if p.Name == providerName {
-			return p.GetProtocol()
+			return p.ModelProtocol(modelName)
 		}
 	}
 	return "openai"
@@ -605,7 +638,7 @@ func (a *Agent) modelSupportsInput(providerName, modelName string, kind config.M
 	if kind == config.MediaImage {
 		return a.modelSupportsVision(providerName, modelName)
 	}
-	if a == nil || a.cfg == nil || a.protocolFor(providerName) != "openai" {
+	if a == nil || a.cfg == nil || !config.ProtocolIsOpenAICompatible(a.protocolFor(providerName, modelName)) {
 		return false
 	}
 	for _, provider := range a.cfg.LLM.Providers {
@@ -638,7 +671,7 @@ func (a *Agent) mediaRecognitionRoute(kind config.MediaKind) (config.Recognition
 	if !ok {
 		return config.RecognitionRoute{}, false
 	}
-	if kind != config.MediaImage && a.protocolFor(route.Provider) != "openai" {
+	if kind != config.MediaImage && !config.ProtocolIsOpenAICompatible(a.protocolFor(route.Provider, route.Model)) {
 		return config.RecognitionRoute{}, false
 	}
 	if !a.modelExplicitlySupportsInput(route.Provider, route.Model, kind) {
@@ -1294,6 +1327,13 @@ type ChatRequest struct {
 	// entries (text + image/file) before being sent to the LLM.
 	// Nil/empty = no attachments.
 	Attachments []Attachment `json:"attachments,omitempty"`
+	// DocumentContextAttachments supplies already-persisted current-turn
+	// documents that need a first-request preview without being expanded or
+	// persisted again (for example an automatic resume after a timeout).
+	DocumentContextAttachments []Attachment `json:"-"`
+	// AttachmentSignature is computed from the original request payload before
+	// inline fallbacks are materialized, then persisted on the root user row.
+	AttachmentSignature string `json:"-"`
 	// UseImageRecognition 让上传图片绕过主模型；当前轮先识别，后续轮次可按 upload_id 回看。
 	// UseImageRecognition keeps uploaded images out of the main model.
 	// Current-turn image attachments are recognized before the main model call
@@ -1327,6 +1367,9 @@ type ChatRequest struct {
 	// PlanMode, when true, asks the LLM to produce a step-by-step
 	// plan in plain text instead of executing tools.
 	PlanMode bool `json:"plan_mode,omitempty"`
+	// ToolCallsEnabled 可按请求覆盖工具可用性；nil 保持既有默认行为。
+	// ToolCallsEnabled optionally overrides tool availability for this request.
+	ToolCallsEnabled *bool `json:"tool_calls_enabled,omitempty"`
 	// TurnModePolicy controls whether this turn is routed as auto/plan/build.
 	// Empty keeps the legacy PlanMode boolean behavior.
 	TurnModePolicy TurnModePolicy `json:"turn_mode_policy,omitempty"`
@@ -1516,6 +1559,12 @@ type ChatStreamChunk struct {
 
 	TokensIn  int `json:"tokens_in,omitempty"`
 	TokensOut int `json:"tokens_out,omitempty"`
+	// AE-03: prompt-cache telemetry when the provider reports it.
+	// CacheReported distinguishes "provider said 0 hits" from
+	// "provider did not report cache at all".
+	CacheHitTokens  int  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int  `json:"cache_miss_tokens,omitempty"`
+	CacheReported   bool `json:"cache_reported,omitempty"`
 
 	// SubAgent is true when this chunk originated from a
 	// sub-agent (e.g. a `task` tool call). The UI should
@@ -1609,6 +1658,16 @@ type ChatStreamChunk struct {
 	// Empty when no rewrite occurred. Type field on the SSE event
 	// is "content_rewrite" (handled in chunkToEvent).
 	ContentRewrite string `json:"content_rewrite,omitempty"`
+
+	// StreamReset asks the frontend (and the parts accumulator) to
+	// drop the current round's streamed text/thinking parts because
+	// the LLM attempt that produced them failed mid-stream and the
+	// retry is about to re-stream from scratch. Without this the
+	// retried attempt's deltas would be appended on top of the
+	// failed attempt's partial output — the user sees duplicated
+	// text and the persisted parts carry the same duplication.
+	// Type field on the SSE event is "stream_reset".
+	StreamReset bool `json:"stream_reset,omitempty"`
 
 	// SessionStatus carries the lifecycle state of the chat
 	// turn: "busy" at the start of ChatWithTools, "idle" at
@@ -2006,6 +2065,15 @@ func hasTaskToolCall(toolCalls []nativeToolCall) bool {
 	return false
 }
 
+func hasQuestionToolCall(toolCalls []nativeToolCall) bool {
+	for _, tc := range toolCalls {
+		if tc.Name == "question" {
+			return true
+		}
+	}
+	return false
+}
+
 // ChatWithTools performs a ReAct-style loop: send messages to the LLM with
 // available tools, execute any tool calls, and feed results back to the LLM
 // until it gives a final answer.
@@ -2034,6 +2102,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		upstreamMessageID = strconv.FormatInt(req.ClientMsgID, 10)
 	}
 	ctx = requestheader.WithIdentifiers(ctx, req.SessionID, upstreamMessageID)
+	if a.fileJournal != nil && req.SessionID != "" && req.SubagentType == "" {
+		// Parent turns only — sub-agents share the parent journal turn.
+		a.fileJournal.BeginTurn(req.SessionID)
+		ctx = tool.WithFileJournal(ctx, a.fileJournal)
+	} else if a.fileJournal != nil {
+		ctx = tool.WithFileJournal(ctx, a.fileJournal)
+	}
 
 	// Per-stream monotonic counter for P3-1. sendOrDrop
 	// stamps each emitted chunk's Seq with nextSeq() (0, 1,
@@ -2049,6 +2124,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 	go func() {
 		defer close(ch)
+		var turnAssistantID int64
+		if req.SubagentType == "" {
+			defer func() { a.persistTurnReplay(req.SessionID, turnAssistantID) }()
+		}
 		var asyncLiveClosed atomic.Bool
 		defer asyncLiveClosed.Store(true)
 		// Global default working directory: when the session has no
@@ -2222,6 +2301,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		availableTools = a.imageRecognitionGatedTools(imageRecognitionToolAvailable, availableTools)
 		availableTools = filterMediaRecognitionTools(mediaRecognitionToolAvailable, availableTools)
 		availableTools = filterAttachmentReadTools(attachmentReadAvailable, availableTools)
+		if req.ToolCallsEnabled != nil && !*req.ToolCallsEnabled {
+			availableTools = nil
+		}
 		toolDefs := llm.ToolsFromRegistryDef(availableTools)
 		if len(toolDefs) > 0 {
 			names := make([]string, 0, len(availableTools))
@@ -2302,8 +2384,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			sendOrDrop(ctx, ch, nextSeq, event)
 		})
 		if err != nil {
-			persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, req.RegenGroupID)
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true})
+			turnAssistantID = persistAssistant(req.SessionID, a.store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", partsAcc, 0, 0, 0, 0, false, req.RegenGroupID)
+			a.stampTurnElapsed(turnAssistantID, formatElapsed(time.Since(start)))
+			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "skill", Error: err.Error(), ErrorKind: "skill_error", Done: true, Duration: formatElapsed(time.Since(start))})
 			return
 		}
 		// 兼容仍发送完整 SKILL.md 正文的旧 GUI/CLI 客户端。
@@ -2370,7 +2453,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		// Expand any user-uploaded attachments into separate
 		// ChatMessage entries (text msg + image/file msgs).
 		if len(req.Attachments) > 0 && a.attach != nil {
-			protocol := a.protocolFor(req.Provider)
+			protocol := a.protocolFor(req.Provider, req.Model)
 			modelCapable := func(kind config.MediaKind) bool { return a.modelSupportsInput(req.Provider, req.Model, kind) }
 			msgs = ExpandAttachmentsForCapabilitiesCM(protocol, msgs, req.Attachments, a.attach, modelCapable, recognitionCapabilities)
 			msgs = AppendGenerationAttachmentRefs(msgs, req.Attachments, availableGenerationOps)
@@ -2398,6 +2481,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// persistStart 位于保留历史之后，附件在其后展开。
 			// The new user message and every attachment row still persist.
 			pinnedUserID := req.ClientMsgID
+			attachmentParentID := req.ClientMsgID
 			for i, m := range msgs {
 				if m.Role == llm.RoleSystem {
 					continue
@@ -2412,6 +2496,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					// They drive the retry and image preflight, but already
 					// exist in the database and must not be duplicated.
 					continue
+				}
+				if i == persistStart && req.AttachmentSignature != "" {
+					if m.Meta == nil {
+						m.Meta = make(map[string]any)
+					}
+					m.Meta["attachment_signature"] = req.AttachmentSignature
+				}
+				if i > persistStart && attachmentParentID > 0 && (m.Type == llm.TypeImage || m.Type == llm.TypeAudio || m.Type == llm.TypeVideo || m.Type == llm.TypeFile) {
+					if m.Meta == nil {
+						m.Meta = make(map[string]any)
+					}
+					m.Meta["attachment_parent_user_id"] = attachmentParentID
 				}
 				// Images uploaded via the SPA are persisted as a
 				// "upl://<id>" reference instead of base64: the
@@ -2439,8 +2535,18 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		if currentTurnImageRecognition {
 			msgs = a.injectCurrentImageRecognition(ctx, msgs, persistStart, req.SessionID, req.RegenGroupID, latestUserText(newMessages), ch, nextSeq)
 		}
+		contextAttachments := append([]Attachment(nil), req.Attachments...)
+		contextAttachments = append(contextAttachments, req.DocumentContextAttachments...)
+		documentContext := CurrentDocumentContextForMessages(contextAttachments, msgs[persistStart:], a.attach)
 		msgs = replaceAttachmentReferences(msgs, persistStart, imageRecognitionToolAvailable, attachmentReadAvailable, toolRecognitionCapabilities)
 		msgs = dropDisplayOnlyMediaMessages(msgs)
+		// Current-turn readable documents need a bounded preview before the
+		// first model request. A tool-only reference made the first answer
+		// unaware of every uploaded PDF/DOCX unless the model happened to call
+		// read_attachment first.
+		if documentContext != "" {
+			msgs = append(msgs, llm.ChatMessage{Role: llm.RoleSystem, Type: llm.TypeText, Content: documentContext, SubmitToLLM: 1})
+		}
 		if useImageRecognition {
 			if currentTurnImageRecognition {
 				msgs = replaceImagesWithHeldRefs(msgs)
@@ -2499,6 +2605,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 		}
 
 		var totalIn, totalOut int
+		var totalCacheHit, totalCacheMiss int
+		var cacheReported bool
 
 		// Stuck-loop guard. Track the signature of the (sorted)
 		// tool calls in each round, plus whether the round ended
@@ -2582,6 +2690,8 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				fullThinkingBuilder strings.Builder
 				toolCalls           []nativeToolCall
 				argsAccum           = make(map[int]*nativeToolCall)
+				announcedToolIDs    = make(map[string]bool)
+				responsesItems      = make(map[int]llm.ResponsesOutputItem)
 				roundAnyToolErrored bool
 				// roundFailSigs collects the normalized signatures of
 				// this round's failing tool calls, fed to the T4
@@ -2721,6 +2831,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if ac := AbortContextFrom(ctx); ac != nil {
 				retryCtx = ac
 			}
+			// Snapshot the turn-level token totals before the first
+			// attempt. A mid-stream failure followed by a retry must
+			// roll the totals back to this point — the failed attempt's
+			// usage deltas were already added to totalIn/totalOut and
+			// the retry's fresh requestUsage would add them again.
+			roundStartTotalIn, roundStartTotalOut := totalIn, totalOut
+			roundStartCacheHit, roundStartCacheMiss := totalCacheHit, totalCacheMiss
+			roundStartCacheReported := cacheReported
 		att:
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
 				var usage requestUsage
@@ -2745,6 +2863,44 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						timer.Stop()
 						return
 					case <-timer.C:
+					}
+
+					// Reset every per-attempt accumulator so the retry
+					// re-streams from a clean slate instead of stacking
+					// on top of the failed attempt's partial output:
+					//   - fullContentBuilder/fullThinkingBuilder: final
+					//     reply text (would otherwise be duplicated)
+					//   - argsAccum: tool-call args JSON (would otherwise
+					//     be concatenated into invalid JSON)
+					//   - streamBytes: per-round output budget accounting
+					//   - totalIn/totalOut/cache: roll back the failed
+					//     attempt's usage deltas (usage itself is per-attempt)
+					//   - partsAcc + stream_reset event: drop the partial
+					//     text/thinking parts already shown in the UI
+					hadPartial := fullContentBuilder.Len() > 0 || fullThinkingBuilder.Len() > 0 || len(argsAccum) > 0
+					fullContentBuilder.Reset()
+					fullThinkingBuilder.Reset()
+					argsAccum = make(map[int]*nativeToolCall)
+					announcedToolIDs = make(map[string]bool)
+					responsesItems = make(map[int]llm.ResponsesOutputItem)
+					streamBytes = 0
+					totalIn, totalOut = roundStartTotalIn, roundStartTotalOut
+					totalCacheHit, totalCacheMiss = roundStartCacheHit, roundStartCacheMiss
+					cacheReported = roundStartCacheReported
+					if hadPartial {
+						// The UI already carries partial text/thinking
+						// (and AE-01 provisional tool cards) from the
+						// failed attempt — tell it to drop them before
+						// the retry's deltas arrive.
+						partsAcc.update(ChatStreamChunk{StreamReset: true})
+						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
+							Phase:       "llm",
+							Step:        "stream-reset",
+							Message:     "上一次尝试中断，已清空部分输出并重试",
+							Round:       roundNum,
+							MaxRound:    maxRounds,
+							StreamReset: true,
+						})
 					}
 				}
 
@@ -2830,7 +2986,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 							retryableErr = fmt.Errorf("LLM stream stalled: no data received for %s", stallTimeout)
 							retryableErrKind = llm.KindTimeout
 							cancelStream()
-							break // break inner stream loop → outer retries
+							// Exit the inner stream loop for real. A bare
+							// `break` here would only leave the select, and
+							// the next iteration would consume the
+							// context.Canceled chunk that cancelStream
+							// provokes — misreading it as a fresh terminal
+							// error and returning before the retry ever
+							// runs. Flag the loop closed instead so control
+							// reaches the outer attempt loop.
+							streamOpen = false
+							continue
 						}
 						sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
 							Phase:     "llm",
@@ -2914,6 +3079,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if chunk.ToolCallDelta != nil {
 						chunkBytes += len(chunk.ToolCallDelta.ID) + len(chunk.ToolCallDelta.Name) + len(chunk.ToolCallDelta.ArgsJSON)
 					}
+					if chunk.ResponsesOutputItem != nil {
+						chunkBytes += len(chunk.ResponsesOutputItem.Item)
+					}
 					if streamBytes+chunkBytes > MaxStreamBytesPerRound {
 						cancelStream()
 						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
@@ -2931,6 +3099,12 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						totalOut += outDelta
 					}
 					if cache := chunk.CacheUsage; cache != nil {
+						hitDelta, missDelta, known := usage.addCache(cache)
+						totalCacheHit += hitDelta
+						totalCacheMiss += missDelta
+						if known {
+							cacheReported = true
+						}
 						log.Printf("%s[llm/cache] provider=%s model=%s round=%d attempt=%d input_tokens=%d cache_hit_tokens=%d cache_miss_tokens=%d",
 							trace.LogPrefix(ctx), req.Provider, req.Model, roundNum, attempt, chunk.TokensIn, cache.HitTokens, cache.MissTokens)
 					}
@@ -2948,16 +3122,55 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						tcd := chunk.ToolCallDelta
 						existing, ok := argsAccum[tcd.Index]
 						if !ok {
-							existing = &nativeToolCall{ID: tcd.ID, Name: tcd.Name}
+							existing = &nativeToolCall{ID: tcd.ID, ItemID: tcd.ItemID, Name: tcd.Name, OutputIndex: tcd.Index}
 							argsAccum[tcd.Index] = existing
 						}
-						if tcd.ID != "" {
-							existing.ID = tcd.ID
+						if !existing.StreamAnnounced {
+							if tcd.ID != "" {
+								existing.ID = tcd.ID
+							}
+							if tcd.Name != "" {
+								existing.Name = tcd.Name
+							}
 						}
-						if tcd.Name != "" {
-							existing.Name = tcd.Name
+						if tcd.ItemID != "" {
+							existing.ItemID = tcd.ItemID
 						}
 						existing.ArgsJSON += tcd.ArgsJSON
+						// AE-01: surface the tool card as soon as id+name
+						// are known, then forward args fragments so the
+						// GUI can stream long write_file/edit_file JSON.
+						// The id claimed here is the one the result event
+						// must use; changing it later leaves the card spinning.
+						if existing.ID != "" && existing.Name != "" {
+							if !existing.StreamAnnounced {
+								existing.ID = claimToolCallID(existing.ID, announcedToolIDs)
+								existing.StreamAnnounced = true
+								sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{
+									Phase:    "tool",
+									Step:     fmt.Sprintf("call-%d", tcd.Index+1),
+									ToolID:   existing.ID,
+									ToolName: existing.Name,
+									Round:    roundNum,
+									MaxRound: maxRounds,
+								})
+							}
+							if tcd.ArgsJSON != "" {
+								sendOrDrop(attemptCtx, ch, nextSeq, ChatStreamChunk{
+									Phase:          "tool",
+									Step:           fmt.Sprintf("call-%d-args", tcd.Index+1),
+									ToolID:         existing.ID,
+									ToolName:       existing.Name,
+									ToolArgs:       tcd.ArgsJSON,
+									ToolCallStatus: "args",
+									Round:          roundNum,
+									MaxRound:       maxRounds,
+								})
+							}
+						}
+					}
+					if chunk.ResponsesOutputItem != nil {
+						responsesItems[chunk.ResponsesOutputItem.OutputIndex] = *chunk.ResponsesOutputItem
 					}
 				} // inner for chunk
 				cancelStream()
@@ -2983,10 +3196,20 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 
 			toolCalls = orderedToolCalls(argsAccum)
 
-			sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum), Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
+			roundDone := ChatStreamChunk{
+				Phase: "llm", Step: fmt.Sprintf("round-%d-done", roundNum),
+				Message: fmt.Sprintf("[第 %d 轮] 模型响应: %d 字符 / 耗时 %s", roundNum, len(fullContent), formatElapsed(time.Since(roundStart))),
+				Round:   roundNum, MaxRound: maxRounds,
+				TokensIn: totalIn, TokensOut: totalOut,
+			}
+			stampCacheUsage(&roundDone, totalCacheHit, totalCacheMiss, cacheReported)
+			sendOrDrop(ctx, ch, nextSeq, roundDone)
 
 			if len(toolCalls) == 0 {
 				toolCalls = parseMarkdownToolCalls(fullContent)
+			}
+			if req.ToolCallsEnabled != nil && !*req.ToolCallsEnabled {
+				toolCalls = nil
 			}
 			// The final safety round must not execute a markdown-formatted call
 			// that bypassed the empty native tool list.
@@ -2999,16 +3222,27 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if len(toolCalls) > 0 {
 				fullContent = cleanMarkdownToolCalls(fullContent)
 			}
-			if hasTaskToolCall(toolCalls) {
+			// task 与 question 都不能被 MaxTurnSeconds 掐断：子代理可能跑很久，
+			// 提问则要一直等到用户选择并提交。两者都切到无截止时间的 abortCtx，
+			// 用户停止或连接断开仍会取消。
+			// task and question must outlive MaxTurnSeconds. Sub-agents can run
+			// for a long time, and a question waits until the user submits.
+			// Both switch to the deadline-free abortCtx; user stop and
+			// disconnect still cancel the wait.
+			if hasTaskToolCall(toolCalls) || hasQuestionToolCall(toolCalls) {
 				if detached, ok := detachTurnDeadlineForTask(ctx); ok {
 					ctx = detached
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-						Phase:    "tool",
-						Step:     "task-detached",
-						Message:  "检测到子代理编排/等待任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
-						Round:    roundNum,
-						MaxRound: maxRounds,
-					})
+					if hasTaskToolCall(toolCalls) {
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+							Phase:    "tool",
+							Step:     "task-detached",
+							Message:  "检测到子代理编排/等待任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
+							Round:    roundNum,
+							MaxRound: maxRounds,
+						})
+					} else {
+						log.Printf("%s[question] detached turn deadline; waiting until the user submits or cancels", trace.LogPrefix(ctx))
+					}
 				}
 			}
 
@@ -3039,13 +3273,28 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// Build the assistant message for the conversation.
 			// Emit as a single text ChatMessage (tool calls are
 			// separate messages appended below).
+			assistantMeta := map[string]any{"thinking": modelThinking}
+			if len(responsesItems) > 0 {
+				indices := make([]int, 0, len(responsesItems))
+				for index := range responsesItems {
+					indices = append(indices, index)
+				}
+				sort.Ints(indices)
+				ordered := make([]llm.ResponsesOutputItem, 0, len(indices))
+				for _, index := range indices {
+					ordered = append(ordered, responsesItems[index])
+				}
+				if encoded, err := json.Marshal(ordered); err == nil {
+					assistantMeta[llm.ResponsesOutputItemsMetaKey] = string(encoded)
+				}
+			}
 			assistantMsg := llm.ChatMessage{
 				Role:        llm.RoleAssistant,
 				Type:        llm.TypeText,
 				Content:     fullContent,
 				MsgType:     llm.MsgTypeText,
 				SubmitToLLM: 1,
-				Meta:        map[string]any{"thinking": modelThinking},
+				Meta:        assistantMeta,
 			}
 			msgs = append(msgs, assistantMsg)
 			// 以实际请求顺序入库：助手文本，再工具调用，再工具结果。
@@ -3061,7 +3310,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				if roundPersisted {
 					return
 				}
-				assistantRowID := persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, req.RegenGroupID)
+				assistantRowID := persistAssistant(req.SessionID, a.store, assistantMsg, fullThinking, partsAcc, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, req.RegenGroupID)
+				if assistantRowID > 0 {
+					turnAssistantID = assistantRowID
+				}
 				if a.store != nil {
 					for _, msg := range roundToolMessages {
 						a.store.AddChatMessageTo(req.SessionID, msg)
@@ -3092,16 +3344,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			// the reply and end with a done event.
 			if successAttempt > 1 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				persistRound()
-				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{
-					Phase:     "done",
-					Step:      "done",
-					Message:   "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
-					Round:     roundNum,
-					MaxRound:  maxRounds,
-					TokensIn:  totalIn,
-					TokensOut: totalOut,
-				})
-				sendOrDrop(retryCtx, ch, nextSeq, ChatStreamChunk{Done: true})
+				phaseDone := ChatStreamChunk{
+					Phase: "done", Step: "done",
+					Message: "回合执行预算已超出，重试恢复后直接收尾（本轮未执行工具）",
+					Round:   roundNum, MaxRound: maxRounds,
+					TokensIn: totalIn, TokensOut: totalOut,
+				}
+				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
+				sendOrDrop(retryCtx, ch, nextSeq, phaseDone)
+				a.emitDone(retryCtx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 				return
 			}
 
@@ -3139,6 +3390,11 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			normalizeToolCallArgs(toolCalls)
 			for i := range toolCalls {
 				tc := &toolCalls[i]
+				toolMeta := map[string]any{}
+				if tc.ItemID != "" {
+					toolMeta["responses_item_id"] = tc.ItemID
+					toolMeta["responses_output_index"] = tc.OutputIndex
+				}
 				tcm := llm.ChatMessage{
 					Role:        llm.RoleAssistant,
 					Type:        llm.TypeToolCall,
@@ -3147,6 +3403,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					ToolInput:   tc.ArgsJSON,
 					MsgType:     llm.MsgTypeTool,
 					SubmitToLLM: 1,
+					Meta:        toolMeta,
 				}
 				msgs = append(msgs, tcm)
 				roundToolMessages = append(roundToolMessages, tcm)
@@ -3243,12 +3500,19 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if pending > 0 {
 					persistRound()
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+					a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 					return
 				}
 				persistRound()
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Phase: "done", Step: "done", Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum), Round: roundNum, MaxRound: maxRounds, TokensIn: totalIn, TokensOut: totalOut})
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+				phaseDone := ChatStreamChunk{
+					Phase: "done", Step: "done",
+					Message: fmt.Sprintf("完成 (总耗时 %s, 共 %d 轮)", formatElapsed(time.Since(start)), roundNum),
+					Round:   roundNum, MaxRound: maxRounds,
+					TokensIn: totalIn, TokensOut: totalOut,
+				}
+				stampCacheUsage(&phaseDone, totalCacheHit, totalCacheMiss, cacheReported)
+				sendOrDrop(ctx, ch, nextSeq, phaseDone)
+				a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 				return
 			}
 
@@ -3278,11 +3542,10 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					tc.ID = "call_" + uuid.NewString()
 					toolCalls[i].ID = tc.ID
 				}
-				argsPreview := tc.ArgsJSON
-				if len(argsPreview) > 200 {
-					argsPreview = argsPreview[:200] + "..."
-				}
-				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: argsPreview, Round: roundNum, MaxRound: maxRounds}
+				// AE-01: send full args on start (UI truncates for display).
+				// Streaming fragments already painted the card; this
+				// replaces partial JSON with the final payload.
+				startChunk := ChatStreamChunk{Phase: "tool", Step: fmt.Sprintf("call-%d", i+1), Message: fmt.Sprintf("  -> 工具 %d/%d: %s", i+1, len(toolCalls), tc.Name), ToolID: tc.ID, ToolName: tc.Name, ToolArgs: tc.ArgsJSON, Round: roundNum, MaxRound: maxRounds}
 				partsAcc.update(startChunk)
 				sendOrDrop(ctx, ch, nextSeq, startChunk)
 				if skillName, isLoad := parseSkillLoadCall(tc.Name, tc.ArgsJSON); isLoad {
@@ -3317,16 +3580,16 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			type forwarder struct{ done chan struct{} }
 			var forwarders []forwarder
 			var wg sync.WaitGroup
-			serialToolCalls := false
-			for _, tc := range toolCalls {
+			// REL-02: only exclusive calls take the gate. Read-safe tools in
+			// the same batch still run together; unknown tools stay exclusive.
+			canParallel := make([]bool, len(toolCalls))
+			for i, tc := range toolCalls {
 				meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot)
-				if !ok || !meta.EffectivePolicy().CanRunInParallel() {
-					serialToolCalls = true
-					break
-				}
+				canParallel[i] = ok && meta.EffectivePolicy().CanRunInParallel()
 			}
+			exclusiveCall, anyExclusive := exclusiveCallMask(canParallel)
 			var serialGate chan struct{}
-			if serialToolCalls {
+			if anyExclusive {
 				serialGate = make(chan struct{}, 1)
 			}
 			for i, tc := range toolCalls {
@@ -3372,6 +3635,9 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				}
 				if req.SessionID != "" {
 					tctx = tool.WithSessionID(tctx, req.SessionID)
+				}
+				if a.fileJournal != nil {
+					tctx = tool.WithFileJournal(tctx, a.fileJournal)
 				}
 				if a.store != nil && req.SessionID != "" {
 					tctx = tool.WithMediaContextResolver(tctx, a.resolveMediaContextForTool)
@@ -3481,10 +3747,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// User-facing waits (sandbox confirm, question, browser
 				// RequireConfirm) must not share the per-tool execution
 				// deadline — otherwise write_file's 60s budget expires
-				// while the confirm modal is still on screen. The turn
-				// ctx still cancels those waits on user stop / turn
-				// timeout; ConfirmWaitTimeout / QuestionWaitTimeout are
-				// the interactive caps.
+				// while the confirm modal is still on screen. Confirm
+				// waits are capped by ConfirmWaitTimeout. question has
+				// no cap: it blocks until the user submits, or until
+				// the interactive context is cancelled (user stop /
+				// disconnect). A question call also detaches
+				// MaxTurnSeconds above so the turn deadline cannot
+				// cancel that wait.
 				tctx = tool.WithInteractiveContext(tctx, ctx)
 				toolTimeout := tool.DefaultToolTimeout
 				if meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot); ok {
@@ -3542,7 +3811,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					}
 				}()
 
-				go func(i int, tc nativeToolCall) {
+				go func(i int, tc nativeToolCall, exclusive bool) {
 					defer wg.Done()
 					defer close(eventCh)
 					// Tool definitions are intentionally restricted during a
@@ -3586,7 +3855,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						}
 						return
 					}
-					if serialGate != nil {
+					if exclusive && serialGate != nil {
 						select {
 						case serialGate <- struct{}{}:
 							defer func() { <-serialGate }()
@@ -3741,6 +4010,14 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 										PathClass:    cfmTarget.PathClass,
 										RiskLevel:    cfmTarget.RiskLevel,
 									}
+									if err := tool.PrepareConfirmRequest(&cfm); err != nil {
+										outcomes[i] = toolOutcome{
+											idx:    i,
+											tc:     tc,
+											result: &tool.CallResult{Content: "无法创建工具确认请求", IsError: true},
+										}
+										return
+									}
 									var sessionID string
 									if sid, ok := tctx.Value(tool.SessionIDKey{}).(string); ok {
 										sessionID = sid
@@ -3830,7 +4107,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 						err:     err,
 						elapsed: time.Since(toolStart),
 					}
-				}(i, tc)
+				}(i, tc, exclusiveCall[i])
 			}
 			// Wait for all tool goroutines to finish, but release the main
 			// stream immediately on cancellation. Third-party and dynamic
@@ -3846,6 +4123,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// 取消时也保留已发出的调用，后续历史修复可补齐中断结果。
 				// Preserve issued calls on cancellation so history repair can mark interrupted results.
 				persistRound()
+				a.stampTurnElapsed(turnAssistantID, formatElapsed(time.Since(start)))
 				return
 			}
 			// All tools completed normally. Drain their final events before
@@ -3855,6 +4133,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				case <-f.done:
 				case <-ctx.Done():
 					persistRound()
+					a.stampTurnElapsed(turnAssistantID, formatElapsed(time.Since(start)))
 					return
 				}
 			}
@@ -3891,10 +4170,6 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					ordinaryWorkCalled = true
 				}
 				toolElapsed := formatElapsed(o.elapsed)
-				argsPreview := tc.ArgsJSON
-				if len(argsPreview) > 200 {
-					argsPreview = argsPreview[:200] + "..."
-				}
 
 				if o.err != nil || o.result == nil {
 					roundAnyToolErrored = true
@@ -4077,7 +4352,7 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 					if todoCheckpointAttempts >= MaxTodoCheckpointAttempts {
 						emitTodoIncomplete("todo_write was not completed during the required state check", roundNum)
 						persistRound()
-						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+						a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 						return
 					}
 				}
@@ -4140,15 +4415,15 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			prevErrored = curErrored
 			if stuckStreak >= stuckThreshold {
 				emitTodoIncomplete("stuck-loop stopped the agent before the plan was complete", roundNum)
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-					Phase:    "stuck",
-					Step:     "stuck-loop",
-					Message:  fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
-					Round:    roundNum,
-					MaxRound: maxRounds,
+				stuckChunk := ChatStreamChunk{
+					Phase: "stuck", Step: "stuck-loop",
+					Message: fmt.Sprintf("已连续 %d 轮以相同的工具调用失败，疑似陷入循环。自动停止。", stuckStreak+1),
+					Round:   roundNum, MaxRound: maxRounds,
 					TokensIn: totalIn, TokensOut: totalOut,
-				})
-				sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{Done: true})
+				}
+				stampCacheUsage(&stuckChunk, totalCacheHit, totalCacheMiss, cacheReported)
+				sendOrDrop(ctx, ch, nextSeq, stuckChunk)
+				a.emitDone(ctx, ch, nextSeq, totalIn, totalOut, totalCacheHit, totalCacheMiss, cacheReported, start, turnAssistantID)
 				return
 			}
 
@@ -4369,7 +4644,51 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 	return ch
 }
 
-func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn int, tokensOut int, regenGroupID string) int64 {
+// stampCacheUsage copies AE-03 cache totals onto a chunk when the
+// provider reported cache telemetry at least once this turn.
+func stampCacheUsage(c *ChatStreamChunk, hit, miss int, reported bool) {
+	if c == nil || !reported {
+		return
+	}
+	c.CacheHitTokens = hit
+	c.CacheMissTokens = miss
+	c.CacheReported = true
+}
+
+// makeDoneChunk builds the terminal Done=true event with turn token
+// + cache totals so the GUI can stamp the assistant bubble.
+func makeDoneChunk(tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported bool, start time.Time) ChatStreamChunk {
+	c := ChatStreamChunk{
+		Done:      true,
+		TokensIn:  tokensIn,
+		TokensOut: tokensOut,
+		Duration:  formatElapsed(time.Since(start)),
+	}
+	stampCacheUsage(&c, cacheHit, cacheMiss, cacheReported)
+	return c
+}
+
+// emitDone sends the terminal done event and records that same duration
+// on the assistant row. History reloads then show the footer time on
+// every turn, not only the message that just finished streaming.
+func (a *Agent) emitDone(ctx context.Context, ch chan<- ChatStreamChunk, nextSeq func() uint64, tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported bool, start time.Time, assistantID int64) {
+	chunk := makeDoneChunk(tokensIn, tokensOut, cacheHit, cacheMiss, cacheReported, start)
+	a.stampTurnElapsed(assistantID, chunk.Duration)
+	sendOrDrop(ctx, ch, nextSeq, chunk)
+}
+
+// stampTurnElapsed writes the turn duration into message metadata.
+// stampTurnElapsed persists the duration the live footer already shows.
+func (a *Agent) stampTurnElapsed(messageID int64, elapsed string) {
+	if a == nil || a.store == nil || messageID <= 0 || elapsed == "" {
+		return
+	}
+	if err := a.store.MergeMessageMeta(messageID, map[string]string{"elapsed": elapsed}); err != nil {
+		log.Printf("[agent] stamp elapsed: %v", err)
+	}
+}
+
+func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, fullThinking string, partsAcc *partsAccumulator, tokensIn, tokensOut, cacheHit, cacheMiss int, cacheReported bool, regenGroupID string) int64 {
 	if store == nil {
 		return 0
 	}
@@ -4422,6 +4741,11 @@ func persistAssistant(convID string, store *memory.Store, msg llm.ChatMessage, f
 	}
 	if tokensOut > 0 {
 		meta["tokens_out"] = fmt.Sprintf("%d", tokensOut)
+	}
+	if cacheReported {
+		meta["cache_hit_tokens"] = fmt.Sprintf("%d", cacheHit)
+		meta["cache_miss_tokens"] = fmt.Sprintf("%d", cacheMiss)
+		meta["cache_reported"] = "1"
 	}
 	structural := snapshotStructural(partsAcc)
 	if len(structural) > 0 {

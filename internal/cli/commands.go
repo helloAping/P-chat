@@ -168,6 +168,15 @@ func init() {
 			Handler: cmdNew,
 		},
 		{
+			Name: "/project", Aliases: []string{"/proj"}, Description: "切换当前项目会话范围",
+			Usage: "/project [目录|off]",
+			Args: "无参       - 显示当前项目范围\n" +
+				"<目录>     - 切换到该目录并新建项目会话\n" +
+				"off        - 脱离项目范围并新建全局会话",
+			Examples: []string{"/project", "/project D:/projects/myapp", "/project off"},
+			Handler:  cmdProject,
+		},
+		{
 			Name: "/clear", Aliases: []string{"/cls"}, Description: "清空当前对话的消息 (保留会话本身)",
 			Usage: "/clear",
 			Args: "无参。\n" +
@@ -240,15 +249,17 @@ func init() {
 			Handler: cmdRegen,
 		},
 		{
-			Name: "/export", Aliases: []string{"/save"}, Description: "导出会话到文件 [markdown|json] [id|last] [-o file]",
+			Name: "/export", Aliases: []string{"/save"}, Description: "导出会话到文件 [markdown|html|pdf|json] [id|last] [-o file]",
 			Usage: "/export [format] [session] [-o <file>]",
-			Args: "format     - markdown (默认) 或 json\n" +
+			Args: "format     - markdown (默认)、html、pdf 或 json\n" +
 				"      session    - last (默认, 当前会话) 或会话 id\n" +
 				"      -o <file>  - 自定义输出文件路径, 否则用默认名\n" +
 				"      无参 - 导出当前会话为 markdown 到当前目录",
 			Examples: []string{
 				"/export",
 				"/export markdown",
+				"/export html",
+				"/export pdf",
 				"/export json",
 				"/export last",
 				"/export markdown conv_20260625_001",
@@ -315,31 +326,33 @@ func init() {
 			Handler: cmdHistory,
 		},
 		{
-			Name: "/recall", Description: "语义检索知识库 + 历史对话",
+			Name: "/recall", Description: "检索已启用的知识库",
 			Usage: "/recall <查询语句>",
 			Args: "<query>  - 任意自然语言查询\n" +
-				"      检索结果按余弦相似度排序 (top-5)\n" +
-				"      来源: 挂载的 KB 目录 + 历史会话消息\n" +
-				"      嵌入器: local-hash (默认) 或 openai (如配置)",
+				"      在已启用的知识库中检索并显示前 5 条结果\n" +
+				"      来源: 挂载的 KB 目录",
 			Examples: []string{
 				"/recall P-Chat 架构",
 				"/recall Go context cancellation",
-				"/recall 上次讨论的子 agent 实现",
+				"/recall 子 agent 实现文档",
 			},
 			Handler: cmdRecall,
 		},
 		{
 			Name: "/kb", Description: "管理外挂知识库 (挂载目录 → 扫描 → 嵌入 → 可被 /recall 检索)",
-			Usage: "/kb [list|add <path>|remove <path>|scan]",
+			Usage: "/kb [list|add <path>|remove <path>|scan|status [name]]",
 			Args: "list            列出已挂载目录 (别名: ls)\n" +
 				"      add <path>      挂载目录 (递归扫描 .md/.txt/.markdown, 跳过 node_modules 等)\n" +
 				"      remove <path>   卸载 (别名: rm)\n" +
-				"      scan            重新索引全部 (文件 hash 不变则跳过)",
+				"      scan            重新索引全部 (文件 hash 不变则跳过)\n" +
+				"      status [name]   查看服务端异步扫描进度；不传名称时显示全部",
 			Examples: []string{
 				"/kb list",
-				"/kb add ~/Documents/notes",
+				"/kb add /home/me/Documents/notes",
 				"/kb add D:/projects/myapp/docs",
 				"/kb scan",
+				"/kb status",
+				"/kb status docs",
 				"/kb remove ~/Documents/notes",
 			},
 			Handler: cmdKB,
@@ -429,20 +442,18 @@ func init() {
 			Usage: "/rules",
 			Args: "无参。\n" +
 				"  - 同 skills 合并逻辑: 全局 ~/.p-chat/rules/*.md + 项目 .p-chat/rules/*.md\n" +
-				"  - 名字 (来源标记 G/P)\n" +
-				"  - 路径",
+				"  - 名字、来源范围和路径",
 			Examples: []string{
 				"/rules",
 			},
 			Handler: cmdRules,
 		},
 		{
-			Name: "/agents", Description: "查看 AGENTS.md 合并后的内容",
+			Name: "/agents", Description: "查看可发现的 AGENTS.md",
 			Usage: "/agents",
 			Args: "无参。\n" +
-				"  - 全局 ~/.p-chat/AGENTS.md (G)\n" +
-				"  - 项目 .p-chat/AGENTS.md (P)\n" +
-				"  - 合并后送进 system prompt",
+				"  - 候选：项目根 AGENTS.md、项目 .p-chat/AGENTS.md、全局 ~/.p-chat/AGENTS.md\n" +
+				"  - 按优先级选取首个非空可读文件，不拼接；显示实际注入提示词",
 			Examples: []string{
 				"/agents",
 			},
@@ -717,10 +728,8 @@ func cmdProvider(ctx cliContext, args string) error {
 		fmt.Printf("    Base URL: %s\n", view.BaseURL)
 		fmt.Printf("    Model:    %s\n", view.Model)
 		keyDisplay := "(已设置)"
-		if view.APIKey == "" {
+		if !view.APIKeySet {
 			keyDisplay = color.YellowString("(未设置 - 将无法调用)")
-		} else if len(view.APIKey) > 8 {
-			keyDisplay = view.APIKey[:4] + "..." + view.APIKey[len(view.APIKey)-4:]
 		}
 		fmt.Printf("    APIKey:   %s\n", keyDisplay)
 		fmt.Printf("    模型:     %s\n", model)
@@ -802,7 +811,6 @@ func cmdModel(ctx cliContext, args string) error {
 	if args != "" {
 		if idx, err := strconv.Atoi(args); err == nil && idx >= 1 && idx <= len(entries) {
 			e := entries[idx-1]
-			_ = ctx.SetCurrentProvider(e.provider)
 			if err := ctx.SetModel(e.provider, e.model); err != nil {
 				color.Red("  ✗ %v", err)
 				return nil
@@ -811,7 +819,6 @@ func cmdModel(ctx cliContext, args string) error {
 			return nil
 		}
 		if prov, model, ok := splitProviderModel(args, entries); ok {
-			_ = ctx.SetCurrentProvider(prov)
 			if err := ctx.SetModel(prov, model); err != nil {
 				color.Red("  ✗ %v", err)
 				return nil
@@ -821,7 +828,6 @@ func cmdModel(ctx cliContext, args string) error {
 		}
 		for _, p := range providers {
 			if p.Name == args {
-				_ = ctx.SetCurrentProvider(p.Name)
 				if err := ctx.SetModel(p.Name, ""); err != nil {
 					color.Red("  ✗ %v", err)
 					return nil
@@ -863,7 +869,6 @@ func cmdModel(ctx cliContext, args string) error {
 		return nil
 	}
 	e := entries[idx]
-	_ = ctx.SetCurrentProvider(e.provider)
 	if err := ctx.SetModel(e.provider, e.model); err != nil {
 		color.Red("  ✗ %v", err)
 		return nil
@@ -1084,10 +1089,6 @@ func setupRemove(ctx cliContext, scanner *bufio.Scanner) error {
 	}
 
 	name := providers[idx-1].Name
-	if name == ctx.GetCurrentProvider() {
-		color.Red("  不能删除当前正在使用的提供商")
-		return nil
-	}
 
 	if err := ctx.RemoveProvider(name); err != nil {
 		return err
@@ -1198,7 +1199,10 @@ func setupSetDefault(ctx cliContext, scanner *bufio.Scanner) error {
 
 func cmdConfig(ctx cliContext, args string) error {
 	if args == "" {
-		// Show current config
+		if httpCtx, ok := ctx.(*httpContext); ok {
+			return cmdHTTPConfig(httpCtx)
+		}
+		// Show current config for the in-process local REPL.
 		cfg, _ := config.Load("")
 		if cfg == nil {
 			color.Red("  加载配置失败")
@@ -1252,11 +1256,39 @@ func cmdConfig(ctx cliContext, args string) error {
 	}
 }
 
-// cmdConfigModel dispatches `/config model ...` to the per-action
-// handlers. All actions operate on the global config (write to
-// ~/.p-chat/config.yaml) and require the user to reload by
-// re-running /config or restarting for the in-memory LLM client
-// to pick up the change.
+// cmdHTTPConfig renders the server's effective provider configuration. The
+// server owns --config overlays, so the production CLI must not call
+// config.Load(\"\") and accidentally display the user's global file instead.
+func cmdHTTPConfig(ctx *httpContext) error {
+	providers, err := ctx.ListProviders(context.Background())
+	if err != nil {
+		color.Red("  加载配置失败: %v", err)
+		return nil
+	}
+
+	fmt.Println()
+	color.Cyan("  当前配置（服务端生效配置）")
+	color.Cyan("  ─────────────────────────────────────────────────")
+	if len(providers) == 0 {
+		color.HiBlack("  暂无 LLM 提供商")
+	} else {
+		fmt.Println("  LLM 提供商:")
+		for _, provider := range providers {
+			marker := " "
+			if provider.IsDefault {
+				marker = "●"
+			}
+			fmt.Printf("    %s %-14s %-28s [%s] %s\n", marker, provider.Name, provider.Model, provider.Protocol, provider.BaseURL)
+		}
+	}
+	fmt.Println()
+	color.HiBlack("  用法: /config add|remove|key|test|list <args>")
+	return nil
+}
+
+// cmdConfigModel 将 `/config model ...` 派发给对应操作；写入由当前
+// cliContext 处理，本地模式更新配置，HTTP 模式更新服务端活动配置层。
+// cmdConfigModel dispatches model actions through the active cliContext.
 func cmdConfigModel(ctx cliContext, args string) error {
 	parts := strings.Fields(args)
 	if len(parts) == 0 {
@@ -2054,7 +2086,11 @@ func cmdNew(ctx cliContext, args string) error {
 	sess, err := ctx.NewSession(context.Background(), httpcli.CreateSessionOpts{})
 	if err != nil {
 		color.Red("  ✗ 创建失败: %v", err)
-		return nil
+		return err
+	}
+	if err := ctx.SetCurrentSession(sess.ID); err != nil {
+		color.Red("  ✗ 切换到新对话失败: %v", err)
+		return err
 	}
 	color.Green("  ✓ 已开启新对话: %s", sess.ID)
 	color.HiBlack("    使用 /history 查看或切换回旧对话")
@@ -2062,21 +2098,82 @@ func cmdNew(ctx cliContext, args string) error {
 	return nil
 }
 
-// cmdExport writes the current (or specified) conversation to a
-// file in markdown or json form. See export.go for the format
-// details.
-func cmdExport(ctx cliContext, args string) error {
-	if !isLocalContext(ctx) {
-		color.HiBlack("  (导出仅在本地 REPL 可用 - HTTP 模式请用 GET /api/v1/sessions/<id>/messages)")
-		return nil
-	}
-	lc := asLocalContext(ctx)
-	if lc.r.store == nil {
-		color.HiBlack("  (会话存储未启用)")
+// cmdProject 切换 HTTP CLI 的会话范围；切换时新建会话，避免旧会话关联到其他项目。
+// cmdProject changes the HTTP CLI session scope and opens a new session to avoid
+// silently rebinding old instructions, tools, or history to another project.
+func cmdProject(ctx cliContext, args string) error {
+	args = strings.TrimSpace(args)
+	if args == "" {
+		if path := ctx.ProjectPath(); path != "" {
+			color.Cyan("  当前项目范围: %s", path)
+		} else {
+			color.Cyan("  当前项目范围: 全局")
+		}
 		return nil
 	}
 
-	path, err := doExport(lc.r.store, args)
+	oldPath := ctx.ProjectPath()
+	newPath := ""
+	if !strings.EqualFold(args, "off") && !strings.EqualFold(args, "global") {
+		abs, err := filepath.Abs(args)
+		if err != nil {
+			return fmt.Errorf("解析项目目录: %w", err)
+		}
+		info, err := os.Stat(abs)
+		if err != nil {
+			return fmt.Errorf("读取项目目录: %w", err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("项目路径不是目录: %s", abs)
+		}
+		newPath = filepath.Clean(abs)
+	}
+	if err := ctx.SetProjectPath(newPath); err != nil {
+		if isUnsupported(err) {
+			color.HiBlack("  (/project 仅在 HTTP CLI 可用)")
+			return nil
+		}
+		return err
+	}
+	sess, err := ctx.NewSession(context.Background(), httpcli.CreateSessionOpts{})
+	if err != nil {
+		_ = ctx.SetProjectPath(oldPath)
+		return fmt.Errorf("创建项目会话: %w", err)
+	}
+	if err := ctx.SetCurrentSession(sess.ID); err != nil {
+		_ = ctx.SetProjectPath(oldPath)
+		return fmt.Errorf("切换项目会话: %w", err)
+	}
+	if newPath == "" {
+		color.Green("  ✓ 已切换到全局会话: %s", sess.ID)
+	} else {
+		color.Green("  ✓ 已切换项目: %s", newPath)
+	}
+	return nil
+}
+
+// cmdExport writes the current (or specified) conversation to a file.
+// HTTP CLI downloads the server-rendered export; local mode renders in process.
+func cmdExport(ctx cliContext, args string) error {
+	var (
+		path string
+		err  error
+	)
+	switch typed := ctx.(type) {
+	case *httpContext:
+		hc := typed
+		path, err = doHTTPExport(context.Background(), hc.c, hc.curSess, hc.projectPath, args)
+	case *localContext:
+		lc := typed
+		if lc.r.store == nil {
+			color.HiBlack("  (会话存储未启用)")
+			return nil
+		}
+		path, err = doExport(lc.r.store, args)
+	default:
+		color.HiBlack("  (当前 CLI 上下文不支持导出)")
+		return nil
+	}
 	if err != nil {
 		color.Red("  ✗ 导出失败: %v", err)
 		return nil
@@ -2255,7 +2352,7 @@ func cmdSkillUsage(_ cliContext, args string) error {
 }
 
 func cmdRules(ctx cliContext, args string) error {
-	names, err := ctx.ListRules()
+	rules, err := ctx.ListRules()
 	if err != nil {
 		if isUnsupported(err) {
 			color.HiBlack("  (规则列表仅在本地 REPL 可用)")
@@ -2266,13 +2363,13 @@ func cmdRules(ctx cliContext, args string) error {
 	}
 
 	fmt.Println()
-	if len(names) == 0 {
+	if len(rules) == 0 {
 		color.HiBlack("  暂无已加载规则")
 		fmt.Println("  将 .md 文件放入 ~/.p-chat/rules/ 或 .p-chat/rules/")
 	} else {
-		color.Cyan("  已加载规则 (%d)\n", len(names))
-		for _, n := range names {
-			fmt.Printf("    • %s\n", n)
+		color.Cyan("  已加载规则 (%d)\n", len(rules))
+		for _, rule := range rules {
+			fmt.Printf("    • %s [%s]\n      %s\n", rule.Name, rule.Scope, rule.Path)
 		}
 	}
 	fmt.Println()
@@ -2280,12 +2377,8 @@ func cmdRules(ctx cliContext, args string) error {
 }
 
 func cmdAgents(ctx cliContext, args string) error {
-	global, project, err := ctx.AgentsContext()
+	view, err := ctx.AgentsContext()
 	if err != nil {
-		if isUnsupported(err) {
-			color.HiBlack("  (AGENTS.md 仅在本地 REPL 可用)")
-			return nil
-		}
 		color.Red("  加载 AGENTS.md 失败: %v", err)
 		return nil
 	}
@@ -2294,24 +2387,22 @@ func cmdAgents(ctx cliContext, args string) error {
 	color.Cyan("  AGENTS.md")
 	color.Cyan("  ─────────────────────────────────────")
 
-	if global != "" {
-		fmt.Println()
-		color.Yellow("  [全局] ~/.p-chat/AGENTS.md")
-		for _, line := range strings.Split(global, "\n") {
-			fmt.Printf("    %s\n", line)
+	color.Cyan("  候选文件（按优先级，首个非空可读文件胜出）")
+	for _, candidate := range view.Candidates {
+		status := "未找到"
+		if candidate.Exists {
+			status = "可用，未选中"
 		}
-	} else {
-		color.HiBlack("  [全局] 未找到 ~/.p-chat/AGENTS.md")
+		if candidate.Selected {
+			status = "✓ 胜出"
+		}
+		fmt.Printf("    • [%s] %s — %s\n      %s\n", candidate.Label, status, candidate.Path, candidate.Slot)
 	}
 
-	if project != "" {
-		fmt.Println()
-		color.Yellow("  [项目] ./AGENTS.md")
-		for _, line := range strings.Split(project, "\n") {
-			fmt.Printf("    %s\n", line)
-		}
-	} else {
-		color.HiBlack("  [项目] 未找到 ./AGENTS.md")
+	fmt.Println()
+	color.Green("  实际注入提示词")
+	for _, line := range strings.Split(view.Prompt, "\n") {
+		fmt.Printf("    %s\n", line)
 	}
 
 	fmt.Println()
@@ -2693,10 +2784,10 @@ func runTurnQueue(ctx cliContext, sessionID string) error {
 		ui.SetQuestionHandler(sessionID, func(sid string, answers map[string]string) error {
 			return ctx.SubmitQuestionAnswer(streamCtx, sid, answers)
 		})
-		ui.SetConfirmHandler(sessionID, func(sid string, approved bool, action string) error {
-			return ctx.SubmitToolConfirm(streamCtx, sid, approved, action)
+		ui.SetConfirmHandlerWithID(sessionID, func(sid string, approved bool, action, confirmID string) error {
+			return submitToolConfirmWithID(ctx, streamCtx, sid, approved, action, confirmID)
 		})
-		ui.PrintBannerHeader(payload.Message)
+		ui.BeginTurn(payload.Message, true)
 
 		stream, err := ctx.ChatQueuedTurn(streamCtx, sessionID, *payload)
 		if err != nil {
@@ -2838,10 +2929,10 @@ func cmdRegen(ctx cliContext, args string) error {
 	ui.SetQuestionHandler(ctx.GetCurrentSessionID(), func(sessionID string, answers map[string]string) error {
 		return ctx.SubmitQuestionAnswer(streamCtx, sessionID, answers)
 	})
-	ui.SetConfirmHandler(ctx.GetCurrentSessionID(), func(sessionID string, approved bool, action string) error {
-		return ctx.SubmitToolConfirm(streamCtx, sessionID, approved, action)
+	ui.SetConfirmHandlerWithID(ctx.GetCurrentSessionID(), func(sessionID string, approved bool, action, confirmID string) error {
+		return submitToolConfirmWithID(ctx, streamCtx, sessionID, approved, action, confirmID)
 	})
-	ui.PrintBannerHeader(fmt.Sprintf("/regen %d", userMessageID))
+	ui.BeginTurn(fmt.Sprintf("/regen %d", userMessageID), false)
 	for chunk := range stream {
 		ui.Handle(chunk)
 	}
@@ -3039,6 +3130,10 @@ func cmdKB(ctx cliContext, args string) error {
 		color.HiBlack("  用法: /kb scan   重新索引全部")
 		return nil
 	case "add":
+		if strings.TrimSpace(rest) == "" {
+			color.HiBlack("  用法: /kb add <目录路径>")
+			return nil
+		}
 		if err := ctx.AddKB(rest); err != nil {
 			if isUnsupported(err) {
 				color.HiBlack("  (知识库未初始化)")
@@ -3047,6 +3142,10 @@ func cmdKB(ctx cliContext, args string) error {
 			color.Red("  ✗ %v", err)
 		}
 	case "remove", "rm":
+		if strings.TrimSpace(rest) == "" {
+			color.HiBlack("  用法: /kb remove <目录路径或名称>")
+			return nil
+		}
 		if err := ctx.RemoveKB(rest); err != nil {
 			if isUnsupported(err) {
 				color.HiBlack("  (知识库未初始化)")
@@ -3055,17 +3154,86 @@ func cmdKB(ctx cliContext, args string) error {
 			color.Red("  ✗ %v", err)
 		}
 	case "scan", "index":
-		if _, _, err := ctx.ScanKBs(); err != nil {
+		added, _, err := ctx.ScanKBs()
+		if err != nil {
 			if isUnsupported(err) {
 				color.HiBlack("  (知识库未初始化)")
 				return nil
 			}
 			color.Red("  ✗ %v", err)
+			return nil
 		}
+		if _, ok := ctx.(*httpContext); ok {
+			color.Green("  ✓ 已启动 %d 个知识库的后台索引", added)
+		} else {
+			color.Green("  ✓ 索引重建完成：共 %d 个节点", added)
+		}
+	case "status":
+		return cmdKBStatus(ctx, strings.TrimSpace(rest))
 	default:
-		color.HiBlack("  未知子命令: %s  (list | add | remove | scan)", subcmd)
+		color.HiBlack("  未知子命令: %s  (list | add | remove | scan | status)", subcmd)
 	}
 	return nil
+}
+
+func cmdKBStatus(ctx cliContext, name string) error {
+	if name != "" {
+		return printKBScanStatus(ctx, name)
+	}
+	bases, err := ctx.ListKBs()
+	if err != nil {
+		if isUnsupported(err) {
+			color.HiBlack("  (知识库未初始化)")
+			return nil
+		}
+		color.Red("  ✗ %v", err)
+		return nil
+	}
+	if len(bases) == 0 {
+		color.HiBlack("  (未挂载任何知识库；没有可查询的扫描任务)")
+		return nil
+	}
+	for _, base := range bases {
+		name := base.Name
+		if name == "" {
+			name = base.Path
+		}
+		if err := printKBScanStatus(ctx, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func printKBScanStatus(ctx cliContext, name string) error {
+	status, err := ctx.GetKBScanStatus(context.Background(), name)
+	if err != nil {
+		if isUnsupported(err) {
+			color.HiBlack("  (扫描状态仅在连接 pchat-server 时可查询)")
+			return nil
+		}
+		color.Red("  ✗ %s: %v", name, err)
+		return nil
+	}
+	fmt.Printf("  • %s：%s\n", name, formatKBScanStatus(status))
+	return nil
+}
+
+func formatKBScanStatus(status httpcli.KnowledgeScanStatus) string {
+	counts := fmt.Sprintf("节点 %d，变更 %d，跳过 %d，删除 %d，失败 %d", status.Chunks, status.Changed, status.Skipped, status.Deleted, status.Failed)
+	switch {
+	case status.Error != "":
+		return fmt.Sprintf("扫描错误：%s（%s）", status.Error, counts)
+	case status.Done:
+		return fmt.Sprintf("扫描完成（%s）", counts)
+	case status.Message != "":
+		if status.Total > 0 {
+			return fmt.Sprintf("%s（%d/%d，%s）", status.Message, status.Current, status.Total, counts)
+		}
+		return fmt.Sprintf("%s（%s）", status.Message, counts)
+	default:
+		return fmt.Sprintf("当前没有扫描任务（已索引 %d 个节点）", status.Chunks)
+	}
 }
 
 func cmdDebug(ctx cliContext, args string) error {
@@ -3172,6 +3340,7 @@ func cmdExpand(ctx cliContext, args string) error {
 			tr := toolResult{
 				seq: t.Seq, tool: t.Tool, args: t.Args,
 				result: t.Result, err: t.Err, duration: t.Duration, at: t.At,
+				truncated: t.Truncated, fullLen: t.FullLen,
 			}
 			fmt.Println("  " + describe(&tr))
 		}
@@ -3182,19 +3351,27 @@ func cmdExpand(ctx cliContext, args string) error {
 
 	var r2 *ToolResultView
 	if arg == "last" {
-		v, ok := ctx.ExpandLast()
+		v, ok, err := ctx.ExpandLast()
+		if err != nil {
+			color.Red("  ✗ %v", err)
+			return nil
+		}
 		if !ok {
 			color.Red("  ✗ 未找到 #%s", arg)
 			return nil
 		}
 		r2 = &v
 	} else {
-		var idx int
-		if _, err := fmt.Sscanf(arg, "%d", &idx); err != nil {
+		idx, err := strconv.Atoi(arg)
+		if err != nil {
 			color.Red("  ✗ 无效的编号: %s", arg)
 			return nil
 		}
-		v, ok := ctx.ExpandByIndex(idx)
+		v, ok, err := ctx.ExpandByIndex(idx)
+		if err != nil {
+			color.Red("  ✗ %v", err)
+			return nil
+		}
 		if !ok {
 			color.Red("  ✗ 未找到 #%s", arg)
 			return nil

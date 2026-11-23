@@ -94,3 +94,78 @@ func TestChatWithTools_TaskContinuesPastTurnDeadlineOnAbortContext(t *testing.T)
 		t.Fatalf("LLM requests = %d, want 2", gotReq)
 	}
 }
+
+func TestChatWithTools_QuestionContinuesPastTurnDeadlineOnAbortContext(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		count := requests.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if count == 1 {
+			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_question\",\"type\":\"function\",\"function\":{\"name\":\"question\",\"arguments\":\"{\\\"questions\\\":[{\\\"header\\\":\\\"心情\\\"}]}\"}}]}}]}\n\n")
+		} else {
+			_, _ = fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"summary after question\"}}]}\n\n")
+		}
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		LLM: config.LLMConfig{
+			Default: "test",
+			Providers: []config.ProviderConfig{{
+				Name: "test", Protocol: "openai", BaseURL: srv.URL,
+				APIKey: "test-key", Model: "test-model",
+			}},
+		},
+		Limits: config.LimitsConfig{MaxRounds: 2},
+	}
+	llmClient, err := llm.NewClient(&cfg.LLM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turnCtx, turnCancel := context.WithDeadline(context.Background(), time.Now().Add(10*time.Second))
+	defer turnCancel()
+	abortCtx, abortCancel := context.WithCancel(context.Background())
+	defer abortCancel()
+
+	registry := tool.NewRegistry()
+	var sawDeadline atomic.Bool
+	registry.Register(tool.Tool{
+		Name:       "question",
+		Parameters: json.RawMessage(`{"type":"object"}`),
+	}, func(ctx context.Context, _ json.RawMessage) (*tool.CallResult, error) {
+		if _, ok := ctx.Deadline(); ok {
+			sawDeadline.Store(true)
+		}
+		// 回合截止时间在提问开始后触发。若 question 仍绑在 turnCtx 上，
+		// 父循环会提前退出，后续 summary 请求不会发生。
+		// Fire the turn deadline after the question starts. If the wait
+		// stays on turnCtx, the parent loop exits before the summary request.
+		turnCancel()
+		time.Sleep(250 * time.Millisecond)
+		return &tool.CallResult{Content: `{"answers":{"心情":"好"}}`}, nil
+	})
+
+	agt := New(cfg, llmClient, (*style.Manager)(nil), nil, registry)
+	agt.SetSkillManager(&recordingSkillManager{load: func(skill.LoadRequest) (skill.LoadedSkill, error) {
+		return skill.LoadedSkill{}, nil
+	}})
+
+	var got strings.Builder
+	for chunk := range agt.ChatWithTools(WithAbortContext(turnCtx, abortCtx), ChatRequest{
+		Style: style.Off, Provider: "test", Model: "test-model",
+		Messages: []llm.ChatMessage{{Role: llm.RoleUser, Type: llm.TypeText, Content: "ask me"}},
+	}) {
+		got.WriteString(chunk.Content)
+	}
+
+	if !strings.Contains(got.String(), "summary after question") {
+		t.Fatalf("final summary missing after question; got %q, requests=%d, sawDeadline=%v", got.String(), requests.Load(), sawDeadline.Load())
+	}
+	if sawDeadline.Load() {
+		t.Fatal("question handler inherited the parent turn deadline")
+	}
+	if gotReq := requests.Load(); gotReq != 2 {
+		t.Fatalf("LLM requests = %d, want 2", gotReq)
+	}
+}

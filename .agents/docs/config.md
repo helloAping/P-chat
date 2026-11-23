@@ -76,6 +76,20 @@ LLMConfig 核心字段：
 2. 若 `projectRoot` 非空，加载 `<project>/.p-chat/config.json`
 3. 项目配置覆盖全局配置（shallow merge）
 
+显式 `--config <path>` 是最高优先级 overlay。CLI `KBManager` 及 `pchat-server` 的所有配置
+写端点都必须保留这条活动路径，并调用对应的 `*At(path, ...)` API。当前覆盖 Provider/Model、
+系统配置、Web Search、Browser、MCP 与知识库：
+
+- `path == ""`：沿用全局配置写入；
+- custom path：原始 JSON overlay 编辑器只更新显式提交的字段；
+- 未提交的顶层、普通子对象与未知字段保持原样或继续继承，不能把
+  `Load(path)` 得到的完整合并结果整体写回 custom 文件；
+- Provider、Model、MCP server 等数组发生增删时写入完整有效数组，确保覆盖继承值；
+  这些显式替换的集合按当前 schema 重写，集合元素内部的未知字段不承诺保留；
+- `generation.defaults` 在 custom 层具有完整替换语义，支持删除继承的 map key；
+- PATCH 的指针字段区分“未提交”和显式零值/空数组；例如删除最后一个知识库会写入
+  `bases: []`，清空 Provider API key 会写入 `api_key: ""`。
+
 ### 4. 运行时热重载
 
 `Manager.Reload()` 重新加载配置文件并更新内存中的 Agent `SetLLM()`。
@@ -109,7 +123,8 @@ LLMConfig 核心字段：
 媒体生成配置定义在 `generation.go`。媒体模型通过
 `generation.operations` 显式声明规范能力，map value 仅作为能力标记；同一模型只在
 `generation.api` 保存一份 `endpoint`、`query_endpoint`、`timeout_seconds` 和
-`default_params`。Provider 保存公共 `base_url`；LLM 的 `api_endpoint`、媒体模型的
+`default_params`。Provider 保存公共 `base_url`；LLM 可通过可选 `protocol` 覆盖供应商
+请求协议（缺省或空值表示继承），并保存自己的 `api_endpoint`；媒体模型的
 `endpoint` 与可选 `query_endpoint` 都只保存相对路径后缀。运行时统一使用
 `JoinAPIURL(base_url, endpoint)` 拼接，不按厂商猜测 `/v1` 或 `/v3`。新建 LLM 会按协议
 预填 `/chat/completions`、`/responses` 或 `/messages`；新建媒体生成模型会按供应商策略、

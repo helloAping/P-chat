@@ -12,7 +12,9 @@ import (
 )
 
 type downloadUpdateRequest struct {
-	CurrentVersion string `json:"current_version,omitempty"`
+	CurrentVersion    string `json:"current_version,omitempty"`
+	ExpectedVersion   string `json:"expected_version,omitempty"`
+	IncludePrerelease bool   `json:"include_prerelease,omitempty"`
 }
 
 // CheckUpdate GET /api/v1/updates/check
@@ -21,7 +23,7 @@ func (h *Handler) CheckUpdate(c *gin.Context) {
 	if current == "" {
 		current = version.ReleaseString()
 	}
-	res, err := pchatupdate.NewService(pchatupdate.Options{}).Check(c.Request.Context(), current)
+	res, err := pchatupdate.NewService(pchatupdate.Options{IncludePrerelease: c.Query("include_prerelease") == "1"}).Check(c.Request.Context(), current)
 	if err != nil {
 		c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 		return
@@ -32,24 +34,28 @@ func (h *Handler) CheckUpdate(c *gin.Context) {
 // DownloadUpdate POST /api/v1/updates/download
 func (h *Handler) DownloadUpdate(c *gin.Context) {
 	current := strings.TrimSpace(c.Query("current_version"))
-	if current == "" {
-		var req downloadUpdateRequest
-		if c.Request.Body != nil && c.Request.ContentLength != 0 {
-			if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
-				return
-			}
+	expected := strings.TrimSpace(c.Query("expected_version"))
+	var req downloadUpdateRequest
+	if c.Request.Body != nil && c.Request.ContentLength != 0 {
+		if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
+			return
 		}
+	}
+	if current == "" {
 		current = strings.TrimSpace(req.CurrentVersion)
+	}
+	if expected == "" {
+		expected = strings.TrimSpace(req.ExpectedVersion)
 	}
 	if current == "" {
 		current = version.ReleaseString()
 	}
-	res, err := pchatupdate.NewService(pchatupdate.Options{}).Download(c.Request.Context(), current)
+	res, err := pchatupdate.NewService(pchatupdate.Options{IncludePrerelease: req.IncludePrerelease || c.Query("include_prerelease") == "1"}).Download(c.Request.Context(), current, expected)
 	if err != nil {
 		status := http.StatusBadGateway
 		msg := err.Error()
-		if strings.Contains(msg, "no update available") {
+		if errors.Is(err, pchatupdate.ErrExpectedVersionChanged) || strings.Contains(msg, "no update available") {
 			status = http.StatusConflict
 		} else if strings.Contains(msg, "not an update zip") || strings.Contains(msg, "not a zip file") {
 			status = http.StatusConflict

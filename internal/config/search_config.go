@@ -31,6 +31,7 @@ type SearchConfigPatch struct {
 	Topic          *string `json:"topic,omitempty"`
 	DailyQuota     *int    `json:"daily_quota,omitempty"`
 	RequestTimeout *string `json:"request_timeout,omitempty"`
+	Model          *string `json:"model,omitempty"`
 }
 
 // UpdateSearchConfig merges a SearchConfigPatch into the
@@ -40,8 +41,8 @@ type SearchConfigPatch struct {
 // RegisterWebSearch and search.BuildProvider, so the
 // caller can rely on a round-trip):
 //
-//   - provider, if non-empty, must be "tavily" or
-//     "openai_compat" (case-insensitive).
+//   - provider, if non-empty, must be "tavily",
+//     "openai_compat", "deepseek", "mimo", or "qwen".
 //   - base_url (if non-empty) must parse as a URL with
 //     http or https scheme; non-loopback http is rejected.
 //   - daily_quota, if non-zero, must be 1..100000.
@@ -52,7 +53,13 @@ type SearchConfigPatch struct {
 // (E_BADCFG) so the settings panel can surface a localised
 // message.
 func UpdateSearchConfig(patch SearchConfigPatch) (*SearchConfig, error) {
-	cfg, err := Load("")
+	return UpdateSearchConfigAt("", patch)
+}
+
+// UpdateSearchConfigAt 按活动配置路径更新 Web Search 配置。
+// UpdateSearchConfigAt updates web-search configuration at the active path.
+func UpdateSearchConfigAt(configPath string, patch SearchConfigPatch) (*SearchConfig, error) {
+	cfg, err := Load(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("load config: %w", err)
 	}
@@ -60,10 +67,10 @@ func UpdateSearchConfig(patch SearchConfigPatch) (*SearchConfig, error) {
 	if patch.Provider != nil {
 		normalized := strings.ToLower(strings.TrimSpace(*patch.Provider))
 		switch normalized {
-		case "", "tavily", "openai_compat":
+		case "", "tavily", "openai_compat", "deepseek", "mimo", "qwen":
 			// OK
 		default:
-			return nil, fmt.Errorf("%w: unknown provider %q (expected 'tavily' or 'openai_compat')",
+			return nil, fmt.Errorf("%w: unknown provider %q (expected tavily, openai_compat, deepseek, mimo, or qwen)",
 				ErrBadSearch, *patch.Provider)
 		}
 		cfg.Search.Provider = normalized
@@ -117,6 +124,14 @@ func UpdateSearchConfig(patch SearchConfigPatch) (*SearchConfig, error) {
 		cfg.Search.DailyQuota = q
 	}
 
+	if patch.Model != nil {
+		model := strings.TrimSpace(*patch.Model)
+		if len([]rune(model)) > 128 {
+			return nil, fmt.Errorf("%w: model must be at most 128 characters", ErrBadSearch)
+		}
+		cfg.Search.Model = model
+	}
+
 	if patch.RequestTimeout != nil {
 		raw := strings.TrimSpace(*patch.RequestTimeout)
 		if raw == "" {
@@ -151,11 +166,46 @@ func UpdateSearchConfig(patch SearchConfigPatch) (*SearchConfig, error) {
 			if cfg.Search.BaseURL == "" {
 				return nil, fmt.Errorf("%w: enabled=true requires base_url for provider 'openai_compat'", ErrBadSearch)
 			}
+		case "deepseek", "mimo":
+			if cfg.Search.APIKey == "" {
+				return nil, fmt.Errorf("%w: enabled=true requires api_key for provider %q", ErrBadSearch, prov)
+			}
+		case "qwen":
+			if cfg.Search.APIKey == "" || cfg.Search.BaseURL == "" {
+				return nil, fmt.Errorf("%w: enabled=true requires api_key and base_url for provider 'qwen'", ErrBadSearch)
+			}
 		}
 	}
 
-	mgr := NewManager()
-	if err := mgr.SaveGlobal(cfg); err != nil {
+	fields := make([]configOverlayField, 0, 8)
+	if patch.Enabled != nil {
+		fields = append(fields, overlayField(cfg.Search.Enabled, "search", "enabled"))
+	}
+	if patch.Provider != nil {
+		fields = append(fields, overlayField(cfg.Search.Provider, "search", "provider"))
+	}
+	if patch.ClearAPIKey || patch.APIKey != nil {
+		fields = append(fields, overlayField(cfg.Search.APIKey, "search", "api_key"))
+	}
+	if patch.BaseURL != nil {
+		fields = append(fields, overlayField(cfg.Search.BaseURL, "search", "base_url"))
+	}
+	if patch.Path != nil {
+		fields = append(fields, overlayField(cfg.Search.Path, "search", "path"))
+	}
+	if patch.Topic != nil {
+		fields = append(fields, overlayField(cfg.Search.Topic, "search", "topic"))
+	}
+	if patch.DailyQuota != nil {
+		fields = append(fields, overlayField(cfg.Search.DailyQuota, "search", "daily_quota"))
+	}
+	if patch.RequestTimeout != nil {
+		fields = append(fields, overlayField(cfg.Search.RequestTimeout, "search", "request_timeout"))
+	}
+	if patch.Model != nil {
+		fields = append(fields, overlayField(cfg.Search.Model, "search", "model"))
+	}
+	if err := saveConfigFieldsAt(configPath, cfg, fields...); err != nil {
 		return nil, fmt.Errorf("save search config: %w", err)
 	}
 	return &cfg.Search, nil

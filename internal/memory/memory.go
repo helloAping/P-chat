@@ -93,6 +93,7 @@ type MessageIdentity struct {
 	ConversationID string
 	Role           string
 	Content        string
+	Metadata       string
 }
 
 // Summary records an LLM-generated compression of a range of messages.
@@ -173,6 +174,12 @@ func OpenAt(dbPath string, maxHistory int) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
+	}
+	// PERF-02: ensure FTS index exists when bootstrap marked mig 14 applied
+	// without running Up, or triggers were dropped.
+	if err := ensureMessagesFTSReady(s.db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("messages fts: %w", err)
 	}
 
 	// Migrate legacy JSON file if present.
@@ -544,6 +551,44 @@ func (s *Store) UpdateChatMessageContentAndMeta(rowID int64, content string, met
 	return err
 }
 
+// MergeMessageMeta 把 patch 合并进一条消息已有的 metadata，不改动正文。
+// MergeMessageMeta folds patch into one row's existing metadata without
+// rewriting the message body. Used to stamp turn elapsed after the
+// assistant row has already been inserted.
+func (s *Store) MergeMessageMeta(rowID int64, patch map[string]string) error {
+	if s == nil || rowID <= 0 || len(patch) == 0 {
+		return nil
+	}
+	if err := s.Flush(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var raw sql.NullString
+	if err := s.db.QueryRow(`SELECT metadata FROM messages WHERE id = ?`, rowID).Scan(&raw); err != nil {
+		return err
+	}
+	meta := map[string]any{}
+	if raw.Valid && strings.TrimSpace(raw.String) != "" {
+		if err := json.Unmarshal([]byte(raw.String), &meta); err != nil {
+			return fmt.Errorf("decode message metadata: %w", err)
+		}
+	}
+	for k, v := range patch {
+		if strings.TrimSpace(k) == "" {
+			continue
+		}
+		meta[k] = v
+	}
+	b, err := json.Marshal(meta)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`UPDATE messages SET metadata = ? WHERE id = ?`, string(b), rowID)
+	return err
+}
+
 // AddChatMessageWithMetaToRegen is the P1-4 regen-aware
 // variant of AddChatMessageWithMetaTo. regenGroupID is the
 // string form of the user message id that this assistant
@@ -637,15 +682,19 @@ func (s *Store) FindMessageIdentity(rowID int64) (MessageIdentity, bool, error) 
 	}
 
 	var identity MessageIdentity
+	var metadata sql.NullString
 	err := s.db.QueryRow(
-		`SELECT conversation_id, role, content FROM messages WHERE id = ?`,
+		`SELECT conversation_id, role, content, metadata FROM messages WHERE id = ?`,
 		rowID,
-	).Scan(&identity.ConversationID, &identity.Role, &identity.Content)
+	).Scan(&identity.ConversationID, &identity.Role, &identity.Content, &metadata)
 	if err == sql.ErrNoRows {
 		return MessageIdentity{}, false, nil
 	}
 	if err != nil {
 		return MessageIdentity{}, false, err
+	}
+	if metadata.Valid {
+		identity.Metadata = metadata.String
 	}
 	return identity, true, nil
 }
@@ -1138,12 +1187,23 @@ func decodeChatMessages(role, content string, metaStr string, dbMsgType int, dbS
 	// 使用既有 thinking 元数据恢复协议上下文，无需新增存储字段。
 	// Restore protocol reasoning from the existing thinking metadata without new storage fields.
 	defer func() {
-		if thinking := meta["thinking"]; thinking != "" {
-			for i := range decoded {
-				if decoded[i].Role == llm.RoleAssistant && decoded[i].Type == llm.TypeText {
-					decoded[i].Meta = map[string]any{"thinking": thinking}
-					break
+		thinking := meta["thinking"]
+		responsesItems := meta[llm.ResponsesOutputItemsMetaKey]
+		if thinking == "" && responsesItems == "" {
+			return
+		}
+		for i := range decoded {
+			if decoded[i].Role == llm.RoleAssistant && decoded[i].Type == llm.TypeText {
+				if decoded[i].Meta == nil {
+					decoded[i].Meta = make(map[string]any)
 				}
+				if thinking != "" {
+					decoded[i].Meta["thinking"] = thinking
+				}
+				if responsesItems != "" {
+					decoded[i].Meta[llm.ResponsesOutputItemsMetaKey] = responsesItems
+				}
+				break
 			}
 		}
 	}()
@@ -2037,6 +2097,16 @@ func AttachmentsFromMultiContent(parts []openai.ChatMessagePart) []Attachment {
 // every REPL call or thread a "skip-current" flag
 // through call sites that don't need it.
 func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
+	return s.getMessagesFullByID(sessionID, 0, 0)
+}
+
+// GetMessagesFullBySeqRange returns the same rich rows as GetMessagesFullByID,
+// limited to an inclusive seq window. Zero bounds are open.
+func (s *Store) GetMessagesFullBySeqRange(sessionID string, fromSeq, toSeq int64) []MessageFull {
+	return s.getMessagesFullByID(sessionID, fromSeq, toSeq)
+}
+
+func (s *Store) getMessagesFullByID(sessionID string, fromSeq, toSeq int64) []MessageFull {
 	if sessionID == "" {
 		return nil
 	}
@@ -2044,7 +2114,7 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 
 	limit := s.maxHistory
 	rows, err := s.db.Query(
-		`SELECT id, role, content, metadata, created_at FROM messages
+		`SELECT id, seq, role, content, metadata, created_at FROM messages
 		 WHERE conversation_id = ?
 		 ORDER BY id ASC`,
 		sessionID,
@@ -2063,12 +2133,19 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 	for rows.Next() {
 		var (
 			id            int64
+			seq           int64
 			role, content string
 			metadata      sql.NullString
 			created       int64
 		)
-		if err := rows.Scan(&id, &role, &content, &metadata, &created); err != nil {
+		if err := rows.Scan(&id, &seq, &role, &content, &metadata, &created); err != nil {
 			break
+		}
+		if fromSeq > 0 && seq < fromSeq {
+			continue
+		}
+		if toSeq > 0 && seq > toSeq {
+			continue
 		}
 		m := llm.Message{Role: role, Content: content}
 		metaStr := ""
@@ -2108,7 +2185,9 @@ func (s *Store) GetMessagesFullByID(sessionID string) []MessageFull {
 	// ASC-ordered result, matching the REPL path's
 	// semantics: a very long session exports the most
 	// recent N messages, not a random middle slice.
-	if limit > 0 && len(rowsList) > limit {
+	// An explicit bookmark window keeps both ends. The recent-history
+	// cap only applies to a whole-session export.
+	if (fromSeq == 0 || toSeq == 0) && limit > 0 && len(rowsList) > limit {
 		rowsList = rowsList[len(rowsList)-limit:]
 	}
 
@@ -2206,9 +2285,28 @@ func scanConversation(scanner conversationScanner) (Conversation, error) {
 // "no cap" (used by legacy callers / tests). The handler-layer
 // pagination passes limit=200 to bound the response size.
 func (s *Store) ListConversationsLimit(limit int) []Conversation {
+	return s.listConversationsLimit(limit, "", false)
+}
+
+// ListConversationsByProjectPathLimit 返回属于 projectPath 的最多 limit 条活跃会话，
+// 按 updated_at DESC 排序。空 projectPath 只选择全局会话。路径清理后比较，Windows
+// 上使用不区分大小写的匹配。
+//
+// ListConversationsByProjectPathLimit returns up to limit active conversations
+// for projectPath, ordered by updated_at DESC. An empty projectPath selects
+// global conversations only. Project paths are compared after cleaning and use
+// case-insensitive matching on Windows.
+func (s *Store) ListConversationsByProjectPathLimit(projectPath string, limit int) []Conversation {
+	return s.listConversationsLimit(limit, projectPath, true)
+}
+
+func (s *Store) listConversationsLimit(limit int, projectPath string, filterProject bool) []Conversation {
 	_ = s.Flush()
 	q := conversationSelectWithActivity + ` WHERE c.archived = 0 ORDER BY c.updated_at DESC, c.id DESC`
-	if limit > 0 {
+	// 按项目过滤时必须先解码并规范化 metadata，再截取上限；Windows 路径不区分大小写。
+	// Decode and normalize metadata before applying the cap when filtering by
+	// project; Windows paths compare case-insensitively.
+	if limit > 0 && !filterProject {
 		q += fmt.Sprintf(" LIMIT %d", limit)
 	}
 	rows, err := s.db.Query(q)
@@ -2222,7 +2320,13 @@ func (s *Store) ListConversationsLimit(limit int) []Conversation {
 		if err != nil {
 			return out
 		}
+		if filterProject && !sameConversationProjectPath(conversationProjectPath(c.Metadata), projectPath) {
+			continue
+		}
 		out = append(out, c)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
 	}
 	return out
 }
@@ -2428,6 +2532,10 @@ func (s *Store) ListArchivedConversationsLimit(limit int) []Conversation {
 
 // DeleteConversation removes a conversation and all its messages.
 func (s *Store) DeleteConversation(id string) error {
+	_ = s.DeleteTurnChanges(id)
+	if err := s.DeleteBookmarks(id); err != nil {
+		return err
+	}
 	_, err := s.db.Exec(`DELETE FROM conversations WHERE id = ?`, id)
 	if err != nil {
 		return err
@@ -2453,6 +2561,9 @@ func (s *Store) DeleteConversation(id string) error {
 // without removing the conversation record itself (preserves session ID).
 func (s *Store) ClearMessages(conversationID string) error {
 	_ = s.Flush()
+	if err := s.DeleteBookmarks(conversationID); err != nil {
+		return err
+	}
 	if _, err := s.db.Exec(`DELETE FROM messages WHERE conversation_id = ?`, conversationID); err != nil {
 		return err
 	}
@@ -2702,6 +2813,14 @@ func (s *Store) ArchiveSiblings(convID, groupID string, keepActiveID int64) (del
 	); err != nil {
 		return 0, fmt.Errorf("archive siblings: %w", err)
 	}
+	if err := archiveReplyToolRows(tx, convID, groupID); err != nil {
+		return 0, fmt.Errorf("archive sibling tool rows: %w", err)
+	}
+	if keepActiveID > 0 {
+		if err := setReplyToolRowsArchived(tx, convID, keepActiveID, false); err != nil {
+			return 0, fmt.Errorf("restore active sibling tool rows: %w", err)
+		}
+	}
 	if _, err := tx.Exec(
 		`UPDATE media_contexts
 			 SET archived = 1, archive_reason = 'regen'
@@ -2940,6 +3059,12 @@ func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
 	if err != nil {
 		return err
 	}
+	if err := archiveReplyToolRows(tx, convID, groupID); err != nil {
+		return err
+	}
+	if err := setReplyToolRowsArchived(tx, convID, activeID, false); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(
 		`UPDATE media_contexts
 			 SET archived = CASE WHEN message_id = ? THEN 0 ELSE 1 END,
@@ -2950,6 +3075,60 @@ func (s *Store) ActivateSibling(convID, groupID string, activeID int64) error {
 		return err
 	}
 	return tx.Commit()
+}
+
+// archiveReplyToolRows 归档重答组中各助手回复所属的 tool_call/tool_result 行。
+// archiveReplyToolRows archives tool_call/tool_result rows owned by replies in a regenerate group.
+// 旧工具行没有 regen_group_id，因此按“助手行之后、下一条非工具行之前”的持久化顺序推断归属。
+// Legacy tool rows lack regen_group_id, so ownership is inferred from their persisted order.
+func archiveReplyToolRows(tx *sql.Tx, convID, groupID string) error {
+	_, err := tx.Exec(
+		`UPDATE messages AS candidate
+		 SET is_archived = 1
+		 WHERE candidate.conversation_id = ?
+		   AND candidate.msg_type = ?
+		   AND EXISTS (
+		       SELECT 1
+		       FROM messages AS reply
+		       WHERE reply.conversation_id = candidate.conversation_id
+		         AND reply.regen_group_id = ?
+		         AND reply.id < candidate.id
+		         AND NOT EXISTS (
+		             SELECT 1
+		             FROM messages AS boundary
+		             WHERE boundary.conversation_id = candidate.conversation_id
+		               AND boundary.id > reply.id
+		               AND boundary.id < candidate.id
+		               AND boundary.msg_type != ?
+		         )
+		   )`,
+		convID, llm.MsgTypeTool, groupID, llm.MsgTypeTool,
+	)
+	return err
+}
+
+func setReplyToolRowsArchived(tx *sql.Tx, convID string, replyID int64, archived bool) error {
+	value := 0
+	if archived {
+		value = 1
+	}
+	_, err := tx.Exec(
+		`UPDATE messages AS candidate
+		 SET is_archived = ?
+		 WHERE candidate.conversation_id = ?
+		   AND candidate.msg_type = ?
+		   AND candidate.id > ?
+		   AND NOT EXISTS (
+		       SELECT 1
+		       FROM messages AS boundary
+		       WHERE boundary.conversation_id = candidate.conversation_id
+		         AND boundary.id > ?
+		         AND boundary.id < candidate.id
+		         AND boundary.msg_type != ?
+		   )`,
+		value, convID, llm.MsgTypeTool, replyID, replyID, llm.MsgTypeTool,
+	)
+	return err
 }
 
 // DeleteMessagesFrom deletes all messages with id >= fromID in the
@@ -3032,6 +3211,12 @@ func (s *Store) DeleteMessagesFrom(conversationID string, fromID int64) ([]Messa
 		`UPDATE media_contexts
 		 SET archived = 1, archive_reason = 'rollback'
 		 WHERE session_id = ? AND message_id >= ? AND archived = 0`,
+		conversationID, fromID,
+	); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM message_bookmarks WHERE conversation_id = ? AND message_id >= ?`,
 		conversationID, fromID,
 	); err != nil {
 		return nil, err
@@ -3413,14 +3598,13 @@ func newConvID() string {
 	return fmt.Sprintf("conv_%d_%d", time.Now().UnixNano(), n)
 }
 
-// SearchMessages performs a simple LIKE-based full-text search
-// across messages in all active (non-archived) conversations.
+// SearchMessages 在所有未归档会话的可见文本消息中执行全文搜索。
+// SearchMessages searches renderable text messages in active conversations
+// via FTS5 (PERF-02), falling back to LIKE when the index is unavailable.
 // Returns up to `limit` results sorted by created_at desc.
 //
-// User input is escaped so that LIKE metacharacters (`%`, `_`)
-// in the search query don't behave as wildcards. A search for
-// "100%" matches the literal substring "100%", not "100" +
-// anything.
+// User input is escaped so that LIKE/FTS metacharacters do not act as
+// wildcards. A search for "100%" matches the literal token "100%".
 func (s *Store) SearchMessages(q string, limit int) []SearchResult {
 	return s.searchMessages(q, limit, "", false)
 }
@@ -3441,45 +3625,181 @@ func (s *Store) searchMessages(q string, limit int, projectPath string, filterPr
 	if q == "" {
 		return nil
 	}
-	// Escape LIKE metacharacters: backslash, percent, underscore.
-	// SQLite uses `\` as the ESCAPE char by default, so we prefix
-	// each metachar with `\`.
-	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	if searchQueryPreferFTS(q) && hasMessagesFTS(s.db) {
+		if out, ok := s.searchMessagesFTS(q, limit, projectPath, filterProject); ok {
+			return out
+		}
+	}
+	return s.searchMessagesLike(q, limit, projectPath, filterProject)
+}
 
-	query := `SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at, COALESCE(c.metadata, '')
+func (s *Store) searchMessagesFTS(q string, limit int, projectPath string, filterProject bool) ([]SearchResult, bool) {
+	ftsQ := buildMessagesFTSQuery(q)
+	if ftsQ == `""` {
+		return nil, true
+	}
+	lim := limitOrHuge(limit)
+	// Over-fetch slightly so Go-side ui_hidden filtering can still fill limit.
+	fetchLimit := lim
+	if lim < 1<<30 {
+		fetchLimit = lim * 3
+		if fetchLimit < lim+32 {
+			fetchLimit = lim + 32
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at,
+				 COALESCE(c.metadata, ''), COALESCE(m.metadata, '')
+			 FROM messages_fts
+			 JOIN messages m ON m.id = messages_fts.rowid
+			 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
+			 WHERE messages_fts MATCH ?
+			   AND m.is_archived = 0
+			   AND m.msg_type = ?
+			   AND m.role IN (?, ?, ?)`)
+	args := []any{ftsQ, llm.MsgTypeText, llm.RoleUser, llm.RoleAssistant, llm.RoleSystem}
+	if filterProject {
+		cleaned := cleanConversationProjectPath(projectPath)
+		if cleaned == "" {
+			b.WriteString(`
+			   AND (
+			     json_extract(c.metadata, '$.project_path') IS NULL
+			     OR TRIM(COALESCE(json_extract(c.metadata, '$.project_path'), '')) = ''
+			     OR TRIM(json_extract(c.metadata, '$.project_path')) = '.'
+			   )`)
+		} else if runtime.GOOS == "windows" {
+			b.WriteString(`
+			   AND LOWER(json_extract(c.metadata, '$.project_path')) = LOWER(?)`)
+			args = append(args, cleaned)
+		} else {
+			b.WriteString(`
+			   AND json_extract(c.metadata, '$.project_path') = ?`)
+			args = append(args, cleaned)
+		}
+	}
+	b.WriteString(`
+			 ORDER BY m.created_at DESC, m.id DESC
+			 LIMIT ?`)
+	args = append(args, fetchLimit)
+
+	rows, err := s.db.Query(b.String(), args...)
+	if err != nil {
+		return nil, false
+	}
+	defer rows.Close()
+
+	out := collectSearchRows(rows, q, lim, false, "")
+	return out, true
+}
+
+func (s *Store) searchMessagesLike(q string, limit int, projectPath string, filterProject bool) []SearchResult {
+	// Escape LIKE metacharacters: backslash, percent, underscore.
+	escaped := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	lim := limitOrHuge(limit)
+	fetchLimit := lim
+	if lim < 1<<30 {
+		fetchLimit = lim * 3
+		if fetchLimit < lim+32 {
+			fetchLimit = lim + 32
+		}
+	}
+
+	var b strings.Builder
+	b.WriteString(`SELECT m.conversation_id, COALESCE(c.title, ''), m.id, m.role, m.content, m.created_at,
+				 COALESCE(c.metadata, ''), COALESCE(m.metadata, '')
 			 FROM messages m
 			 JOIN conversations c ON c.id = m.conversation_id AND c.archived = 0
 			 WHERE m.content LIKE ? ESCAPE '\'
-			 ORDER BY m.created_at DESC`
-	args := []any{"%" + escaped + "%"}
-	if !filterProject {
-		query += ` LIMIT ?`
-		args = append(args, limitOrHuge(limit))
+			   AND m.is_archived = 0
+			   AND m.msg_type = ?
+			   AND m.role IN (?, ?, ?)`)
+	args := []any{"%" + escaped + "%", llm.MsgTypeText, llm.RoleUser, llm.RoleAssistant, llm.RoleSystem}
+	if filterProject {
+		cleaned := cleanConversationProjectPath(projectPath)
+		if cleaned == "" {
+			b.WriteString(`
+			   AND (
+			     json_extract(c.metadata, '$.project_path') IS NULL
+			     OR TRIM(COALESCE(json_extract(c.metadata, '$.project_path'), '')) = ''
+			     OR TRIM(json_extract(c.metadata, '$.project_path')) = '.'
+			   )`)
+		} else if runtime.GOOS == "windows" {
+			b.WriteString(`
+			   AND LOWER(json_extract(c.metadata, '$.project_path')) = LOWER(?)`)
+			args = append(args, cleaned)
+		} else {
+			b.WriteString(`
+			   AND json_extract(c.metadata, '$.project_path') = ?`)
+			args = append(args, cleaned)
+		}
 	}
-	rows, err := s.db.Query(query, args...)
+	b.WriteString(`
+			 ORDER BY m.created_at DESC, m.id DESC
+			 LIMIT ?`)
+	args = append(args, fetchLimit)
+
+	rows, err := s.db.Query(b.String(), args...)
 	if err != nil {
 		return nil
 	}
 	defer rows.Close()
+	// Project filter already applied in SQL when filterProject is set.
+	return collectSearchRows(rows, q, lim, false, "")
+}
 
+func collectSearchRows(rows *sql.Rows, q string, limit int, filterProject bool, projectPath string) []SearchResult {
 	var out []SearchResult
 	for rows.Next() {
 		var r SearchResult
 		var content string
 		var convMeta string
-		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt, &convMeta); err != nil {
+		var messageMeta string
+		if err := rows.Scan(&r.ConversationID, &r.ConversationTitle, &r.MessageID, &r.Role, &content, &r.CreatedAt, &convMeta, &messageMeta); err != nil {
 			break
 		}
 		if filterProject && !sameConversationProjectPath(conversationProjectPath(convMeta), projectPath) {
 			continue
 		}
+		if searchMessageHidden(messageMeta, r.Role, content) {
+			continue
+		}
 		r.Snippet = snippet(content, q, 120)
 		out = append(out, r)
-		if filterProject && len(out) >= limitOrHuge(limit) {
+		if len(out) >= limit {
 			break
 		}
 	}
 	return out
+}
+
+// searchMessageHidden 使搜索结果与历史消息的可见性规则保持一致。
+// searchMessageHidden keeps search visibility aligned with the history API.
+func searchMessageHidden(rawMeta, role, content string) bool {
+	if role == llm.RoleUser {
+		trimmed := strings.TrimSpace(content)
+		if strings.HasPrefix(trimmed, "⏱ 上一回合因") ||
+			strings.HasPrefix(trimmed, "⚠ 系统检测：你刚才的回复没有调用任何工具") {
+			return true
+		}
+	}
+	if rawMeta == "" {
+		return false
+	}
+	var meta map[string]any
+	if err := json.Unmarshal([]byte(rawMeta), &meta); err != nil {
+		return false
+	}
+	switch value := meta["ui_hidden"].(type) {
+	case bool:
+		return value
+	case string:
+		return strings.EqualFold(strings.TrimSpace(value), "true")
+	case float64:
+		return value != 0
+	default:
+		return false
+	}
 }
 
 // snippet extracts a short window around the first occurrence of

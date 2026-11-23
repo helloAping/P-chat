@@ -10,13 +10,19 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
+	"path"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/p-chat/pchat/internal/config"
 )
+
+const maxToolResultResponseBytes = 64 << 20
 
 // Client talks to pchat-server over HTTP. All methods are safe for
 // concurrent use.
@@ -79,19 +85,93 @@ func NewClient(base string) *Client {
 
 // Session mirrors server.SessionResponse.
 type Session struct {
-	ID        string `json:"id"`
-	Title     string `json:"title"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Style     string `json:"style,omitempty"`
-	WorkMode  string `json:"work_mode,omitempty"`
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	ID          string `json:"id"`
+	Title       string `json:"title"`
+	ProjectPath string `json:"project_path,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	Model       string `json:"model,omitempty"`
+	Style       string `json:"style,omitempty"`
+	WorkMode    string `json:"work_mode,omitempty"`
+	CreatedAt   int64  `json:"created_at"`
+	UpdatedAt   int64  `json:"updated_at"`
 	// AutoContinue mirrors the server's P0-3 flag (default
 	// true). The CLI uses it to display the current
 	// auto-continue state next to /auto-continue's status
 	// output and to remember the user's last choice.
 	AutoContinue bool `json:"auto_continue"`
+}
+
+// ExportFile 是 pchat-server 返回的二进制会话导出。
+// ExportFile is a binary session export returned by pchat-server.
+// Filename 是移除路径成分后的服务端建议文件名。Filename is the server's
+// suggested basename after removing path components.
+type ExportFile struct {
+	Body        []byte
+	Filename    string
+	ContentType string
+}
+
+// ToolResult is the full content returned for one previously truncated tool call.
+type ToolResult struct {
+	ToolID  string `json:"tool_id"`
+	Content string `json:"content"`
+	Bytes   int    `json:"bytes"`
+}
+
+// KnowledgeBase 映射 CLI 使用的服务端知识库载荷。KnowledgeBase mirrors the
+// server knowledge-base payload used by the CLI.
+type KnowledgeBase struct {
+	Name     string `json:"name"`
+	Path     string `json:"path"`
+	Enabled  bool   `json:"enabled"`
+	Status   string `json:"status,omitempty"`
+	DocCount int    `json:"doc_count,omitempty"`
+}
+
+// KnowledgeScanStatus 映射知识库扫描状态端点返回的进度载荷。
+// KnowledgeScanStatus mirrors the progress payload returned by a knowledge
+// base scan-status endpoint.
+type KnowledgeScanStatus struct {
+	Chunks  int    `json:"chunks"`
+	Done    bool   `json:"done"`
+	Error   string `json:"error,omitempty"`
+	Current int    `json:"current"`
+	Total   int    `json:"total"`
+	Changed int    `json:"changed,omitempty"`
+	Skipped int    `json:"skipped,omitempty"`
+	Deleted int    `json:"deleted,omitempty"`
+	Failed  int    `json:"failed,omitempty"`
+	Message string `json:"message,omitempty"`
+}
+
+// KnowledgeSearchRequest 是 /knowledge/search 接受的请求体。
+// KnowledgeSearchRequest is the request body accepted by /knowledge/search.
+type KnowledgeSearchRequest struct {
+	Query string   `json:"query"`
+	TopK  int      `json:"top_k,omitempty"`
+	Grep  string   `json:"grep,omitempty"`
+	Bases []string `json:"bases,omitempty"`
+}
+
+// KnowledgeSearchResult 是一条 canonical 知识库搜索命中。
+// KnowledgeSearchResult is one canonical knowledge search hit.
+type KnowledgeSearchResult struct {
+	Source      string  `json:"source"`
+	Content     string  `json:"content"`
+	Similarity  float64 `json:"similarity"`
+	Rank        int     `json:"rank"`
+	Base        string  `json:"base,omitempty"`
+	Title       string  `json:"title,omitempty"`
+	MatchType   string  `json:"match_type,omitempty"`
+	Query       string  `json:"query,omitempty"`
+	Explanation string  `json:"explanation,omitempty"`
+}
+
+// KnowledgeSearchResponse 是 /knowledge/search 的 canonical 响应。
+// KnowledgeSearchResponse is the canonical response from /knowledge/search.
+type KnowledgeSearchResponse struct {
+	Query   string                  `json:"query"`
+	Results []KnowledgeSearchResult `json:"results"`
 }
 
 // Message mirrors server.MessageResponse.
@@ -174,11 +254,66 @@ type StreamEvent struct {
 
 // ProviderInfo mirrors the providers endpoint payload.
 type ProviderInfo struct {
-	Name      string  `json:"name"`
-	Model     string  `json:"model"`
-	Protocol  string  `json:"protocol"`
-	IsDefault bool    `json:"is_default"`
-	Models    []Model `json:"models"`
+	Name            string  `json:"name"`
+	ProviderID      string  `json:"provider_id,omitempty"`
+	StrategyVariant string  `json:"strategy_variant,omitempty"`
+	Model           string  `json:"model"`
+	Protocol        string  `json:"protocol"`
+	BaseURL         string  `json:"base_url,omitempty"`
+	IsDefault       bool    `json:"is_default"`
+	Models          []Model `json:"models"`
+}
+
+// ProviderDetails is the safe rich provider view returned by GET and PATCH
+// /api/v1/providers/:name. It deliberately exposes only whether an API key is
+// configured, never the plaintext key returned by the server.
+type ProviderDetails struct {
+	Name            string               `json:"name"`
+	ProviderID      string               `json:"provider_id"`
+	StrategyVariant string               `json:"strategy_variant"`
+	Protocol        string               `json:"protocol"`
+	BaseURL         string               `json:"base_url"`
+	APIKeySet       bool                 `json:"api_key_set"`
+	IsDefault       bool                 `json:"is_default"`
+	Models          []config.ModelConfig `json:"models"`
+	Model           string               `json:"model"`
+}
+
+type providerDetailsResponse struct {
+	Name            string               `json:"name"`
+	ProviderID      string               `json:"provider_id"`
+	StrategyVariant string               `json:"strategy_variant"`
+	Protocol        string               `json:"protocol"`
+	BaseURL         string               `json:"base_url"`
+	APIKey          string               `json:"api_key"`
+	IsDefault       bool                 `json:"is_default"`
+	Models          []config.ModelConfig `json:"models"`
+	Model           string               `json:"model"`
+}
+
+func (p providerDetailsResponse) safeView() ProviderDetails {
+	return ProviderDetails{
+		Name: p.Name, ProviderID: p.ProviderID, StrategyVariant: p.StrategyVariant,
+		Protocol: p.Protocol, BaseURL: p.BaseURL, APIKeySet: p.APIKey != "",
+		IsDefault: p.IsDefault, Models: p.Models, Model: p.Model,
+	}
+}
+
+// ProviderCreate is the body used to create a provider through pchat-server.
+type ProviderCreate struct {
+	Name            string `json:"name"`
+	ProviderID      string `json:"provider_id,omitempty"`
+	StrategyVariant string `json:"strategy_variant,omitempty"`
+	Protocol        string `json:"protocol"`
+	BaseURL         string `json:"base_url"`
+	APIKey          string `json:"api_key"`
+	Model           string `json:"model"`
+}
+
+// ProviderPatch is the partial body used to update a provider. APIKey remains
+// a pointer so an empty key is intentionally serialized when clearing it.
+type ProviderPatch struct {
+	APIKey *string `json:"api_key,omitempty"`
 }
 
 // Model mirrors a single model entry returned by the server. We
@@ -262,6 +397,29 @@ type ContextInspector struct {
 	Messages          []ContextMessage `json:"messages"`
 }
 
+// RuleInfo is one session-scoped rule returned by pchat-server.
+type RuleInfo struct {
+	Name  string `json:"name"`
+	Path  string `json:"path"`
+	Scope string `json:"scope"`
+}
+
+// AgentsCandidate is one AGENTS.md candidate considered for a session.
+type AgentsCandidate struct {
+	Slot     string `json:"slot"`
+	Label    string `json:"label"`
+	Path     string `json:"path"`
+	Exists   bool   `json:"exists"`
+	Selected bool   `json:"selected"`
+}
+
+// AgentsContext is the session-scoped AGENTS.md diagnostic response. Prompt
+// is exactly the OR-selected instruction block supplied to the agent.
+type AgentsContext struct {
+	Candidates []AgentsCandidate `json:"candidates"`
+	Prompt     string            `json:"prompt"`
+}
+
 // StyleInfo mirrors the styles endpoint payload.
 type StyleInfo struct {
 	ID    string `json:"id"`
@@ -329,10 +487,21 @@ func (c *Client) Ping(ctx context.Context) error {
 // ====================================================================
 
 func (c *Client) ListSessions(ctx context.Context) ([]Session, error) {
+	return c.ListSessionsForProject(ctx, nil)
+}
+
+// ListSessionsForProject 按项目列出会话；nil 不过滤，非 nil（含空串）精确限定范围。
+// ListSessionsForProject lists sessions by project; nil leaves the list unfiltered,
+// while a non-nil value, including an empty string, selects that exact scope.
+func (c *Client) ListSessionsForProject(ctx context.Context, projectPath *string) ([]Session, error) {
 	var resp struct {
 		Sessions []Session `json:"sessions"`
 	}
-	if err := c.doJSON(ctx, "GET", "/api/v1/sessions", nil, &resp); err != nil {
+	endpoint := "/api/v1/sessions"
+	if projectPath != nil {
+		endpoint += "?project_path=" + url.QueryEscape(*projectPath)
+	}
+	if err := c.doJSON(ctx, "GET", endpoint, nil, &resp); err != nil {
 		return nil, err
 	}
 	return resp.Sessions, nil
@@ -346,11 +515,60 @@ func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
 	return &s, nil
 }
 
+// ExportSession 从服务端下载已渲染的会话导出。
+// ExportSession downloads one rendered session export from the server. The
+// format is forwarded as md, markdown, html, pdf, or json. The returned
+// filename is normalized to a basename before callers write it locally.
+func (c *Client) ExportSession(ctx context.Context, sessionID, format string) (ExportFile, error) {
+	endpoint := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/export?format=" + url.QueryEscape(format)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+endpoint, nil)
+	if err != nil {
+		return ExportFile{}, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return ExportFile{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ExportFile{}, fmt.Errorf("read export response: %w", err)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return ExportFile{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return ExportFile{
+		Body:        body,
+		Filename:    exportFilename(resp.Header.Get("Content-Disposition")),
+		ContentType: resp.Header.Get("Content-Type"),
+	}, nil
+}
+
+func exportFilename(contentDisposition string) string {
+	_, params, err := mime.ParseMediaType(contentDisposition)
+	if err != nil {
+		return ""
+	}
+	name := strings.TrimSpace(params["filename"])
+	if name == "" {
+		return ""
+	}
+	// HTTP headers are untrusted input. Treat both Windows and URL path
+	// separators as directory components before returning a local filename.
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = path.Base(name)
+	if name == "." || name == "/" {
+		return ""
+	}
+	return name
+}
+
 type CreateSessionOpts struct {
-	Style    string `json:"style,omitempty"`
-	WorkMode string `json:"work_mode,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Title    string `json:"title,omitempty"`
+	Style       string `json:"style,omitempty"`
+	WorkMode    string `json:"work_mode,omitempty"`
+	Provider    string `json:"provider,omitempty"`
+	Title       string `json:"title,omitempty"`
+	ProjectPath string `json:"project_path,omitempty"`
 }
 
 func (c *Client) CreateSession(ctx context.Context, opts CreateSessionOpts) (*Session, error) {
@@ -418,6 +636,36 @@ func (c *Client) ListMessages(ctx context.Context, id string) ([]Message, error)
 	return resp.Messages, nil
 }
 
+// GetToolResult retrieves one truncated tool result for its owning session.
+// The response is capped to protect the CLI from an unexpectedly large body.
+func (c *Client) GetToolResult(ctx context.Context, sessionID, toolID string) (ToolResult, error) {
+	endpoint := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/messages/0/tool-result/" + url.PathEscape(toolID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.base+endpoint, nil)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxToolResultResponseBytes+1))
+	if err != nil {
+		return ToolResult{}, fmt.Errorf("read tool result response: %w", err)
+	}
+	if len(body) > maxToolResultResponseBytes {
+		return ToolResult{}, fmt.Errorf("tool result exceeds %d MiB response limit", maxToolResultResponseBytes>>20)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return ToolResult{}, fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var result ToolResult
+	if err := json.Unmarshal(body, &result); err != nil {
+		return ToolResult{}, fmt.Errorf("decode tool result: %w", err)
+	}
+	return result, nil
+}
+
 // SendMessageOptions configures a chat call.
 type SendMessageOptions struct {
 	Message              string                `json:"message" binding:"required"`
@@ -434,6 +682,9 @@ type SendMessageOptions struct {
 	SubAgentModel        string                `json:"sub_agent_model,omitempty"`
 	SkillContext         string                `json:"skill_context,omitempty"`
 	ActiveSkills         []string              `json:"active_skills,omitempty"`
+	// ToolsEnabled 仅覆盖当前消息的工具可用性。
+	// ToolsEnabled overrides tool availability for this message only.
+	ToolsEnabled *bool `json:"tools_enabled,omitempty"`
 }
 
 // TurnQueuePayload 镜像 server.SendMessageRequest 中需要持久化排队的字段。
@@ -691,6 +942,129 @@ func (c *Client) ListProviders(ctx context.Context) ([]ProviderInfo, error) {
 	return resp.Providers, nil
 }
 
+// GetProvider returns one provider's complete configuration. The API key in
+// the response must be treated as sensitive by callers.
+func (c *Client) GetProvider(ctx context.Context, name string) (ProviderDetails, error) {
+	var response providerDetailsResponse
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/providers/"+url.PathEscape(name), nil, &response)
+	return response.safeView(), err
+}
+
+// CreateProvider adds a provider through the server's active configuration
+// layer, then refreshes the CLI's provider/model cache.
+func (c *Client) CreateProvider(ctx context.Context, provider ProviderCreate) error {
+	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/providers", provider, nil); err != nil {
+		return err
+	}
+	return c.refreshProviders(ctx)
+}
+
+// DeleteProvider removes a provider through the server's active configuration
+// layer, then refreshes the CLI's provider/model cache.
+func (c *Client) DeleteProvider(ctx context.Context, name string) error {
+	if err := c.doJSON(ctx, http.MethodDelete, "/api/v1/providers/"+url.PathEscape(name), nil, nil); err != nil {
+		return err
+	}
+	return c.refreshProviders(ctx)
+}
+
+// PatchProvider applies a partial provider update. Pointer fields preserve the
+// distinction between omitted values and an intentionally empty API key.
+func (c *Client) PatchProvider(ctx context.Context, name string, patch ProviderPatch) (ProviderDetails, error) {
+	var response providerDetailsResponse
+	if err := c.doJSON(ctx, http.MethodPatch, "/api/v1/providers/"+url.PathEscape(name), patch, &response); err != nil {
+		return ProviderDetails{}, err
+	}
+	if err := c.refreshProviders(ctx); err != nil {
+		return ProviderDetails{}, err
+	}
+	return response.safeView(), nil
+}
+
+// SetDefaultProvider makes name the server's global default provider and
+// refreshes the CLI's provider/model cache.
+func (c *Client) SetDefaultProvider(ctx context.Context, name string) error {
+	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/providers/"+url.PathEscape(name)+"/default", struct{}{}, nil); err != nil {
+		return err
+	}
+	return c.refreshProviders(ctx)
+}
+
+// CreateModel adds a model under a provider. A requested default is applied
+// as a separate server operation because the create endpoint has no default
+// field.
+func (c *Client) CreateModel(ctx context.Context, provider string, model config.ModelConfig) error {
+	if err := c.doJSON(ctx, http.MethodPost, "/api/v1/providers/"+url.PathEscape(provider)+"/models", model, nil); err != nil {
+		return err
+	}
+	if model.Default {
+		if err := c.doJSON(ctx, http.MethodPost, "/api/v1/providers/"+url.PathEscape(provider)+"/models/"+url.PathEscape(model.Name)+"/default", struct{}{}, nil); err != nil {
+			return err
+		}
+	}
+	return c.refreshProviders(ctx)
+}
+
+// UpdateModel updates a model under a provider and refreshes the CLI cache.
+func (c *Client) UpdateModel(ctx context.Context, provider, name string, patch config.ModelConfig) error {
+	endpoint := "/api/v1/providers/" + url.PathEscape(provider) + "/models/" + url.PathEscape(name)
+	if err := c.doJSON(ctx, http.MethodPut, endpoint, patch, nil); err != nil {
+		return err
+	}
+	return c.refreshProviders(ctx)
+}
+
+// DeleteModel removes a model under a provider and refreshes the CLI cache.
+func (c *Client) DeleteModel(ctx context.Context, provider, name string) error {
+	endpoint := "/api/v1/providers/" + url.PathEscape(provider) + "/models/" + url.PathEscape(name)
+	if err := c.doJSON(ctx, http.MethodDelete, endpoint, nil, nil); err != nil {
+		return err
+	}
+	return c.refreshProviders(ctx)
+}
+
+// SetDefaultModel makes a model the provider's default and refreshes the CLI
+// cache.
+func (c *Client) SetDefaultModel(ctx context.Context, provider, name string) error {
+	endpoint := "/api/v1/providers/" + url.PathEscape(provider) + "/models/" + url.PathEscape(name) + "/default"
+	if err := c.doJSON(ctx, http.MethodPost, endpoint, struct{}{}, nil); err != nil {
+		return err
+	}
+	return c.refreshProviders(ctx)
+}
+
+func (c *Client) refreshProviders(ctx context.Context) error {
+	providers, err := c.ListProviders(ctx)
+	if err != nil {
+		return fmt.Errorf("refresh provider cache: %w", err)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	providerExists := false
+	modelExists := false
+	for _, provider := range providers {
+		if provider.Name != c.currentProvider {
+			continue
+		}
+		providerExists = true
+		for _, model := range provider.Models {
+			if model.Name == c.currentModel {
+				modelExists = true
+				break
+			}
+		}
+	}
+	if !providerExists {
+		c.currentProvider = ""
+		c.currentModel = ""
+		return nil
+	}
+	if c.currentModel != "" && !modelExists {
+		c.currentModel = ""
+	}
+	return nil
+}
+
 func (c *Client) ListStyles(ctx context.Context) ([]StyleInfo, error) {
 	var resp struct {
 		Styles []StyleInfo `json:"styles"`
@@ -741,6 +1115,82 @@ func (c *Client) ListSkills(ctx context.Context, sessionID string) ([]SkillInfo,
 		return nil, err
 	}
 	return resp.Skills, nil
+}
+
+// ListSessionRules returns rules visible to a session's project scope.
+func (c *Client) ListSessionRules(ctx context.Context, sessionID string) ([]RuleInfo, error) {
+	var response struct {
+		Rules []RuleInfo `json:"rules"`
+	}
+	endpoint := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/rules"
+	if err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &response); err != nil {
+		return nil, err
+	}
+	return response.Rules, nil
+}
+
+// GetSessionAgents returns the AGENTS.md candidates and selected instruction
+// prompt for a session's project scope.
+func (c *Client) GetSessionAgents(ctx context.Context, sessionID string) (AgentsContext, error) {
+	var response AgentsContext
+	endpoint := "/api/v1/sessions/" + url.PathEscape(sessionID) + "/agents"
+	err := c.doJSON(ctx, http.MethodGet, endpoint, nil, &response)
+	return response, err
+}
+
+// ListKnowledgeBases 返回服务端配置的知识库。ListKnowledgeBases returns the
+// server's configured knowledge bases.
+func (c *Client) ListKnowledgeBases(ctx context.Context) ([]KnowledgeBase, error) {
+	var bases []KnowledgeBase
+	if err := c.doJSON(ctx, http.MethodGet, "/api/v1/knowledge/bases", nil, &bases); err != nil {
+		return nil, err
+	}
+	return bases, nil
+}
+
+// AddKnowledgeBase 在服务端活动配置层创建知识库。AddKnowledgeBase creates a
+// knowledge base in the server's active config layer.
+func (c *Client) AddKnowledgeBase(ctx context.Context, base KnowledgeBase) error {
+	return c.doJSON(ctx, http.MethodPost, "/api/v1/knowledge/bases", base, nil)
+}
+
+// SetKnowledgeEnabled 更新服务端活动配置层的知识库总开关。
+// SetKnowledgeEnabled updates the knowledge feature flag in the server's active config layer.
+func (c *Client) SetKnowledgeEnabled(ctx context.Context, enabled bool) error {
+	return c.doJSON(ctx, http.MethodPatch, "/api/v1/knowledge/config", struct {
+		Enabled bool `json:"enabled"`
+	}{Enabled: enabled}, nil)
+}
+
+// RemoveKnowledgeBase 按名称从服务端活动配置层移除知识库。RemoveKnowledgeBase
+// removes one knowledge base by name from the server's active config layer.
+func (c *Client) RemoveKnowledgeBase(ctx context.Context, name string) error {
+	return c.doJSON(ctx, http.MethodDelete, "/api/v1/knowledge/bases/"+url.PathEscape(name), nil, nil)
+}
+
+// StartKnowledgeScan 启动服务端管理的单知识库异步扫描。StartKnowledgeScan starts
+// the server-managed asynchronous scan for one knowledge base.
+func (c *Client) StartKnowledgeScan(ctx context.Context, name string) error {
+	return c.doJSON(ctx, http.MethodPost, "/api/v1/knowledge/bases/"+url.PathEscape(name)+"/scan", struct{}{}, nil)
+}
+
+// GetKnowledgeScanStatus 返回一个知识库当前的服务端扫描状态。Done=false 且 Message
+// 为空表示服务端没有活动扫描任务，此时 Chunks 是已有索引节点数量。
+// GetKnowledgeScanStatus returns the server's current scan state for one
+// knowledge base. A response with Done=false and an empty Message means the
+// server has no active scan job for that base; Chunks is its current index size.
+func (c *Client) GetKnowledgeScanStatus(ctx context.Context, name string) (KnowledgeScanStatus, error) {
+	var status KnowledgeScanStatus
+	err := c.doJSON(ctx, http.MethodGet, "/api/v1/knowledge/bases/"+url.PathEscape(name)+"/scan/status", nil, &status)
+	return status, err
+}
+
+// SearchKnowledge 向服务端发送 canonical 知识库搜索请求。SearchKnowledge sends a
+// canonical knowledge search request to the server.
+func (c *Client) SearchKnowledge(ctx context.Context, request KnowledgeSearchRequest) (KnowledgeSearchResponse, error) {
+	var response KnowledgeSearchResponse
+	err := c.doJSON(ctx, http.MethodPost, "/api/v1/knowledge/search", request, &response)
+	return response, err
 }
 
 // CompressSession 请求服务端压缩会话历史。CompressSession requests the server to compact session history.
@@ -867,14 +1317,25 @@ func (c *Client) ProviderModel() string {
 	return ""
 }
 
-// SetModel selects a model on a provider. Currently the server
-// has no endpoint for this (the client must already have the model
-// in its registry). Returns an error if the model is unknown so
-// the REPL can fall back to a picker UI.
+// SetModel 选择提供商模型；空模型名采用默认模型，否则回退首个可用模型。
+// 未知提供商或模型返回错误且不改变缓存；服务端目前没有此操作的独立端点。
+// SetModel selects a provider model; an empty name uses its default or first model.
+// Unknown selections leave cached state unchanged; the server has no dedicated endpoint.
 func (c *Client) SetModel(provider, model string) error {
 	models, ok := c.ModelsFor(provider)
 	if !ok {
 		return fmt.Errorf("provider %q not found", provider)
+	}
+	if model == "" {
+		for _, candidate := range models {
+			if candidate.Default {
+				model = candidate.Name
+				break
+			}
+		}
+		if model == "" && len(models) > 0 {
+			model = models[0].Name
+		}
 	}
 	for _, m := range models {
 		if m.Name == model {
@@ -912,10 +1373,18 @@ func (c *Client) SubmitQuestionResponse(ctx context.Context, sessionID string, a
 
 // SubmitConfirmResponse 提交工具执行确认。SubmitConfirmResponse submits a tool execution confirmation.
 func (c *Client) SubmitConfirmResponse(ctx context.Context, sessionID string, approved bool, action string) error {
+	return c.SubmitConfirmResponseWithID(ctx, sessionID, approved, action, "")
+}
+
+// SubmitConfirmResponseWithID submits a confirmation bound to one exact
+// pending request. An empty confirmID keeps compatibility with servers and
+// clients that only ever expose one pending confirmation per session.
+func (c *Client) SubmitConfirmResponseWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error {
 	body := struct {
-		Approved bool   `json:"approved"`
-		Action   string `json:"action,omitempty"`
-	}{Approved: approved, Action: action}
+		ConfirmID string `json:"confirm_id,omitempty"`
+		Approved  bool   `json:"approved"`
+		Action    string `json:"action,omitempty"`
+	}{ConfirmID: confirmID, Approved: approved, Action: action}
 	return c.doJSON(ctx, "POST", "/api/v1/sessions/"+sessionID+"/confirm-response", body, nil)
 }
 
@@ -931,7 +1400,7 @@ func (c *Client) ModelsFor(provider string) ([]Model, bool) {
 	c.mu.Unlock()
 	for _, p := range providers {
 		if p.Name == provider {
-			if len(p.Models) > 0 {
+			if p.Models != nil {
 				models := make([]Model, 0, len(p.Models))
 				for _, model := range p.Models {
 					if model.Type == "" || model.Type == "llm" {

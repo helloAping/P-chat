@@ -22,16 +22,37 @@ import ChatWindow from './components/ChatWindow.vue'
 import TitleBar from './components/TitleBar.vue'
 import TopBar from './components/TopBar.vue'
 import AppSettingsModal from './components/AppSettingsModal.vue'
+import FirstRunWizard from './components/FirstRunWizard.vue'
 import ImageLightbox from './components/ImageLightbox.vue'
 import PlanReviewModal from './components/PlanReviewModal.vue'
 import ToolConfirmModal from './components/ToolConfirmModal.vue'
 import CloseConfirmModal from './components/CloseConfirmModal.vue'
 import DownloadDock from './components/DownloadDock.vue'
-import { loadSessions, loadProviders, loadProjects } from './stores/chat'
+import GlobalCommandPalette from './components/GlobalCommandPalette.vue'
+import { loadSessions, loadProviders, loadProjects, createSession, switchSession, state as chatState } from './stores/chat'
+import { pickContinueSession } from './utils/continueSession'
+import { buildGlobalCommands, directShortcut, isCommandPaletteShortcut } from './utils/globalCommands'
 import { setupTrayEventListeners } from './utils/trayEvents'
 
 const showAppSettings = ref(false)
+const showFirstRun = ref(false)
+const paletteOpen = ref(false)
+const FIRST_RUN_DISMISS_KEY = 'pchat-firstrun-dismissed'
 let cleanupTrayEvents: (() => void) | null = null
+
+function openFirstRunWizard() {
+  showFirstRun.value = true
+}
+
+function dismissFirstRun() {
+  try { localStorage.setItem(FIRST_RUN_DISMISS_KEY, '1') } catch { /* ignore */ }
+  showFirstRun.value = false
+}
+
+function onFirstRunDone() {
+  try { localStorage.removeItem(FIRST_RUN_DISMISS_KEY) } catch { /* ignore */ }
+  showFirstRun.value = false
+}
 
 // Sidebar collapse state. Persisted in localStorage so the user's
 // preference survives reloads. Toggled by the collapse button in
@@ -314,6 +335,55 @@ function toggleTheme() {
   themeName.value = themeName.value === 'dark' ? 'light' : 'dark'
 }
 
+const paletteCommands = computed(() => {
+  const next = pickContinueSession(chatState.sessions, chatState.currentID)
+  return buildGlobalCommands({
+    sidebarCollapsed: sidebarCollapsed.value,
+    inspectorOpen: inspectorOpen.value,
+    theme: themeName.value,
+    continueTitle: next?.title || null,
+  })
+})
+
+function onGlobalKeydown(event: KeyboardEvent) {
+  const direct = directShortcut(event)
+  if (direct) {
+    event.preventDefault()
+    event.stopPropagation()
+    if (direct === 'new-chat') void createSession()
+    else toggleSidebar()
+    return
+  }
+  if (isCommandPaletteShortcut(event)) {
+    event.preventDefault()
+    event.stopPropagation()
+    paletteOpen.value = !paletteOpen.value
+    return
+  }
+  if (paletteOpen.value && event.key === 'Escape') {
+    event.preventDefault()
+    event.stopPropagation()
+    paletteOpen.value = false
+  }
+}
+
+async function runPaletteCommand(id: string) {
+  const next = pickContinueSession(chatState.sessions, chatState.currentID)
+  paletteOpen.value = false
+  await nextTick()
+  try {
+    if (id === 'new-chat') await createSession()
+    else if (id === 'continue' && next) await switchSession(next.id)
+    else if (id === 'projects') await focusProjects()
+    else if (id === 'add-project') openAddProject()
+    else if (id === 'sidebar') toggleSidebar()
+    else if (id === 'inspector') toggleInspector()
+    else if (id === 'theme') toggleTheme()
+  } catch (error) {
+    console.error('command failed', error)
+  }
+}
+
 // Single brand color used by both Naive UI's primaryColor
 // and the rest of the app's --brand-500. Reading the CSS var
 // (rather than hard-coding) keeps the two in lock-step. The
@@ -379,10 +449,152 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => {
       primaryColorHover: brand,
       primaryColorPressed: brand,
       primaryColorSuppl: brand,
+      borderColor: 'var(--border-subtle)',
+      dividerColor: 'var(--border-subtle)',
       fontFamily: readFontFamily(),
       cubicBezierEaseOut: motion.easeOut,
       cubicBezierEaseIn: motion.easeIn,
       cubicBezierEaseInOut: motion.easeInOut,
+    },
+    // One quiet control language: hairline resting borders,
+    // a soft focus wash, and brand fill only on primary actions.
+    Button: {
+      fontWeight: '500',
+      fontSizeSmall: '12.5px',
+      fontSizeMedium: '13px',
+      heightSmall: 'var(--control-height)',
+      heightMedium: '32px',
+      borderRadiusSmall: 'var(--radius-sm)',
+      borderRadiusMedium: 'var(--radius-sm)',
+      borderRadiusLarge: 'var(--radius-md)',
+      rippleColor: 'transparent',
+      waveOpacity: '0',
+      color: 'transparent',
+      colorHover: 'var(--surface-2)',
+      colorPressed: 'var(--surface-3)',
+      colorFocus: 'var(--surface-2)',
+      textColor: 'var(--text-secondary)',
+      textColorHover: 'var(--text-primary)',
+      textColorPressed: 'var(--text-primary)',
+      textColorFocus: 'var(--text-primary)',
+      textColorDisabled: 'var(--text-quaternary)',
+      border: 'var(--control-border)',
+      borderHover: 'var(--control-border-hover)',
+      borderPressed: 'var(--control-border-hover)',
+      borderFocus: 'var(--control-focus-border)',
+      borderDisabled: 'var(--control-border)',
+      colorSecondary: 'transparent',
+      colorSecondaryHover: 'var(--surface-2)',
+      colorSecondaryPressed: 'var(--surface-3)',
+      textColorTertiary: 'var(--text-secondary)',
+      colorTertiary: 'transparent',
+      colorTertiaryHover: 'var(--surface-2)',
+      colorTertiaryPressed: 'var(--surface-3)',
+      colorQuaternary: 'transparent',
+      colorQuaternaryHover: 'var(--surface-2)',
+      colorQuaternaryPressed: 'var(--surface-3)',
+      colorPrimary: 'var(--brand-500)',
+      colorHoverPrimary: 'var(--brand-600)',
+      colorPressedPrimary: 'var(--brand-700)',
+      colorFocusPrimary: 'var(--brand-600)',
+      textColorPrimary: 'var(--on-brand)',
+      textColorHoverPrimary: 'var(--on-brand)',
+      textColorPressedPrimary: 'var(--on-brand)',
+      textColorFocusPrimary: 'var(--on-brand)',
+      borderPrimary: '1px solid transparent',
+      borderHoverPrimary: '1px solid transparent',
+      borderPressedPrimary: '1px solid transparent',
+      borderFocusPrimary: '1px solid transparent',
+      rippleColorPrimary: 'transparent',
+      borderInfo: '1px solid transparent',
+      borderHoverInfo: '1px solid transparent',
+      borderPressedInfo: '1px solid transparent',
+      borderFocusInfo: '1px solid transparent',
+      borderSuccess: '1px solid transparent',
+      borderHoverSuccess: '1px solid transparent',
+      borderPressedSuccess: '1px solid transparent',
+      borderFocusSuccess: '1px solid transparent',
+      borderWarning: '1px solid transparent',
+      borderHoverWarning: '1px solid transparent',
+      borderPressedWarning: '1px solid transparent',
+      borderFocusWarning: '1px solid transparent',
+      borderError: '1px solid transparent',
+      borderHoverError: '1px solid transparent',
+      borderPressedError: '1px solid transparent',
+      borderFocusError: '1px solid transparent',
+    },
+    Input: {
+      fontWeight: '400',
+      heightSmall: 'var(--control-height)',
+      heightMedium: '32px',
+      fontSizeSmall: '13px',
+      fontSizeMedium: '13px',
+      borderRadius: 'var(--radius-sm)',
+      color: 'var(--surface-input)',
+      colorFocus: 'var(--surface-input)',
+      textColor: 'var(--text-primary)',
+      placeholderColor: 'var(--text-tertiary)',
+      caretColor: 'var(--brand-500)',
+      iconColor: 'var(--text-tertiary)',
+      iconColorHover: 'var(--text-secondary)',
+      iconColorPressed: 'var(--text-primary)',
+      clearColor: 'var(--text-tertiary)',
+      clearColorHover: 'var(--text-secondary)',
+      clearColorPressed: 'var(--text-primary)',
+      border: 'var(--control-border)',
+      borderHover: 'var(--control-border-hover)',
+      borderFocus: 'var(--control-focus-border)',
+      boxShadowFocus: 'var(--control-focus-ring)',
+      borderDisabled: 'var(--control-border)',
+      colorDisabled: 'var(--surface-2)',
+    },
+    Checkbox: {
+      borderRadius: '4px',
+      sizeSmall: '14px',
+      sizeMedium: '15px',
+      sizeLarge: '16px',
+      labelFontWeight: '400',
+      color: 'transparent',
+      colorChecked: 'var(--brand-500)',
+      checkMarkColor: 'var(--on-brand)',
+      textColor: 'var(--text-primary)',
+      border: 'var(--control-border)',
+      borderChecked: '1px solid var(--brand-500)',
+      borderFocus: 'var(--control-focus-border)',
+      boxShadowFocus: 'var(--control-focus-ring)',
+    },
+    Radio: {
+      radioSizeSmall: '14px',
+      radioSizeMedium: '15px',
+      radioSizeLarge: '16px',
+      labelFontWeight: '400',
+      color: 'transparent',
+      colorActive: 'var(--brand-500)',
+      dotColorActive: 'var(--on-brand)',
+      textColor: 'var(--text-primary)',
+      boxShadow: 'inset 0 0 0 1px var(--border-subtle)',
+      boxShadowHover: 'inset 0 0 0 1px var(--border-default)',
+      boxShadowActive: 'inset 0 0 0 1px var(--brand-500)',
+      boxShadowFocus: 'var(--control-focus-ring), inset 0 0 0 1px var(--border-subtle)',
+      buttonBorderRadius: 'var(--radius-sm)',
+      buttonBorderColor: 'var(--border-subtle)',
+      buttonBorderColorHover: 'var(--border-default)',
+      buttonBorderColorActive: 'var(--border-subtle)',
+      buttonColor: 'transparent',
+      buttonColorActive: 'color-mix(in srgb, var(--brand-500) 8%, var(--surface-1))',
+      buttonTextColor: 'var(--text-secondary)',
+      buttonTextColorHover: 'var(--text-primary)',
+      buttonTextColorActive: 'var(--text-primary)',
+      buttonBoxShadow: 'none',
+      buttonBoxShadowHover: 'none',
+      buttonBoxShadowFocus: 'var(--control-focus-ring)',
+    },
+    Switch: {
+      railColor: 'var(--surface-3)',
+      railColorActive: 'var(--brand-500)',
+      buttonColor: 'var(--on-brand)',
+      boxShadowFocus: 'var(--control-focus-ring)',
+      buttonBoxShadow: 'none',
     },
     Select: {
       menuBoxShadow: 'var(--shadow-lg)',
@@ -403,13 +615,13 @@ const themeOverrides = computed<GlobalThemeOverrides>(() => {
           color: 'var(--surface-2)',
           colorActive: 'var(--surface-3)',
           colorDisabled: 'var(--surface-2)',
-          border: '1px solid var(--border-subtle)',
-          borderHover: '1px solid var(--border-default)',
-          borderActive: '1px solid var(--border-default)',
-          borderFocus: '1px solid var(--brand-500)',
+          border: 'var(--control-border)',
+          borderHover: 'var(--control-border-hover)',
+          borderActive: 'var(--control-focus-border)',
+          borderFocus: 'var(--control-focus-border)',
           boxShadowHover: 'none',
-          boxShadowActive: '0 0 0 2px var(--brand-100)',
-          boxShadowFocus: '0 0 0 2px var(--brand-100)',
+          boxShadowActive: 'var(--control-focus-ring)',
+          boxShadowFocus: 'var(--control-focus-ring)',
           caretColor: 'var(--brand-500)',
           arrowColor: 'var(--text-tertiary)',
           arrowColorDisabled: 'var(--text-quaternary)',
@@ -483,7 +695,12 @@ function openAbout() {
   sidebarRef.value?.openAbout?.()
 }
 
+function onOpenInspector() {
+  inspectorOpen.value = true
+}
+
 onMounted(async () => {
+  window.addEventListener('pchat:open-inspector', onOpenInspector)
   // Theme bootstrap: localStorage > OS preference > dark.
   let initial: 'dark' | 'light' | null = null
   try {
@@ -521,23 +738,34 @@ onMounted(async () => {
   // Expose an open handle too, in case something other than the
   // sidebar needs it.
   ;(window as any).openAppSettings = () => { showAppSettings.value = true }
+  ;(window as any).openFirstRunWizard = openFirstRunWizard
+  ;(window as any).openAddProject = () => { sidebarRef.value?.openAddProject() }
   try {
     // Projects must load before sessions so the store can restore
     // the last active project, then pick that project's last session.
     await Promise.all([loadProviders(), loadProjects()])
     await loadSessions()
+    const dismissed = (() => {
+      try { return localStorage.getItem(FIRST_RUN_DISMISS_KEY) === '1' } catch { return false }
+    })()
+    if ((chatState.providers || []).length === 0 && !dismissed) {
+      showFirstRun.value = true
+    }
   } catch (e) {
     console.error('init failed', e)
   }
   cleanupTrayEvents = await setupTrayEventListeners()
   window.addEventListener('resize', keepPanelWidthsInBounds)
+  window.addEventListener('keydown', onGlobalKeydown, true)
 })
 
 onUnmounted(() => {
+  window.removeEventListener('pchat:open-inspector', onOpenInspector)
   removeSidebarResizeListeners()
   removeInspectorResizeListeners()
   if (typeof window !== 'undefined') {
     window.removeEventListener('resize', keepPanelWidthsInBounds)
+    window.removeEventListener('keydown', onGlobalKeydown, true)
   }
   if (cleanupTrayEvents) {
     cleanupTrayEvents()
@@ -628,10 +856,22 @@ onUnmounted(() => {
               v-if="showAppSettings"
               v-model:show="showAppSettings"
             />
+            <FirstRunWizard
+              v-model:show="showFirstRun"
+              @done="onFirstRunDone"
+              @dismiss="dismissFirstRun"
+            />
             <ToolConfirmModal />
             <PlanReviewModal />
             <CloseConfirmModal />
             <DownloadDock />
+            <GlobalCommandPalette
+              :open="paletteOpen"
+              :commands="paletteCommands"
+              :theme="themeName"
+              @close="paletteOpen = false"
+              @run="runPaletteCommand"
+            />
           </div>
         </NNotificationProvider>
       </NDialogProvider>

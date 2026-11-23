@@ -6,16 +6,17 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/fatih/color"
 	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/agents"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
-	"github.com/p-chat/pchat/internal/paths"
 	"github.com/p-chat/pchat/internal/rules"
 	"github.com/p-chat/pchat/internal/skill"
 	"github.com/p-chat/pchat/internal/style"
@@ -34,7 +35,7 @@ import (
 //     server doesn't expose the corresponding endpoint yet) but are
 //     always safe to call; local mode is always a no-error operation.
 //   - Methods that don't have a meaningful HTTP counterpart (e.g.
-//     project-file reads for /init, /skills, /rules, /agents) return
+//     project-file reads for /init) return
 //     *ErrUnsupported so the handler can show a friendly "only
 //     available in local mode" message.
 type cliContext interface {
@@ -44,6 +45,8 @@ type cliContext interface {
 	SetCurrentSession(id string) error
 	GetCurrentSessionMessages(ctx context.Context) ([]httpcli.Message, error)
 	NewSession(ctx context.Context, opts httpcli.CreateSessionOpts) (*httpcli.Session, error)
+	ProjectPath() string
+	SetProjectPath(path string) error
 	RenameSession(ctx context.Context, id, title string) error
 	DeleteSession(ctx context.Context, id string) error
 	// PatchSession sends a partial update to the session's
@@ -173,9 +176,9 @@ type cliContext interface {
 	// ExpandList returns one-line summaries of all stored results.
 	ExpandList() []ToolResultView
 	// ExpandByIndex returns the full result for the 1-based index.
-	ExpandByIndex(idx int) (ToolResultView, bool)
+	ExpandByIndex(idx int) (ToolResultView, bool, error)
 	// ExpandLast returns the most recent result.
-	ExpandLast() (ToolResultView, bool)
+	ExpandLast() (ToolResultView, bool, error)
 
 	// === Diagnostics ===
 	// SubAgentStats returns hit/miss/store counts + hit ratio. Returns
@@ -195,29 +198,38 @@ type cliContext interface {
 	AddKB(path string) error
 	RemoveKB(path string) error
 	ScanKBs() (added, updated int, err error)
+	GetKBScanStatus(ctx context.Context, name string) (httpcli.KnowledgeScanStatus, error)
 
 	// === Recall (for /recall) ===
 	Recall(ctx context.Context, query string, topK int) error
 
 	// === Project context (for /init, /skills, /rules, /agents) ===
-	// These are inherently local-filesystem operations. In HTTP
-	// mode they return ErrUnsupported so the handler can show a
-	// friendly "only available locally" message.
+	// /init remains local-only. The other queries are session-scoped
+	// server observations when the REPL is connected over HTTP.
 	InitProject(dir string) error
 	ListSkills() ([]string, error)
-	ListRules() ([]string, error)
-	AgentsContext() (global, project string, err error)
+	ListRules() ([]RuleView, error)
+	AgentsContext() (AgentsContextView, error)
 }
+
+// RuleView describes one loaded rule and its scope.
+type RuleView = httpcli.RuleInfo
+
+// AgentsContextView describes candidates and the exact prompt selected by the
+// AGENTS.md OR loader.
+type AgentsContextView = httpcli.AgentsContext
 
 // ProviderConfigView is a read-only snapshot of a provider's
 // on-disk config. Used by /provider and /setup.
 type ProviderConfigView struct {
-	Name     string
-	Protocol string
-	BaseURL  string
-	APIKey   string
-	Model    string
-	Models   []ModelView
+	Name            string
+	ProviderID      string
+	StrategyVariant string
+	Protocol        string
+	BaseURL         string
+	APIKeySet       bool
+	Model           string
+	Models          []ModelView
 }
 
 // ProviderConfigInput is the writer-side shape for AddProvider.
@@ -271,17 +283,20 @@ type ToolDiagnosticView struct {
 
 // ToolResultView is a snapshot of a cached tool call result.
 type ToolResultView struct {
-	Seq      int
-	Tool     string
-	Args     string
-	Result   string
-	Err      string
-	Duration time.Duration
-	At       time.Time
+	Seq       int
+	Tool      string
+	Args      string
+	Result    string
+	Err       string
+	Duration  time.Duration
+	At        time.Time
+	Truncated bool
+	FullLen   int
 }
 
 // KBView is one mounted knowledge base directory.
 type KBView struct {
+	Name  string
 	Path  string
 	Files int
 	Size  int64
@@ -311,6 +326,17 @@ type ErrUnsupported struct{ Op string }
 
 func (e *ErrUnsupported) Error() string {
 	return "operation " + e.Op + " is not supported in HTTP mode"
+}
+
+type confirmIDContext interface {
+	SubmitToolConfirmWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error
+}
+
+func submitToolConfirmWithID(ctx cliContext, requestCtx context.Context, sessionID string, approved bool, action, confirmID string) error {
+	if detailed, ok := ctx.(confirmIDContext); ok {
+		return detailed.SubmitToolConfirmWithID(requestCtx, sessionID, approved, action, confirmID)
+	}
+	return ctx.SubmitToolConfirm(requestCtx, sessionID, approved, action)
 }
 
 // ====================================================================
@@ -377,6 +403,11 @@ func (c *localContext) NewSession(ctx context.Context, opts httpcli.CreateSessio
 		}
 	}
 	return &httpcli.Session{ID: id}, nil
+}
+
+func (c *localContext) ProjectPath() string { return "" }
+func (c *localContext) SetProjectPath(path string) error {
+	return &ErrUnsupported{Op: "SetProjectPath"}
 }
 
 func (c *localContext) RenameSession(ctx context.Context, id, title string) error {
@@ -457,7 +488,11 @@ func (c *localContext) SubmitQuestionAnswer(ctx context.Context, sessionID strin
 }
 
 func (c *localContext) SubmitToolConfirm(ctx context.Context, sessionID string, approved bool, action string) error {
-	if !tool.SubmitConfirmResponse(sessionID, tool.ConfirmResponse{Approved: approved, Action: action}) {
+	return c.SubmitToolConfirmWithID(ctx, sessionID, approved, action, "")
+}
+
+func (c *localContext) SubmitToolConfirmWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error {
+	if !tool.SubmitConfirmResponse(sessionID, tool.ConfirmResponse{ConfirmID: confirmID, Approved: approved, Action: action}) {
 		return fmt.Errorf("no pending tool confirmation for session %s", sessionID)
 	}
 	return nil
@@ -711,7 +746,13 @@ func (c *localContext) SetCurrentProvider(name string) error {
 	return nil
 }
 
-func (c *localContext) SetModel(p, m string) error   { return c.r.llm.SetModel(p, m) }
+func (c *localContext) SetModel(p, m string) error {
+	if err := c.r.llm.SetModel(p, m); err != nil {
+		return err
+	}
+	c.r.provider = p
+	return nil
+}
 func (c *localContext) HasProvider(n string) bool    { return c.r.llm.HasProvider(n) }
 func (c *localContext) DisplayModel(p string) string { return c.r.llm.DisplayModel(p) }
 
@@ -731,12 +772,14 @@ func (c *localContext) ProviderConfig(name string) (ProviderConfigView, error) {
 			})
 		}
 		return ProviderConfigView{
-			Name:     p.Name,
-			Protocol: p.GetProtocol(),
-			BaseURL:  p.EffectiveBaseURL(),
-			APIKey:   p.APIKey,
-			Model:    p.EffectiveModel(),
-			Models:   models,
+			Name:            p.Name,
+			ProviderID:      p.GetProviderID(),
+			StrategyVariant: p.GetStrategyVariant(),
+			Protocol:        p.GetProtocol(),
+			BaseURL:         p.EffectiveBaseURL(),
+			APIKeySet:       p.APIKey != "",
+			Model:           p.EffectiveModel(),
+			Models:          models,
 		}, nil
 	}
 	return ProviderConfigView{}, &ErrUnsupported{Op: "ProviderConfig: provider not found"}
@@ -872,7 +915,9 @@ func (c *localContext) ReloadConfig() error {
 }
 
 func (c *localContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) (<-chan agent.ChatStreamChunk, error) {
-	return c.r.agent.ChatWithTools(ctx, req), nil
+	enabled := c.r.useTools
+	req.ToolCallsEnabled = &enabled
+	return c.cacheToolStream(req.SessionID, c.r.agent.ChatWithTools(ctx, req)), nil
 }
 
 func (c *localContext) ChatQueuedTurn(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (<-chan agent.ChatStreamChunk, error) {
@@ -885,7 +930,32 @@ func (c *localContext) ChatStream(ctx context.Context, req agent.ChatRequest) (<
 		close(ch)
 		return ch, nil
 	}
-	return c.r.agent.ChatStream(ctx, req), nil
+	return c.cacheToolStream(req.SessionID, c.r.agent.ChatStream(ctx, req)), nil
+}
+
+// cacheToolStream records terminal tool chunks while preserving stream order.
+func (c *localContext) cacheToolStream(sessionID string, stream <-chan agent.ChatStreamChunk) <-chan agent.ChatStreamChunk {
+	out := make(chan agent.ChatStreamChunk, 16)
+	go func() {
+		defer close(out)
+		for chunk := range stream {
+			c.recordToolChunk(sessionID, chunk)
+			out <- chunk
+		}
+	}()
+	return out
+}
+
+// recordToolChunk saves completed tool calls for a later /expand command.
+func (c *localContext) recordToolChunk(sessionID string, chunk agent.ChatStreamChunk) {
+	if c.r.toolCache == nil || chunk.ToolName == "" || (chunk.ToolResult == "" && chunk.ToolResultFull == "" && chunk.ToolError == "") {
+		return
+	}
+	result := chunk.ToolResult
+	if chunk.ToolResultFull != "" {
+		result = chunk.ToolResultFull
+	}
+	c.r.toolCache.record(chunk.ToolName, chunk.ToolID, sessionID, chunk.ToolArgs, result, chunk.ToolError, parseToolDuration(chunk.ToolElapsed), chunk.ToolResultTruncated, chunk.ToolResultFullLen)
 }
 
 func (c *localContext) StyleLabel(s style.Style) string { return c.r.styleMgr.DisplayLabel(s) }
@@ -1033,47 +1103,39 @@ func (c *localContext) ExpandList() []ToolResultView {
 		return nil
 	}
 	src := c.r.toolCache.list()
-	out := make([]ToolResultView, 0, len(src))
-	for _, t := range src {
-		out = append(out, ToolResultView{
-			Seq:      t.seq,
-			Tool:     t.tool,
-			Args:     t.args,
-			Result:   t.result,
-			Err:      t.err,
-			Duration: t.duration,
-			At:       t.at,
-		})
-	}
-	return out
+	return toolResultViews(src)
 }
 
-func (c *localContext) ExpandByIndex(idx int) (ToolResultView, bool) {
+func (c *localContext) ExpandByIndex(idx int) (ToolResultView, bool, error) {
 	if c.r.toolCache == nil {
-		return ToolResultView{}, false
+		return ToolResultView{}, false, nil
 	}
 	r := c.r.toolCache.get(idx)
 	if r == nil {
-		return ToolResultView{}, false
+		return ToolResultView{}, false, nil
+	}
+	if r.truncated {
+		result, ok := agent.LookupTruncatedResult(r.sessionID, r.toolID)
+		if !ok {
+			return ToolResultView{}, false, fmt.Errorf("工具结果已过期或不在当前会话中")
+		}
+		c.r.toolCache.replaceResult(r, result)
 	}
 	return ToolResultView{
 		Seq: r.seq, Tool: r.tool, Args: r.args,
-		Result: r.result, Err: r.err, Duration: r.duration, At: r.at,
-	}, true
+		Result: r.result, Err: r.err, Duration: r.duration, At: r.at, Truncated: r.truncated, FullLen: r.fullLen,
+	}, true, nil
 }
 
-func (c *localContext) ExpandLast() (ToolResultView, bool) {
+func (c *localContext) ExpandLast() (ToolResultView, bool, error) {
 	if c.r.toolCache == nil {
-		return ToolResultView{}, false
+		return ToolResultView{}, false, nil
 	}
 	r := c.r.toolCache.last()
 	if r == nil {
-		return ToolResultView{}, false
+		return ToolResultView{}, false, nil
 	}
-	return ToolResultView{
-		Seq: r.seq, Tool: r.tool, Args: r.args,
-		Result: r.result, Err: r.err, Duration: r.duration, At: r.at,
-	}, true
+	return c.ExpandByIndex(r.seq)
 }
 
 func (c *localContext) ListKBs() ([]KBView, error) {
@@ -1101,7 +1163,21 @@ func (c *localContext) ScanKBs() (added, updated int, err error) {
 	if c.r.kbManager == nil {
 		return 0, 0, &ErrUnsupported{Op: "ScanKBs"}
 	}
-	return c.r.kbManager.ScanStats()
+	// 实际重建每个已启用知识库的索引；旧实现只统计已有节点，并未扫描文件。
+	// Actually rebuild every enabled base; the old implementation only counted
+	// existing nodes and never scanned the files.
+	if err := c.r.kbManager.Scan(""); err != nil {
+		return 0, 0, fmt.Errorf("scan knowledge bases: %w", err)
+	}
+	added, updated, err = c.r.kbManager.ScanStats()
+	if err != nil {
+		return 0, 0, fmt.Errorf("read knowledge base scan stats: %w", err)
+	}
+	return added, updated, nil
+}
+
+func (c *localContext) GetKBScanStatus(ctx context.Context, name string) (httpcli.KnowledgeScanStatus, error) {
+	return httpcli.KnowledgeScanStatus{}, &ErrUnsupported{Op: "GetKBScanStatus"}
 }
 
 func (c *localContext) Recall(ctx context.Context, query string, topK int) error {
@@ -1118,7 +1194,10 @@ func (c *localContext) Recall(ctx context.Context, query string, topK int) error
 	if effective == nil {
 		effective = context.Background()
 	}
-	return c.r.recallEngine.PrintSearch(effective, query, topK)
+	if err := c.r.recallEngine.PrintSearch(effective, query, topK); err != nil {
+		return fmt.Errorf("search knowledge base: %w", err)
+	}
+	return nil
 }
 
 func (c *localContext) InitProject(dir string) error {
@@ -1137,29 +1216,40 @@ func (c *localContext) ListSkills() ([]string, error) {
 	return out, nil
 }
 
-func (c *localContext) ListRules() ([]string, error) {
-	all, err := rules.LoadAll()
+func (c *localContext) ListRules() ([]RuleView, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("get project root: %w", err)
+	}
+	all, err := rules.LoadAllWithRoot(root)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]string, 0, len(all))
+	out := make([]RuleView, 0, len(all))
 	for _, r := range all {
-		out = append(out, r.Name)
+		scope := "project"
+		if r.IsGlobal {
+			scope = "global"
+		}
+		out = append(out, RuleView{Name: r.Name, Path: r.Path, Scope: scope})
 	}
 	return out, nil
 }
 
-func (c *localContext) AgentsContext() (global, project string, err error) {
-	globalPath := paths.GlobalAgents()
-	projectPath := "AGENTS.md"
-
-	if data, e := os.ReadFile(globalPath); e == nil {
-		global = string(data)
+func (c *localContext) AgentsContext() (AgentsContextView, error) {
+	root, err := os.Getwd()
+	if err != nil {
+		return AgentsContextView{}, fmt.Errorf("get project root: %w", err)
 	}
-	if data, e := os.ReadFile(projectPath); e == nil {
-		project = string(data)
+	inspection := agents.InspectWithRoot(root)
+	view := AgentsContextView{Prompt: inspection.Prompt, Candidates: make([]httpcli.AgentsCandidate, 0, len(inspection.Candidates))}
+	for _, candidate := range inspection.Candidates {
+		view.Candidates = append(view.Candidates, httpcli.AgentsCandidate{
+			Slot: candidate.Slot, Label: candidate.Label, Path: candidate.Path,
+			Exists: candidate.Exists, Selected: candidate.Selected,
+		})
 	}
-	return global, project, nil
+	return view, nil
 }
 
 func (c *localContext) Flush() error { return c.r.store.Flush() }
@@ -1174,24 +1264,34 @@ func (c *localContext) Flush() error { return c.r.store.Flush() }
 // ====================================================================
 
 type httpContext struct {
-	c       *httpcli.Client
-	style   string
-	mode    string
-	prov    string
-	curSess string
+	c            *httpcli.Client
+	style        string
+	mode         string
+	prov         string
+	curSess      string
+	projectPath  string
+	toolsEnabled bool
+	toolCache    *toolResultCache
 
 	rollbackUndo map[string][]httpcli.Message
 }
 
 // NewHTTPContext creates a cliContext backed by an httpcli.Client.
 // All operations go through the pchat-server REST API.
-func NewHTTPContext(c *httpcli.Client, style, mode, provider, sessionID string) cliContext {
+func NewHTTPContext(c *httpcli.Client, style, mode, provider, sessionID string, projectPath ...string) cliContext {
+	boundProjectPath := ""
+	if len(projectPath) > 0 {
+		boundProjectPath = projectPath[0]
+	}
 	return &httpContext{
-		c:       c,
-		style:   style,
-		mode:    string(config.WorkMode(mode).Normalize()),
-		prov:    provider,
-		curSess: sessionID,
+		c:            c,
+		style:        style,
+		mode:         string(config.WorkMode(mode).Normalize()),
+		prov:         provider,
+		curSess:      sessionID,
+		projectPath:  boundProjectPath,
+		toolsEnabled: true,
+		toolCache:    newToolResultCache(20),
 	}
 }
 
@@ -1204,8 +1304,6 @@ func (c *httpContext) ListProviders(ctx context.Context) ([]httpcli.ProviderInfo
 }
 
 func (c *httpContext) ListProviderModels(ctx context.Context, provider string) ([]httpcli.Model, error) {
-	// The server doesn't expose a per-provider list-models endpoint
-	// yet; synthesize from cached provider info if available.
 	models, _ := c.c.ModelsFor(provider)
 	out := make([]httpcli.Model, 0, len(models))
 	for _, m := range models {
@@ -1214,50 +1312,179 @@ func (c *httpContext) ListProviderModels(ctx context.Context, provider string) (
 	return out, nil
 }
 
-func (c *httpContext) GetCurrentProvider() string          { return c.prov }
-func (c *httpContext) GetCurrentModel() string             { return c.c.ProviderModel() }
-func (c *httpContext) GetProviderProtocol(p string) string { return "" }
+func (c *httpContext) GetCurrentProvider() string { return c.prov }
+func (c *httpContext) GetCurrentModel() string    { return c.c.ProviderModel() }
+func (c *httpContext) GetProviderProtocol(p string) string {
+	providers, _ := c.c.ListProviders(context.Background())
+	for _, provider := range providers {
+		if provider.Name == p {
+			return provider.Protocol
+		}
+	}
+	return ""
+}
 func (c *httpContext) SetCurrentProvider(name string) error {
 	c.prov = name
 	return nil
 }
-func (c *httpContext) SetModel(p, m string) error   { return c.c.SetModel(p, m) }
-func (c *httpContext) HasProvider(n string) bool    { return true }
+func (c *httpContext) SetModel(p, m string) error {
+	if err := c.c.SetModel(p, m); err != nil {
+		return err
+	}
+	c.prov = p
+	return nil
+}
+func (c *httpContext) HasProvider(n string) bool {
+	providers, err := c.c.ListProviders(context.Background())
+	if err != nil {
+		return false
+	}
+	for _, provider := range providers {
+		if provider.Name == n {
+			return true
+		}
+	}
+	return false
+}
 func (c *httpContext) DisplayModel(p string) string { return c.c.DisplayModel(p) }
 func (c *httpContext) ProviderConfig(name string) (ProviderConfigView, error) {
-	return ProviderConfigView{}, c.unsupported("ProviderConfig")
+	provider, err := c.c.GetProvider(context.Background(), name)
+	if err != nil {
+		return ProviderConfigView{}, err
+	}
+	models := make([]ModelView, 0, len(provider.Models))
+	for _, model := range provider.Models {
+		models = append(models, ModelView{
+			Provider:    provider.Name,
+			Name:        model.Name,
+			DisplayName: model.DisplayName,
+			Description: model.Description,
+			Default:     model.Default,
+		})
+	}
+	return ProviderConfigView{
+		Name:            provider.Name,
+		ProviderID:      provider.ProviderID,
+		StrategyVariant: provider.StrategyVariant,
+		Protocol:        provider.Protocol,
+		BaseURL:         provider.BaseURL,
+		APIKeySet:       provider.APIKeySet,
+		Model:           provider.Model,
+		Models:          models,
+	}, nil
 }
-func (c *httpContext) AddProvider(p ProviderConfigInput) error { return c.unsupported("AddProvider") }
-func (c *httpContext) RemoveProvider(name string) error        { return c.unsupported("RemoveProvider") }
+func (c *httpContext) AddProvider(p ProviderConfigInput) error {
+	return c.c.CreateProvider(context.Background(), httpcli.ProviderCreate{
+		Name: p.Name, Protocol: p.Protocol, BaseURL: p.BaseURL, APIKey: p.APIKey, Model: p.Model,
+	})
+}
+func (c *httpContext) RemoveProvider(name string) error {
+	if err := c.c.DeleteProvider(context.Background(), name); err != nil {
+		return err
+	}
+	if c.prov == name {
+		providers, err := c.c.ListProviders(context.Background())
+		if err != nil {
+			return err
+		}
+		for _, provider := range providers {
+			if provider.IsDefault {
+				c.prov = provider.Name
+				c.c.SetCurrentProvider(provider.Name)
+				break
+			}
+		}
+	}
+	return nil
+}
 func (c *httpContext) SetProviderAPIKey(name, key string) error {
-	return c.unsupported("SetProviderAPIKey")
+	_, err := c.c.PatchProvider(context.Background(), name, httpcli.ProviderPatch{APIKey: &key})
+	return err
 }
 func (c *httpContext) SetDefaultProvider(name string) error {
-	return c.unsupported("SetDefaultProvider")
+	if err := c.c.SetDefaultProvider(context.Background(), name); err != nil {
+		return err
+	}
+	c.prov = name
+	c.c.SetCurrentProvider(name)
+	return nil
 }
-func (c *httpContext) AddModel(p, n, d, dd string) error { return c.unsupported("AddModel") }
+func (c *httpContext) AddModel(p, n, d, dd string) error {
+	return c.c.CreateModel(context.Background(), p, config.ModelConfig{Name: n, DisplayName: d, Description: dd})
+}
 func (c *httpContext) AddModelFull(p string, m config.ModelConfig) error {
-	return c.unsupported("AddModelFull")
+	return c.c.CreateModel(context.Background(), p, m)
 }
 func (c *httpContext) UpdateModel(p, n string, patch config.ModelConfig) error {
-	return c.unsupported("UpdateModel")
+	return c.c.UpdateModel(context.Background(), p, n, patch)
 }
-func (c *httpContext) RemoveModel(p, n string) error              { return c.unsupported("RemoveModel") }
-func (c *httpContext) SetDefaultModel(p, n string) error          { return c.unsupported("SetDefaultModel") }
-func (c *httpContext) ListAllModels(provider string) []ModelView  { return nil }
-func (c *httpContext) GetModelSettings(p, m string) ModelSettings { return ModelSettings{} }
-func (c *httpContext) ReloadConfig() error                        { return c.unsupported("ReloadConfig") }
+func (c *httpContext) RemoveModel(p, n string) error {
+	return c.c.DeleteModel(context.Background(), p, n)
+}
+func (c *httpContext) SetDefaultModel(p, n string) error {
+	return c.c.SetDefaultModel(context.Background(), p, n)
+}
+func (c *httpContext) ListAllModels(provider string) []ModelView {
+	providers, err := c.c.ListProviders(context.Background())
+	if err != nil {
+		return nil
+	}
+	var models []ModelView
+	for _, item := range providers {
+		if provider != "" && item.Name != provider {
+			continue
+		}
+		for _, model := range item.Models {
+			models = append(models, ModelView{Provider: item.Name, Name: model.Name, DisplayName: model.DisplayName, Description: model.Description, Default: model.Default})
+		}
+	}
+	return models
+}
+func (c *httpContext) GetModelSettings(p, m string) ModelSettings {
+	providers, err := c.c.ListProviders(context.Background())
+	if err != nil {
+		return ModelSettings{}
+	}
+	for _, provider := range providers {
+		if provider.Name != p {
+			continue
+		}
+		for _, model := range provider.Models {
+			if model.Name == m {
+				return ModelSettings{MaxTokensContext: model.MaxTokensContext, MaxTokensOutput: model.MaxTokensOutput}
+			}
+		}
+	}
+	return ModelSettings{}
+}
+func (c *httpContext) ReloadConfig() error { return c.unsupported("ReloadConfig") }
 
 func (c *httpContext) ListSessions(ctx context.Context) ([]httpcli.Session, error) {
-	return c.c.ListSessions(ctx)
+	return c.c.ListSessionsForProject(ctx, &c.projectPath)
 }
-func (c *httpContext) GetCurrentSessionID() string       { return c.curSess }
-func (c *httpContext) SetCurrentSession(id string) error { c.curSess = id; return nil }
+func (c *httpContext) GetCurrentSessionID() string { return c.curSess }
+func (c *httpContext) SetCurrentSession(id string) error {
+	session, err := c.c.GetSession(context.Background(), id)
+	if err != nil {
+		return fmt.Errorf("load session %q: %w", id, err)
+	}
+	if session.ProjectPath != c.projectPath {
+		return fmt.Errorf("session %q belongs to a different project scope", id)
+	}
+	c.curSess = id
+	return nil
+}
 func (c *httpContext) GetCurrentSessionMessages(ctx context.Context) ([]httpcli.Message, error) {
 	return c.c.ListMessages(ctx, c.curSess)
 }
 func (c *httpContext) NewSession(ctx context.Context, opts httpcli.CreateSessionOpts) (*httpcli.Session, error) {
+	opts.ProjectPath = c.projectPath
 	return c.c.CreateSession(ctx, opts)
+}
+func (c *httpContext) ProjectPath() string { return c.projectPath }
+func (c *httpContext) SetProjectPath(path string) error {
+	c.projectPath = path
+	return nil
 }
 func (c *httpContext) RenameSession(ctx context.Context, id, title string) error {
 	return c.c.RenameSession(ctx, id, title)
@@ -1317,6 +1544,10 @@ func (c *httpContext) SubmitToolConfirm(ctx context.Context, sessionID string, a
 	return c.c.SubmitConfirmResponse(ctx, sessionID, approved, action)
 }
 
+func (c *httpContext) SubmitToolConfirmWithID(ctx context.Context, sessionID string, approved bool, action, confirmID string) error {
+	return c.c.SubmitConfirmResponseWithID(ctx, sessionID, approved, action, confirmID)
+}
+
 func (c *httpContext) CompressSession(ctx context.Context, sessionID string) (httpcli.CompressResult, error) {
 	return c.c.CompressSession(ctx, sessionID)
 }
@@ -1334,7 +1565,9 @@ func (c *httpContext) Regenerate(ctx context.Context, sessionID string, userMess
 	go func() {
 		defer close(out)
 		err := c.c.Regenerate(ctx, sessionID, userMessageID, func(ev httpcli.StreamEvent) {
-			out <- httpEventToChunk(ev)
+			chunk := httpEventToChunk(ev)
+			c.recordToolChunk(sessionID, chunk)
+			out <- chunk
 		})
 		if err != nil {
 			out <- agent.ChatStreamChunk{Error: err.Error(), Done: true}
@@ -1421,6 +1654,7 @@ func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) 
 		SubAgentModel:    req.SubagentModel.Model,
 		SkillContext:     req.SkillContext,
 		ActiveSkills:     append([]string(nil), req.ActiveSkills...),
+		ToolsEnabled:     c.toolCallsEnabled(),
 	}
 	if req.UseImageRecognition {
 		enabled := true
@@ -1434,7 +1668,9 @@ func (c *httpContext) ChatWithTools(ctx context.Context, req agent.ChatRequest) 
 }
 
 func (c *httpContext) ChatQueuedTurn(ctx context.Context, sessionID string, payload httpcli.TurnQueuePayload) (<-chan agent.ChatStreamChunk, error) {
-	return c.streamHTTPMessage(ctx, sessionID, queuedPayloadSendOptions(payload)), nil
+	opts := queuedPayloadSendOptions(payload)
+	opts.ToolsEnabled = c.toolCallsEnabled()
+	return c.streamHTTPMessage(ctx, sessionID, opts), nil
 }
 
 func queuedPayloadSendOptions(payload httpcli.TurnQueuePayload) httpcli.SendMessageOptions {
@@ -1461,7 +1697,9 @@ func (c *httpContext) streamHTTPMessage(ctx context.Context, sessionID string, o
 	go func() {
 		defer close(out)
 		err := c.c.SendMessage(ctx, sessionID, opts, func(ev httpcli.StreamEvent) {
-			out <- httpEventToChunk(ev)
+			chunk := httpEventToChunk(ev)
+			c.recordToolChunk(sessionID, chunk)
+			out <- chunk
 		})
 		if err != nil {
 			out <- agent.ChatStreamChunk{Error: err.Error(), Done: true}
@@ -1609,8 +1847,13 @@ func (c *httpContext) ListToolDiagnostics() []ToolDiagnosticView {
 	}
 	return out
 }
-func (c *httpContext) ToolsEnabled() bool      { return true }
-func (c *httpContext) SetToolsEnabled(on bool) {}
+func (c *httpContext) ToolsEnabled() bool      { return c.toolsEnabled }
+func (c *httpContext) SetToolsEnabled(on bool) { c.toolsEnabled = on }
+
+func (c *httpContext) toolCallsEnabled() *bool {
+	enabled := c.toolsEnabled
+	return &enabled
+}
 
 // httpContext sandbox methods are deliberate no-ops with a
 // visible warning. The server's sandbox is configured at process
@@ -1634,9 +1877,67 @@ func (c *httpContext) BypassSandboxOnce() {
 }
 func (c *httpContext) RebuildSandbox() error { return c.unsupported("RebuildSandbox") }
 
-func (c *httpContext) ExpandList() []ToolResultView                 { return nil }
-func (c *httpContext) ExpandByIndex(idx int) (ToolResultView, bool) { return ToolResultView{}, false }
-func (c *httpContext) ExpandLast() (ToolResultView, bool)           { return ToolResultView{}, false }
+func (c *httpContext) ExpandList() []ToolResultView {
+	if c.toolCache == nil {
+		return nil
+	}
+	return toolResultViews(c.toolCache.list())
+}
+
+func (c *httpContext) ExpandByIndex(idx int) (ToolResultView, bool, error) {
+	if c.toolCache == nil {
+		return ToolResultView{}, false, nil
+	}
+	r := c.toolCache.get(idx)
+	if r == nil {
+		return ToolResultView{}, false, nil
+	}
+	if r.truncated {
+		result, err := c.c.GetToolResult(context.Background(), r.sessionID, r.toolID)
+		if err != nil {
+			return ToolResultView{}, false, fmt.Errorf("获取完整工具结果失败（可能已过期）: %w", err)
+		}
+		c.toolCache.replaceResult(r, result.Content)
+	}
+	return toolResultView(r), true, nil
+}
+
+func (c *httpContext) ExpandLast() (ToolResultView, bool, error) {
+	if c.toolCache == nil {
+		return ToolResultView{}, false, nil
+	}
+	r := c.toolCache.last()
+	if r == nil {
+		return ToolResultView{}, false, nil
+	}
+	return c.ExpandByIndex(r.seq)
+}
+
+func (c *httpContext) recordToolChunk(sessionID string, chunk agent.ChatStreamChunk) {
+	if c.toolCache == nil || chunk.ToolName == "" || (chunk.ToolResult == "" && chunk.ToolResultFull == "" && chunk.ToolError == "") {
+		return
+	}
+	result := chunk.ToolResult
+	if chunk.ToolResultFull != "" {
+		result = chunk.ToolResultFull
+	}
+	c.toolCache.record(chunk.ToolName, chunk.ToolID, sessionID, chunk.ToolArgs, result, chunk.ToolError, parseToolDuration(chunk.ToolElapsed), chunk.ToolResultTruncated, chunk.ToolResultFullLen)
+}
+
+func toolResultViews(results []toolResult) []ToolResultView {
+	if len(results) == 0 {
+		return nil
+	}
+	out := make([]ToolResultView, 0, len(results))
+	for i := range results {
+		out = append(out, toolResultView(&results[i]))
+	}
+	return out
+}
+
+func toolResultView(r *toolResult) ToolResultView {
+	return ToolResultView{Seq: r.seq, Tool: r.tool, Args: r.args, Result: r.result, Err: r.err, Duration: r.duration, At: r.at, Truncated: r.truncated, FullLen: r.fullLen}
+}
 
 func (c *httpContext) SubAgentStats() (int, int, int, int, float64, bool) {
 	return 0, 0, 0, 0, 0, false
@@ -1647,12 +1948,118 @@ func (c *httpContext) MemoryStats() (int, int, string, bool) {
 
 func (c *httpContext) Flush() error { return c.c.Flush() }
 
-func (c *httpContext) ListKBs() ([]KBView, error) { return nil, c.unsupported("ListKBs") }
-func (c *httpContext) AddKB(path string) error    { return c.unsupported("AddKB") }
-func (c *httpContext) RemoveKB(path string) error { return c.unsupported("RemoveKB") }
-func (c *httpContext) ScanKBs() (int, int, error) { return 0, 0, c.unsupported("ScanKBs") }
+func (c *httpContext) ListKBs() ([]KBView, error) {
+	bases, err := c.c.ListKnowledgeBases(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	views := make([]KBView, 0, len(bases))
+	for _, base := range bases {
+		views = append(views, KBView{Name: base.Name, Path: base.Path, Files: base.DocCount})
+	}
+	return views, nil
+}
+
+func (c *httpContext) AddKB(dir string) error {
+	path := strings.TrimSpace(dir)
+	if path == "" {
+		return errors.New("知识库目录不能为空")
+	}
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return fmt.Errorf("resolve knowledge base path: %w", err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return fmt.Errorf("knowledge base path is not accessible: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("knowledge base path %q is not a directory", abs)
+	}
+	if err := c.c.AddKnowledgeBase(context.Background(), httpcli.KnowledgeBase{
+		Name:    filepath.Base(abs),
+		Path:    abs,
+		Enabled: true,
+	}); err != nil {
+		return err
+	}
+	if err := c.c.SetKnowledgeEnabled(context.Background(), true); err != nil {
+		return fmt.Errorf("knowledge base was added, but enabling knowledge failed: %w", err)
+	}
+	return nil
+}
+
+func (c *httpContext) RemoveKB(path string) error {
+	bases, err := c.c.ListKnowledgeBases(context.Background())
+	if err != nil {
+		return err
+	}
+	value := strings.TrimSpace(path)
+	abs, absErr := filepath.Abs(value)
+	for _, base := range bases {
+		if base.Name == value || base.Path == value || (absErr == nil && base.Path == abs) {
+			return c.c.RemoveKnowledgeBase(context.Background(), base.Name)
+		}
+	}
+	return fmt.Errorf("knowledge base at %q not found", value)
+}
+
+func (c *httpContext) ScanKBs() (int, int, error) {
+	bases, err := c.c.ListKnowledgeBases(context.Background())
+	if err != nil {
+		return 0, 0, err
+	}
+	started := 0
+	for _, base := range bases {
+		if !base.Enabled {
+			continue
+		}
+		if err := c.c.StartKnowledgeScan(context.Background(), base.Name); err != nil {
+			return started, 0, fmt.Errorf("start scan for %s: %w", base.Name, err)
+		}
+		started++
+	}
+	if started == 0 {
+		return 0, 0, errors.New("no enabled knowledge bases")
+	}
+	return started, 0, nil
+}
+
+func (c *httpContext) GetKBScanStatus(ctx context.Context, name string) (httpcli.KnowledgeScanStatus, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.c.GetKnowledgeScanStatus(ctx, name)
+}
+
 func (c *httpContext) Recall(ctx context.Context, query string, topK int) error {
-	return c.unsupported("Recall")
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result, err := c.c.SearchKnowledge(ctx, httpcli.KnowledgeSearchRequest{Query: query, TopK: topK})
+	if err != nil {
+		return err
+	}
+	if len(result.Results) == 0 {
+		fmt.Printf("recall: no results for %q\n", query)
+		return nil
+	}
+	for i, item := range result.Results {
+		title := item.Title
+		if title == "" {
+			title = item.Source
+		}
+		overview := item.Content
+		if idx := strings.IndexAny(overview, "\n\r"); idx >= 0 {
+			overview = overview[:idx]
+		}
+		if len([]rune(overview)) > 120 {
+			overview = string([]rune(overview)[:120]) + "…"
+		}
+		fmt.Printf("%2d. %s\n    %s\n    source: %s\n", i+1, title, overview, item.Source)
+	}
+	fmt.Printf("— %d result(s) for %q\n", len(result.Results), query)
+	return nil
 }
 func (c *httpContext) InitProject(dir string) error { return c.unsupported("InitProject") }
 func (c *httpContext) ListSkills() ([]string, error) {
@@ -1669,9 +2076,23 @@ func (c *httpContext) ListSkills() ([]string, error) {
 	}
 	return names, nil
 }
-func (c *httpContext) ListRules() ([]string, error) { return nil, c.unsupported("ListRules") }
-func (c *httpContext) AgentsContext() (string, string, error) {
-	return "", "", c.unsupported("AgentsContext")
+func (c *httpContext) ListRules() ([]RuleView, error) {
+	if c.c == nil {
+		return nil, c.unsupported("ListRules")
+	}
+	if c.curSess == "" {
+		return nil, errors.New("no active session")
+	}
+	return c.c.ListSessionRules(context.Background(), c.curSess)
+}
+func (c *httpContext) AgentsContext() (AgentsContextView, error) {
+	if c.c == nil {
+		return AgentsContextView{}, c.unsupported("AgentsContext")
+	}
+	if c.curSess == "" {
+		return AgentsContextView{}, errors.New("no active session")
+	}
+	return c.c.GetSessionAgents(context.Background(), c.curSess)
 }
 
 // lastUserContent extracts the trailing user message from a list
@@ -1688,8 +2109,9 @@ func lastUserContent(msgs []llm.ChatMessage) string {
 	return ""
 }
 
-// httpEventToChunk converts an HTTP stream event into the
-// agent.ChatStreamChunk shape used by the local UI renderer.
+// httpEventToChunk 将 HTTP 流事件转换为终端渲染器使用的 ChatStreamChunk。
+// httpEventToChunk converts an HTTP stream event into the shape used by the
+// terminal renderer.
 func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 	return agent.ChatStreamChunk{
 		Seq:                   ev.Seq,
@@ -1740,6 +2162,7 @@ func httpEventToChunk(ev httpcli.StreamEvent) agent.ChatStreamChunk {
 		ToolConfirmJSON:       ev.ToolConfirmJSON,
 		ContentRewrite:        ev.ContentRewrite,
 		ThinkingRewrite:       ev.ThinkingRewrite,
+		StreamReset:           ev.Type == "stream_reset",
 		SessionStatus:         ev.SessionStatus,
 	}
 }
@@ -1815,7 +2238,7 @@ func runLocalPlan(ctx cliContext, args string) error {
 
 	provModel := r.llm.GetModel(r.provider)
 	ui := NewChatUI(r.provider, provModel)
-	ui.PrintBannerHeader("/plan " + task)
+	ui.BeginTurn("/plan "+task, false)
 
 	// Plan mode disables tools and limits to 1 round (handled in agent).
 	req := agent.ChatRequest{
@@ -1933,7 +2356,7 @@ func runLocalExecutePlan(ctx cliContext, msgs []llm.ChatMessage, plan, provModel
 		HistoryMessageCount: len(msgs) + 1,
 	}
 	ui := NewChatUI(r.provider, provModel)
-	ui.PrintBannerHeader(task + " (执行)")
+	ui.BeginTurn(task+" (执行)", true)
 
 	cctx, cancel := context.WithCancel(context.Background())
 	r.mu.Lock()

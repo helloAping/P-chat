@@ -76,10 +76,10 @@ const shortError = computed(() => {
   align-items: flex-start;
   gap: var(--space-2);
   margin: 0;
-  padding: var(--space-1) var(--space-2);
-  min-height: calc(var(--space-6) - var(--space-1));
+  padding: 6px 0;
+  min-height: 28px;
   border: none;
-  border-radius: var(--radius-sm);
+  border-radius: 0;
   background: transparent;
   color: var(--text-secondary);
   font-size: 12px;
@@ -94,19 +94,18 @@ const shortError = computed(() => {
   align-items: center;
   justify-content: center;
   flex: 0 0 16px;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   margin-top: 1px;
-  border-radius: 50%;
-  background: var(--brand-50);
+  background: transparent;
   color: var(--brand-500);
 }
 .skill-ready .skill-icon {
-  background: var(--success-50);
+  background: transparent;
   color: var(--success-500);
 }
 .skill-error .skill-icon {
-  background: var(--error-50);
+  background: transparent;
   color: var(--error-500);
 }
 

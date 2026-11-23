@@ -34,7 +34,10 @@ type Config struct {
 	Knowledge KnowledgeConfig `json:"knowledge"`
 	Limits    LimitsConfig    `json:"limits"`
 	Search    SearchConfig    `json:"search"`
-	Browser   BrowserConfig   `json:"browser"`
+	// Fetch selects the web_fetch backend. An empty provider means
+	// the process fetches the URL itself.
+	Fetch   FetchConfig   `json:"fetch,omitempty"`
+	Browser BrowserConfig `json:"browser"`
 	// Generation selects application defaults for vendor-neutral media tools.
 	Generation GenerationConfig `json:"generation,omitempty"`
 	// Recognition is the canonical media-recognition configuration. Each
@@ -42,7 +45,6 @@ type Config struct {
 	Recognition RecognitionConfig `json:"recognition,omitempty"`
 	// Vision is retained for pre-V9 configuration compatibility.
 	Vision VisionRecognitionConfig `json:"vision_recognition,omitempty"`
-	IM     IMConfig                `json:"im"`
 	// Dynamic is the P3-2 per-tool config table. The
 	// user writes `dynamic.<tool_name>.config: {…}`
 	// in their config.json and the dynamic tool's
@@ -327,8 +329,11 @@ type ProviderConfig struct {
 type ModelConfig struct {
 	// Name is the model identifier sent to the API (e.g. "gpt-4o").
 	Name string `json:"name"`
+	// Protocol optionally overrides the provider request protocol. Empty means
+	// the model follows ProviderConfig.Protocol.
+	Protocol string `json:"protocol,omitempty"`
 	// APIEndpoint is appended to the provider BaseURL. Conversational models
-	// default to the selected protocol's conventional suffix when omitted.
+	// default to the model's effective protocol suffix when omitted.
 	APIEndpoint string `json:"api_endpoint,omitempty"`
 	// DisplayName is shown in /model and /config. Optional.
 	DisplayName string `json:"display_name,omitempty"`
@@ -375,6 +380,16 @@ func (m ModelConfig) EffectiveType() ModelType {
 		return ModelTypeLLM
 	}
 	return m.Type
+}
+
+// EffectiveProtocol 返回模型实际使用的请求协议；空覆盖继承供应商协议。
+// EffectiveProtocol returns the model request protocol, inheriting the
+// provider protocol when the model has no explicit override.
+func (m ModelConfig) EffectiveProtocol(providerProtocol string) string {
+	if strings.TrimSpace(m.Protocol) != "" {
+		return NormalizeProtocol(m.Protocol)
+	}
+	return NormalizeProtocol(providerProtocol)
 }
 
 const (
@@ -515,6 +530,18 @@ func (p ProviderConfig) GetProtocol() string {
 	return "openai"
 }
 
+// ModelProtocol 返回指定模型实际使用的请求协议。
+// ModelProtocol returns the effective request protocol for a model, falling
+// back to the provider protocol when the model is unknown or inherits it.
+func (p ProviderConfig) ModelProtocol(modelName string) string {
+	for _, model := range p.Models {
+		if model.Name == modelName && model.EffectiveType() == ModelTypeLLM {
+			return model.EffectiveProtocol(p.GetProtocol())
+		}
+	}
+	return NormalizeProtocol(p.GetProtocol())
+}
+
 // DefaultLLMAPIEndpoint 返回新建对话模型默认填入的可编辑端点后缀。
 // DefaultLLMAPIEndpoint returns the editable endpoint suffix offered for a
 // newly-created conversational model.
@@ -601,6 +628,7 @@ func (p ProviderConfig) ModelAPIURL(modelName string) string {
 		return strings.TrimSpace(p.APIURL)
 	}
 	endpoint := ""
+	protocol := p.ModelProtocol(modelName)
 	for _, model := range p.Models {
 		if model.Name == modelName && model.EffectiveType() == ModelTypeLLM {
 			endpoint = model.APIEndpoint
@@ -608,7 +636,7 @@ func (p ProviderConfig) ModelAPIURL(modelName string) string {
 		}
 	}
 	if endpoint == "" {
-		endpoint = DefaultLLMAPIEndpoint(p.GetProtocol())
+		endpoint = DefaultLLMAPIEndpoint(protocol)
 	}
 	return JoinAPIURL(p.EffectiveBaseURL(), endpoint)
 }
@@ -978,6 +1006,9 @@ type MemoryConfig struct {
 //   - "openai_compat": any HTTP endpoint that accepts
 //     `{query, max_results, ...}` and returns
 //     `{results: [{title, url, snippet}, ...]}`; requires BaseURL
+//   - "deepseek": POST /v1/tools/search, requires APIKey
+//   - "mimo": Chat Completions web_search tool, requires APIKey
+//   - "qwen": Responses API web_search tool, requires APIKey and BaseURL
 type SearchConfig struct {
 	// Enabled is the master switch. When false, the `web_search`
 	// tool is not registered and the LLM cannot call it.
@@ -1017,6 +1048,41 @@ type SearchConfig struct {
 	// counter resets at 00:00 UTC and is *not* persisted
 	// across server restarts (a deliberate choice — quota
 	// is a soft budget, not a billing boundary).
+	DailyQuota int `json:"daily_quota,omitempty"`
+
+	// Model is the hosted-tool model for mimo and qwen.
+	// Empty uses the provider default.
+	Model string `json:"model,omitempty"`
+}
+
+// FetchConfig configures the web_fetch backend.
+//
+// The tool stays registered either way. Provider "local" (or empty)
+// fetches from this process. "deepseek" and "qwen" send the URL to
+// that vendor and fall back to a local GET when the vendor returns
+// no page, times out, or answers 5xx. POST requests always stay local.
+type FetchConfig struct {
+	// Provider selects the backend. Empty string = "local".
+	Provider string `json:"provider,omitempty"`
+
+	// APIKey is required for deepseek and qwen.
+	APIKey string `json:"api_key,omitempty"`
+
+	// BaseURL overrides the vendor endpoint. Required for qwen
+	// because the workspace host is account-specific.
+	BaseURL string `json:"base_url,omitempty"`
+
+	// Path overrides the fetch path. Empty uses the vendor default.
+	Path string `json:"path,omitempty"`
+
+	// Model is the hosted-tool model for qwen. Empty uses the default.
+	Model string `json:"model,omitempty"`
+
+	// RequestTimeout is the per-fetch HTTP timeout. Zero means 20s.
+	RequestTimeout time.Duration `json:"request_timeout,omitempty"`
+
+	// DailyQuota caps vendor fetches per UTC day. 0 = unlimited.
+	// Local fetches do not consume it. The counter is in-memory.
 	DailyQuota int `json:"daily_quota,omitempty"`
 }
 
@@ -1295,9 +1361,12 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 			return nil, fmt.Errorf("read config %s: %w", customPath, err)
 		}
 		data = stripBOM(data)
-		_, _, perr := tryUnmarshalWithTolerance(data, cfg)
+		cleaned, perr := prepareCustomOverlayLoad(data, cfg)
 		if perr != nil {
 			return nil, fmt.Errorf("parse config %s: %w", customPath, perr)
+		}
+		if err := json.Unmarshal(cleaned, cfg); err != nil {
+			return nil, fmt.Errorf("parse config %s: %w", customPath, err)
 		}
 	}
 
@@ -1321,11 +1390,17 @@ func LoadWithProjectRoot(customPath, projectRoot string) (*Config, error) {
 // original config intact instead of producing a truncated/
 // unparseable file.
 func writeConfigJSON(path string, cfg *Config) error {
+	return writeJSONAtomic(path, cfg)
+}
+
+// writeJSONAtomic 以原子替换方式写入任意 JSON 值。writeJSONAtomic writes
+// any JSON value with the same crash-safe replacement used for full configs.
+func writeJSONAtomic(path string, value any) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -1429,6 +1504,10 @@ func Default() *Config {
 			Provider:       "tavily",
 			RequestTimeout: 20 * time.Second,
 		},
+		Fetch: FetchConfig{
+			Provider:       "local",
+			RequestTimeout: 20 * time.Second,
+		},
 		Browser: BrowserConfig{
 			Enabled:                 false,
 			ScreenshotQuality:       80,
@@ -1451,7 +1530,6 @@ func Default() *Config {
 		},
 		Recognition: RecognitionConfig{Routes: map[MediaKind]RecognitionRoute{}},
 		Generation:  GenerationConfig{Defaults: map[GenerationOperation]GenerationModelTarget{}},
-		IM:          DefaultIMConfig(),
 	}
 }
 
@@ -1465,8 +1543,9 @@ func defaultWriteProtectedPaths() []string {
 		prefixes = append(prefixes, home)
 	}
 	// Common system paths (Linux/macOS); on Windows these simply won't
-	// match any real path.
-	return append(prefixes,
+	// match any real path. Windows paths are always included so a
+	// Windows install is covered even when Defaults() runs under tests.
+	return append(append(prefixes,
 		".ssh/",
 		".bashrc",
 		".zshrc",
@@ -1482,12 +1561,38 @@ func defaultWriteProtectedPaths() []string {
 		"~/.bashrc",
 		"~/.zshrc",
 		"~/.gnupg/",
-	)
+	), windowsWriteProtectedPaths()...)
+}
+
+// windowsWriteProtectedPaths is the SEC-06 Windows baseline. Exported via
+// WindowsWriteProtectedPaths for the V18→V19 upgrade merge.
+func windowsWriteProtectedPaths() []string {
+	return []string{
+		`AppData\Roaming\Microsoft\Credentials`,
+		`AppData\Local\Microsoft\Credentials`,
+		`AppData\Roaming\Microsoft\Protect`,
+		`C:\Windows\`,
+		`C:\Windows\System32\`,
+		`C:\Program Files\`,
+		`C:\Program Files (x86)\`,
+		`C:\Boot\`,
+	}
+}
+
+// WindowsWriteProtectedPaths returns the SEC-06 Windows write-protect
+// baseline for upgrade merges.
+func WindowsWriteProtectedPaths() []string {
+	return windowsWriteProtectedPaths()
 }
 
 // defaultDangerousPatterns returns the baseline list of regexes that
 // flag a shell command as potentially destructive.
 func defaultDangerousPatterns() []string {
+	return append(unixDangerousPatterns(), windowsDangerousPatterns()...)
+}
+
+// unixDangerousPatterns is the historical Unix/POSIX baseline.
+func unixDangerousPatterns() []string {
 	return []string{
 		`\brm\s+(-[a-zA-Z]*[rfRF]+\s+)+/`, // rm -rf /
 		`\brm\s+-rf\s+~`,                  // rm -rf ~
@@ -1508,4 +1613,39 @@ func defaultDangerousPatterns() []string {
 		`\bnc\s+-l\s+-p\s+\d+`,            // netcat listener
 		`\beval\s+.*\$\(`,                 // eval + command substitution
 	}
+}
+
+// windowsDangerousPatterns is the SEC-06 cmd.exe / PowerShell baseline.
+// Patterns use (?i) because Windows shells are case-insensitive.
+func windowsDangerousPatterns() []string {
+	return []string{
+		// cmd.exe recursive / quiet deletes
+		`(?i)\bdel\s+/[a-zA-Z]*s`,             // del /s …
+		`(?i)\b(rd|rmdir)\s+/[a-zA-Z]*s`,      // rd /s, rmdir /s
+		`(?i)\bformat\s+[a-z]:`,               // format C:
+		`(?i)\bdiskpart\b`,                    // diskpart
+		`(?i)\bcipher\s+/w:`,                  // cipher /w: wipe free space
+		`(?i)\breg(\.exe)?\s+delete\b`,        // reg delete
+		`(?i)\btakeown\s+/[fF]\b`,             // takeown /f
+		`(?i)\bicacls\b.*/grant(:r)?\b.*Everyone`, // icacls … /grant Everyone
+		`(?i)\bsc(\.exe)?\s+delete\b`,         // sc delete <service>
+		// PowerShell destructive cmdlets / download-exec
+		`(?i)\bRemove-Item\b.*(-(Recurse|Force)\b|-[rRfF]\b)`,
+		`(?i)\bFormat-Volume\b`,
+		`(?i)\bClear-Disk\b`,
+		`(?i)\bInitialize-Disk\b`,
+		`(?i)\b(Stop|Restart)-Computer\b`,
+		`(?i)\bSet-ExecutionPolicy\b.*\bUnrestricted\b`,
+		`(?i)\b(iex|Invoke-Expression)\b[\s(].*\b(iwr|Invoke-WebRequest|curl)\b`,
+		`(?i)\b(iwr|Invoke-WebRequest)\b.*\|\s*(iex|Invoke-Expression)\b`,
+		`(?i)\bGet-Content\b.*\|\s*(iex|Invoke-Expression)\b`,
+		`(?i)\bStart-Process\b.*-Verb\s+RunAs\b`,
+		`(?i)\bRemove-ItemProperty\b.*HK(LM|CU|CR|U|CC):`,
+	}
+}
+
+// WindowsDangerousPatterns returns the SEC-06 Windows exec baseline
+// for upgrade merges into existing config.json installs.
+func WindowsDangerousPatterns() []string {
+	return windowsDangerousPatterns()
 }

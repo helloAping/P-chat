@@ -55,10 +55,11 @@ function toggle() {
 
 <style scoped>
 .thinking-block {
-  margin: var(--space-2) 0;
-  background: var(--thinking-bg);
-  border: 1px solid var(--thinking-border);
-  border-radius: var(--radius-md);
+  margin: var(--space-1) 0 var(--space-2);
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  border-radius: 0;
   overflow: hidden;
   font-size: 12.5px;
 }
@@ -68,8 +69,8 @@ function toggle() {
   align-items: center;
   gap: var(--space-2);
   width: 100%;
-  padding: var(--space-2) var(--space-3);
-  min-height: 32px;
+  padding: 6px 0;
+  min-height: 28px;
   border: none;
   background: transparent;
   cursor: pointer;
@@ -78,27 +79,25 @@ function toggle() {
   color: var(--text-secondary);
   text-align: left;
   user-select: none;
-  border-radius: var(--radius-sm);
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out);
+  border-radius: 0;
+  transition: color var(--dur-fast) var(--ease-out);
 }
 .thinking-header:hover {
-  background: color-mix(in srgb, var(--thinking-icon) 8%, transparent);
+  background: transparent;
   color: var(--text-primary);
 }
 .icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
-  border-radius: 50%;
-  background: var(--success-50);
+  width: 14px;
+  height: 14px;
+  background: transparent;
   color: var(--success-500);
   flex-shrink: 0;
 }
 .icon.streaming {
-  background: color-mix(in srgb, var(--thinking-icon) 12%, var(--surface-2));
+  background: transparent;
   color: var(--thinking-icon);
 }
 .spin {
@@ -134,11 +133,11 @@ function toggle() {
 .caret.rotated { transform: rotate(90deg); }
 
 .thinking-body {
-  border-top: 1px solid var(--border-subtle);
+  border-top: none;
 }
 .thinking-content {
   margin: 0;
-  padding: var(--space-3) var(--space-4) var(--space-4) 40px;
+  padding: 0 0 var(--space-2) 22px;
   white-space: pre-wrap;
   word-break: break-word;
   overflow-wrap: break-word;

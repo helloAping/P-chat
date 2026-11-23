@@ -14,15 +14,14 @@
  * The new layout is a 2-column flex:
  *
  *   ┌────────────────────────────────────────────────────┐
- *   │  [header: title · save/close]                       │  56px sticky
+ *   │  [header: title · current section · save/close]     │  64px sticky
  *   ├──────────┬─────────────────────────────────────────┤
- *   │          │                                          │
- *   │  [nav1]  │                                          │
- *   │  [nav2]  │  content (active tab)                   │
- *   │  [nav3]  │                                          │
+ *   │          │  [page head: name · purpose · actions]   │
+ *   │  [nav1]  ├─────────────────────────────────────────┤
+ *   │  [nav2]  │                                          │
+ *   │  [nav3]  │  content (active tab owns its scroll)    │
  *   │  ...     │                                          │
- *   │          │                                          │
- *   │  200px   │  flex: 1 (active pane scrolls)           │
+ *   │  200px   │  flex: 1                                 │
  *   └──────────┴─────────────────────────────────────────┘
  *
  * The nav column holds the tab list. The right column holds
@@ -117,6 +116,9 @@ function isActive(name: string) {
   return activeName.value === name
 }
 
+const activeTab = computed(() => props.tabs.find(t => t.name === props.current))
+const headerSubtitle = computed(() => props.subtitle || activeTab.value?.label || '')
+
 /** Consecutive tabs sharing `group` become one labelled block. */
 const navGroups = computed(() => {
   const groups: { label: string; tabs: TabDef[] }[] = []
@@ -149,7 +151,7 @@ const navGroups = computed(() => {
           <div class="settings-header">
             <div class="settings-header-text">
               <div class="settings-title">{{ title }}</div>
-              <div v-if="subtitle" class="settings-subtitle">{{ subtitle }}</div>
+              <div v-if="headerSubtitle" class="settings-subtitle">{{ headerSubtitle }}</div>
             </div>
             <div class="settings-header-actions">
               <button
@@ -207,7 +209,18 @@ const navGroups = computed(() => {
             </nav>
 
             <div class="settings-content">
-              <slot />
+              <header v-if="activeTab" class="settings-page-head">
+                <div class="settings-page-head-text">
+                  <h2 class="settings-page-title">{{ activeTab.label }}</h2>
+                  <p v-if="activeTab.description" class="settings-page-desc">{{ activeTab.description }}</p>
+                </div>
+                <div class="settings-page-actions">
+                  <slot name="page-actions" />
+                </div>
+              </header>
+              <div class="settings-page-body">
+                <slot />
+              </div>
             </div>
           </div>
         </div>
@@ -407,11 +420,59 @@ const navGroups = computed(() => {
 .settings-content {
   flex: 1;
   display: flex;
+  flex-direction: column;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
   padding: 0;
   background: var(--surface-0);
+}
+.settings-page-head {
+  flex-shrink: 0;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5) var(--space-3);
+  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-0);
+}
+.settings-page-head-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.settings-page-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+}
+.settings-page-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-tertiary);
+}
+.settings-page-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-shrink: 0;
+}
+.settings-page-actions:empty {
+  display: none;
+}
+.settings-page-body {
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 /* --- Modal open/close transition ----------------------------------

@@ -545,9 +545,11 @@ onBeforeUnmount(() => {
 <style scoped>
 .subagent-jobs {
   flex-shrink: 0;
-  border-top: 1px solid var(--border-subtle);
-  background: var(--surface-1);
-  padding: 8px 14px;
+  border: none;
+  border-bottom: 1px solid var(--border-subtle);
+  background: transparent;
+  padding: 8px 0;
+  margin: 0 var(--space-3);
 }
 
 .subagent-jobs--collapsed {
@@ -627,8 +629,8 @@ onBeforeUnmount(() => {
   width: 28px;
   height: 28px;
   border-radius: 6px;
-  border: 1px solid var(--border-subtle);
-  background: var(--surface-2);
+  border: none;
+  background: transparent;
   color: var(--text-secondary);
   display: inline-flex;
   align-items: center;

@@ -9,6 +9,7 @@ package browser
 import (
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/p-chat/pchat/internal/config"
@@ -245,4 +246,180 @@ func Decide(cfg PolicyConfig, toolName string, params map[string]any, pageURL st
 		v.Reason = fmt.Sprintf("%s is read-only / low risk", toolName)
 	}
 	return v
+}
+
+type evalWritePattern struct {
+	reason  string
+	pattern *regexp.Regexp
+}
+
+type evalExpressionClass uint8
+
+const (
+	evalExpressionUnknown evalExpressionClass = iota
+	evalExpressionReadOnly
+	evalExpressionBlocked
+)
+
+// evalWritePatterns 覆盖常见的页面写入、导航、网络和跨边界 API。
+// evalWritePatterns covers common page writes, navigation, network, and cross-boundary APIs.
+// 普通读取（document.title、classList.contains、getComputedStyle、history.state）不会匹配。
+// Plain reads (document.title, classList.contains, getComputedStyle, history.state) remain usable.
+var evalWritePatterns = []evalWritePattern{
+	{reason: "network or cross-context communication", pattern: regexp.MustCompile(`\b(?:fetch|XMLHttpRequest|WebSocket|EventSource|WebTransport|BroadcastChannel|Worker|SharedWorker|RTCPeerConnection)\b|\.(?:sendBeacon|postMessage)\s*\(`)},
+	{reason: "dynamic code or deferred execution", pattern: regexp.MustCompile(`\b(?:eval|import|importScripts|setTimeout|setInterval|queueMicrotask|requestAnimationFrame)\s*\(|\bnew\s+(?:Function|Worker|SharedWorker)\b`)},
+	{reason: "window or navigation mutation", pattern: regexp.MustCompile(`\bwindow\s*\.\s*(?:open|close)\s*\(|\blocation\s*(?:\.[A-Za-z_$][\w$]*)?\s*(?:\+=|-=|\*=|/=|%=|&&=|\|\|=|\?\?=|<<=|>>>=?|&=|\|=|\^=|=(?:[^=>]|$))|\blocation\s*\.\s*(?:assign|replace|reload)\s*\(`)},
+	{reason: "history mutation or navigation", pattern: regexp.MustCompile(`\bhistory\s*\.\s*(?:pushState|replaceState|back|forward|go)\s*\(|\bnavigation\s*\.\s*(?:navigate|reload|traverseTo|back|forward)\s*\(`)},
+	{reason: "clipboard or sharing access", pattern: regexp.MustCompile(`\bnavigator\s*\.\s*(?:clipboard|share)\b|\bdocument\s*\.\s*execCommand\s*\(`)},
+	{reason: "persistent storage mutation", pattern: regexp.MustCompile(`\b(?:localStorage|sessionStorage)\s*\.\s*(?:setItem|removeItem|clear)\s*\(|\bindexedDB\s*\.\s*(?:open|deleteDatabase)\s*\(|\bcaches\s*\.\s*(?:open|delete)\s*\(|\.(?:add|addAll|put|delete)\s*\(`)},
+	{reason: "service worker registration", pattern: regexp.MustCompile(`\bnavigator\s*\.\s*serviceWorker\s*\.\s*(?:register|unregister)\s*\(`)},
+	{reason: "document stream mutation", pattern: regexp.MustCompile(`\bdocument\s*\.\s*(?:write|writeln|open|close)\s*\(`)},
+	{reason: "DOM tree or form mutation", pattern: regexp.MustCompile(`\.(?:appendChild|removeChild|insertBefore|replaceChild|append|prepend|remove|replaceWith|replaceChildren|before|after|insertAdjacentHTML|insertAdjacentText|insertAdjacentElement|setAttribute|setAttributeNS|removeAttribute|removeAttributeNS|toggleAttribute|submit|requestSubmit|reset|click|focus|blur|dispatchEvent|setRangeText|insertNode|deleteContents)\s*\(`)},
+	{reason: "style or class mutation", pattern: regexp.MustCompile(`\.(?:classList)\s*\.\s*(?:add|remove|toggle|replace)\s*\(|\.style\s*\.\s*(?:setProperty|removeProperty)\s*\(|\.(?:insertRule|deleteRule|replaceSync)\s*\(|\bCSSStyleSheet\s*\.\s*prototype\s*\.\s*replace\b`)},
+	{reason: "reflective mutation", pattern: regexp.MustCompile(`\bObject\s*\.\s*(?:assign|defineProperty|defineProperties|setPrototypeOf)\s*\(|\bReflect\s*\.\s*(?:set|deleteProperty|defineProperty|setPrototypeOf)\s*\(`)},
+	{reason: "property assignment", pattern: regexp.MustCompile(`(?:\.\s*[A-Za-z_$][\w$]*|\])\s*(?:\+=|-=|\*=|/=|%=|&&=|\|\|=|\?\?=|<<=|>>>=?|&=|\|=|\^=|=(?:[^=>]|$))`)},
+	{reason: "property update or deletion", pattern: regexp.MustCompile(`(?:\.\s*[A-Za-z_$][\w$]*|\])\s*(?:\+\+|--)|\bdelete\s+`)},
+}
+
+func evalWriteReason(expr string) string {
+	masked, ok := maskEvalStrings(expr)
+	if !ok || strings.TrimSpace(masked) == "" {
+		return "expression is empty or missing"
+	}
+	return evalWriteReasonMasked(masked)
+}
+
+// evalWriteReasonMasked evaluates only executable JavaScript tokens. Callers
+// must mask strings and comments first, because selector text and comments may
+// legitimately contain names such as "fetch" without invoking them.
+func evalWriteReasonMasked(masked string) string {
+	for _, rule := range evalWritePatterns {
+		if rule.pattern.MatchString(masked) {
+			return rule.reason
+		}
+	}
+	return ""
+}
+
+var (
+	evalReadOnlyRoot = regexp.MustCompile(`^\s*(?:document|window|globalThis|location|history|navigator|localStorage|sessionStorage|JSON|Math|Number|String|Boolean|Array|getComputedStyle)\b`)
+	evalCallPattern  = regexp.MustCompile(`\b([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*\(`)
+	evalReadUnknown  = regexp.MustCompile(`(?:=>|[;{}]|\b(?:new|function|class|async|await|yield|throw|try|catch|finally|for|while|do|switch|with)\b)`)
+	evalAssignment   = regexp.MustCompile(`(?:^|[^=!<>])=(?:[^=>]|$)`)
+)
+
+var evalReadOnlyCalls = map[string]struct{}{
+	"querySelector": {}, "querySelectorAll": {}, "getElementById": {},
+	"getElementsByClassName": {}, "getElementsByTagName": {}, "getElementsByName": {},
+	"getAttribute": {}, "getAttributeNS": {}, "hasAttribute": {}, "hasAttributeNS": {},
+	"matches": {}, "closest": {}, "contains": {}, "item": {}, "namedItem": {},
+	"getItem": {}, "key": {}, "stringify": {}, "parse": {}, "from": {}, "isArray": {},
+	"keys": {}, "values": {}, "entries": {}, "getOwnPropertyDescriptor": {},
+	"getOwnPropertyDescriptors": {}, "getPrototypeOf": {}, "getComputedStyle": {},
+	"getPropertyValue": {}, "trim": {}, "trimStart": {}, "trimEnd": {}, "includes": {},
+	"startsWith": {}, "endsWith": {}, "slice": {}, "substring": {}, "substr": {},
+	"toLowerCase": {}, "toUpperCase": {}, "normalize": {}, "toString": {},
+}
+
+func classifyEvalExpression(expr string) (evalExpressionClass, string) {
+	masked, ok := maskEvalStrings(expr)
+	if !ok {
+		return evalExpressionUnknown, "expression contains an unterminated string, comment, or template literal"
+	}
+	if reason := evalWriteReasonMasked(masked); reason != "" {
+		return evalExpressionBlocked, reason
+	}
+	if !evalReadOnlyRoot.MatchString(masked) || evalReadUnknown.MatchString(masked) || evalAssignment.MatchString(masked) {
+		return evalExpressionUnknown, "expression is not in the conservative read-only subset"
+	}
+	calls := evalCallPattern.FindAllStringSubmatch(masked, -1)
+	if strings.Count(masked, "(") != len(calls) || strings.Count(masked, ")") != len(calls) {
+		return evalExpressionUnknown, "expression contains dynamic or grouped invocation"
+	}
+	for _, call := range calls {
+		callee := strings.ReplaceAll(call[1], " ", "")
+		parts := strings.Split(callee, ".")
+		if _, allowed := evalReadOnlyCalls[parts[len(parts)-1]]; !allowed {
+			return evalExpressionUnknown, "expression calls an API outside the read-only allowlist"
+		}
+	}
+	return evalExpressionReadOnly, ""
+}
+
+// maskEvalStrings 用空格遮蔽普通字符串和注释，使只读分类只检查可执行 token。
+// maskEvalStrings blanks ordinary strings and comments so read-only classification inspects executable tokens only.
+// 模板字符串可能执行 ${...}，因此直接归为未知。Template literals may execute ${...}, so they stay unknown.
+func maskEvalStrings(expr string) (string, bool) {
+	out := []byte(expr)
+	for i := 0; i < len(out); {
+		switch out[i] {
+		case '`':
+			return string(out), false
+		case '\'', '"':
+			quote := out[i]
+			out[i] = ' '
+			i++
+			closed := false
+			for i < len(out) {
+				if out[i] == '\\' {
+					out[i] = ' '
+					i++
+					if i < len(out) {
+						out[i] = ' '
+						i++
+					}
+					continue
+				}
+				ch := out[i]
+				out[i] = ' '
+				i++
+				if ch == quote {
+					closed = true
+					break
+				}
+			}
+			if !closed {
+				return string(out), false
+			}
+		case '/':
+			if i+1 < len(out) && out[i+1] == '/' {
+				for i < len(out) && out[i] != '\n' {
+					out[i] = ' '
+					i++
+				}
+				continue
+			}
+			if i+1 < len(out) && out[i+1] == '*' {
+				out[i], out[i+1] = ' ', ' '
+				i += 2
+				closed := false
+				for i+1 < len(out) {
+					if out[i] == '*' && out[i+1] == '/' {
+						out[i], out[i+1] = ' ', ' '
+						i += 2
+						closed = true
+						break
+					}
+					out[i] = ' '
+					i++
+				}
+				if !closed {
+					return string(out), false
+				}
+				continue
+			}
+			i++
+		default:
+			i++
+		}
+	}
+	return string(out), true
+}
+
+// LooksLikeEvalWrite 报告表达式是否命中默认拒绝的副作用规则。
+// LooksLikeEvalWrite reports whether an expression matches a default-deny side-effect rule.
+// 这是保守的词法闸门而非 JavaScript 沙箱；真正需要写页面时必须显式开启 allow_eval_write。
+// This is a conservative lexical gate, not a JavaScript sandbox; page writes require explicit allow_eval_write.
+func LooksLikeEvalWrite(expr string) bool {
+	return evalWriteReason(expr) != ""
 }

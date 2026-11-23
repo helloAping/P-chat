@@ -81,7 +81,41 @@ const (
 	// V15 — providers persist provider_id / strategy_variant for strategy presets.
 	V15 AppVersion = 15
 
+	// V16 — conversational models may override the provider request protocol.
+	// Missing model.protocol remains backward compatible and means inheritance.
+	V16 AppVersion = 16
+
+	// V17 — uploads gain per-file owner sidecars. New files are bound to a
+	// conversation before their first message is submitted.
+	V17 AppVersion = 17
+
+	// V18 — retire IM configuration from the managed global config file.
+	V18 AppVersion = 18
+
+	// V19 — SEC-06: merge Windows cmd/PowerShell dangerous exec patterns
+	// and write-protected paths into existing sandbox config.
+	V19 AppVersion = 19
+
+	// V20 — PERF-02: FTS5 index (messages_fts) for conversation message search.
+	V20 AppVersion = 20
+
+	// V21 — message bookmarks table.
+	V21 AppVersion = 21
+
+	// V22 — global user memory cards, separate from style memory.
+	V22 AppVersion = 22
+
+	// V23 — per-project morning digest schedule.
+	V23 AppVersion = 23
+
+	// V24 — persisted turn-change summaries.
+	V24 AppVersion = 24
+
+	// V25 — drop retired global memory cards and morning digest schedules.
+	// Remembered facts live on speaking styles instead.
+	V25 AppVersion = 25
+
 	// Current is the latest AppVersion. When adding a new version,
 	// update this constant and register a step in steps.go.
-	Current AppVersion = V15
+	Current AppVersion = V25
 )

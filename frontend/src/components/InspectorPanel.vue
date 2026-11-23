@@ -6,9 +6,9 @@
  * without turning the panel into a heavy dashboard.
  * Collapse is owned by the parent (v-if / width 0).
  */
-import { computed, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useMessage } from 'naive-ui'
-import { state, currentMessages, refreshContextUsage } from '../stores/chat'
+import { state, currentMessages, refreshContextUsage, currentLastTurnUsage, jumpToBookmarkedMessage, refreshLatestMessages } from '../stores/chat'
 import * as api from '../api/client'
 import { formatCompactTokens } from '../utils/format'
 import { copyText, downloadBlob, downloadFromUrl } from '../utils/clipboard'
@@ -17,12 +17,14 @@ import {
   attachmentArtifactSourceLabel,
   attachmentArtifactTypeLabel,
   collectConversationAttachments,
+  galleryMedia,
   type AttachmentArtifact,
 } from '../utils/attachmentArtifacts'
+import { styleCompareState, clearStyleCompare } from '../utils/styleCompareState'
 import ToolListDrawer from './ToolListDrawer.vue'
 import StyleGenModal from './StyleGenModal.vue'
 import {
-  Copy, Globe, Folder, FolderOpen, Terminal, Wrench, Sparkles, Hash, X,
+  Copy, Globe, Folder, FolderOpen, Terminal, Wrench, Sparkles, Hash, X, Bookmark,
   GitBranch, CheckCircle2, AlertCircle, BarChart3, ImageIcon, Film, Volume2,
   FileText, File, ChevronDown, ChevronRight, Download, Clipboard,
 } from './icons'
@@ -36,6 +38,48 @@ const emit = defineEmits<{
 }>()
 
 const message = useMessage()
+const bookmarkItems = ref<api.BookmarkIndexItem[]>([])
+const bookmarkNotes = ref<Record<string, string>>({})
+const bookmarkLoading = ref(false)
+
+async function loadBookmarkIndex() {
+  bookmarkLoading.value = true
+  try {
+    const resp = await api.listAllBookmarks()
+    bookmarkItems.value = resp.bookmarks || []
+    const notes: Record<string, string> = {}
+    for (const item of bookmarkItems.value) notes[`${item.conversation_id}:${item.message_id}`] = item.note || ''
+    bookmarkNotes.value = notes
+  } catch {
+    bookmarkItems.value = []
+  } finally {
+    bookmarkLoading.value = false
+  }
+}
+
+async function openBookmark(item: api.BookmarkIndexItem) {
+  try {
+    await jumpToBookmarkedMessage(item.conversation_id, item.message_id, item.project_path || '')
+  } catch (err: unknown) {
+    const text = err instanceof Error ? err.message : String(err)
+    message.error(text || '无法打开书签')
+  }
+}
+
+async function saveBookmarkNote(item: api.BookmarkIndexItem) {
+  const key = `${item.conversation_id}:${item.message_id}`
+  const note = (bookmarkNotes.value[key] || '').trim()
+  if ([...note].length > 200) {
+    message.error('备注最多 200 字')
+    return
+  }
+  try {
+    await api.updateBookmarkNote(item.conversation_id, item.message_id, note)
+    bookmarkNotes.value[key] = note
+  } catch (err: unknown) {
+    message.error(err instanceof Error ? err.message : '备注保存失败')
+  }
+}
 const tab = ref<'session' | 'project'>('session')
 const showToolList = ref(false)
 const showStyleGen = ref(false)
@@ -54,6 +98,11 @@ const project = computed(() => {
 const projectName = computed(() => {
   if (!state.activeProjectPath) return '全局空间'
   return project.value?.name || state.activeProjectPath
+})
+
+const projectBookmarks = computed(() => {
+  const path = state.activeProjectPath || ''
+  return bookmarkItems.value.filter(item => (item.project_path || '') === path)
 })
 
 const ctx = computed(() => {
@@ -96,6 +145,26 @@ const ctxUsageTitle = computed(() => {
   return `上下文占用 · ${ctxModel.value} · ${ctxTokensText.value}（${ctxPctText.value}）`
 })
 
+// AE-03: last turn token + cache hit rate for the Inspector.
+const lastTurn = computed(() => currentLastTurnUsage.value)
+const lastTurnCacheRate = computed(() => {
+  const u = lastTurn.value
+  if (!u || (u.cache_hit_tokens == null && u.cache_miss_tokens == null)) return null
+  const hit = u.cache_hit_tokens ?? 0
+  const miss = u.cache_miss_tokens ?? 0
+  const total = hit + miss
+  if (total <= 0) return 0
+  return Math.round((hit / total) * 1000) / 10
+})
+const lastTurnText = computed(() => {
+  const u = lastTurn.value
+  if (!u || !(u.tokens_in || u.tokens_out)) return ''
+  const bits = [`${u.tokens_in}↓ / ${u.tokens_out}↑`]
+  if (lastTurnCacheRate.value != null) bits.push(`cache ${lastTurnCacheRate.value}%`)
+  if (u.elapsed) bits.push(u.elapsed)
+  return bits.join(' · ')
+})
+
 const idSnippet = computed(() => {
   const id = state.currentID
   if (!id) return '—'
@@ -118,6 +187,15 @@ const toolStats = computed(() => {
 })
 
 const sessionAttachments = computed(() => collectConversationAttachments(currentMessages.value))
+const gallery = computed(() => galleryMedia(sessionAttachments.value))
+const galleryExpanded = ref(false)
+const GALLERY_LIMIT = 8
+const visibleGalleryImages = computed(() =>
+  galleryExpanded.value ? gallery.value.images : gallery.value.images.slice(0, GALLERY_LIMIT),
+)
+const hiddenGalleryCount = computed(() =>
+  Math.max(0, gallery.value.images.length - GALLERY_LIMIT),
+)
 const visibleSessionAttachments = computed(() =>
   sessionAttachmentsExpanded.value
     ? sessionAttachments.value
@@ -129,6 +207,7 @@ const hiddenSessionAttachmentCount = computed(() =>
 
 watch(() => state.currentID, () => {
   sessionAttachmentsExpanded.value = false
+  galleryExpanded.value = false
 })
 
 const agentsStatus = computed(() =>
@@ -194,6 +273,35 @@ async function openTerminal() {
     message.error('打开终端失败')
   }
 }
+
+const adoptAlsoSwitch = ref(false)
+
+async function adoptCompare(variant: api.StyleCompareVariant) {
+  const id = state.currentID
+  if (!id || !variant.text) return
+  try {
+    await api.adoptStyleCompare(id, variant.text, variant.style)
+    if (adoptAlsoSwitch.value && variant.style) {
+      const resp = await api.updateSessionMeta(id, { style: variant.style })
+      state.sessionMeta[id] = {
+        ...(state.sessionMeta[id] || {}),
+        style: resp.style ?? variant.style,
+      }
+    }
+    clearStyleCompare()
+    await refreshLatestMessages(id)
+  } catch (err: any) {
+    message.error(err?.message || '没有写入会话')
+  }
+}
+
+onMounted(() => {
+  void loadBookmarkIndex()
+  window.addEventListener('pchat:bookmarks-changed', loadBookmarkIndex)
+})
+onUnmounted(() => {
+  window.removeEventListener('pchat:bookmarks-changed', loadBookmarkIndex)
+})
 
 function refreshContext() {
   if (!state.currentID) return
@@ -296,6 +404,29 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
           <div class="section-title">{{ currentSession?.title || '未选择会话' }}</div>
           <div class="section-meta">ID {{ idSnippet }}</div>
         </section>
+        <section v-if="styleCompareState.source || styleCompareState.loading || styleCompareState.error" class="section">
+          <div class="section-title-row section-title-row--spaced">
+            <div class="section-label">换种说法</div>
+            <button type="button" class="bookmark-refresh" @click="clearStyleCompare">关闭</button>
+          </div>
+          <div v-if="styleCompareState.loading" class="section-text">正在换种说法…</div>
+          <div v-else-if="styleCompareState.error" class="section-text">{{ styleCompareState.error }}</div>
+          <div v-for="variant in styleCompareState.variants" :key="variant.style" class="compare-card">
+            <div class="section-title">{{ variant.label }}</div>
+            <div v-if="variant.error" class="section-text">{{ variant.error }}</div>
+            <div v-else class="section-text compare-text">{{ variant.text }}</div>
+            <label v-if="variant.text" class="compare-adopt">
+              <input v-model="adoptAlsoSwitch" type="checkbox" />
+              <span>本会话改用这个风格</span>
+            </label>
+            <button
+              v-if="variant.text"
+              type="button"
+              class="bookmark-refresh"
+              @click="adoptCompare(variant)"
+            >采用</button>
+          </div>
+        </section>
         <section class="section">
           <div class="section-label">会话操作</div>
           <div class="panel-action-grid">
@@ -359,6 +490,9 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
               <span>{{ ctxLoading ? '刷新中' : '点击刷新' }}</span>
             </span>
           </button>
+          <div v-if="lastTurnText" class="last-turn-usage" :title="lastTurnText">
+            本回合 {{ lastTurnText }}
+          </div>
         </section>
         <section v-if="toolStats.total" class="section">
           <div class="section-label">工具调用</div>
@@ -369,6 +503,39 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
             <span class="dot">·</span>
             进行中 {{ toolStats.running }}
           </div>
+        </section>
+        <section v-if="gallery.images.length || gallery.audio.length" class="section section--gallery">
+          <div class="section-title-row section-title-row--spaced">
+            <div class="section-label">会话画廊</div>
+            <span v-if="gallery.images.length" class="attachment-count">{{ gallery.images.length }}</span>
+          </div>
+          <div v-if="gallery.images.length" class="gallery-grid">
+            <button
+              v-for="item in visibleGalleryImages"
+              :key="item.key"
+              type="button"
+              class="gallery-thumb"
+              :title="attachmentArtifactFileName(item)"
+              @click="openSessionAttachment(item)"
+            >
+              <img :src="item.url || ''" :alt="attachmentArtifactFileName(item)" />
+            </button>
+          </div>
+          <button
+            v-if="hiddenGalleryCount && !galleryExpanded"
+            type="button"
+            class="gallery-more"
+            @click="galleryExpanded = true"
+          >还有 {{ hiddenGalleryCount }} 张</button>
+          <audio
+            v-for="item in gallery.audio"
+            :key="item.key"
+            class="gallery-audio"
+            :src="item.url || ''"
+            :title="attachmentArtifactFileName(item)"
+            controls
+            preload="none"
+          />
         </section>
         <section class="section section--attachments">
           <div class="section-title-row section-title-row--spaced">
@@ -496,6 +663,33 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
           </div>
         </section>
         <section class="section">
+          <div class="section-title-row section-title-row--spaced">
+            <div class="section-label">项目书签</div>
+            <button type="button" class="bookmark-refresh" :disabled="bookmarkLoading" @click="loadBookmarkIndex">刷新</button>
+          </div>
+          <div v-if="!projectBookmarks.length" class="section-text">{{ state.activeProjectPath ? '这个项目还没有书签' : '全局会话还没有书签' }}</div>
+          <div
+            v-for="item in projectBookmarks"
+            :key="`${item.conversation_id}-${item.message_id}`"
+            class="bookmark-row"
+          >
+            <button type="button" class="bookmark-open" @click="openBookmark(item)">
+              <Bookmark :size="13" />
+              <span class="bookmark-copy">
+                <span class="bookmark-where">{{ item.title || '未命名对话' }}</span>
+                <span class="bookmark-snippet">{{ item.snippet || '附件' }}</span>
+              </span>
+            </button>
+            <input
+              v-model="bookmarkNotes[`${item.conversation_id}:${item.message_id}`]"
+              class="bookmark-note"
+              maxlength="200"
+              placeholder="备注"
+              @change="saveBookmarkNote(item)"
+            />
+          </div>
+        </section>
+        <section class="section">
           <div class="section-label">AGENTS.md</div>
           <div class="section-text">{{ agentsStatus }}</div>
         </section>
@@ -526,7 +720,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   min-height: 0;
   overflow: hidden;
   background: var(--surface-2);
-  border-left: 1px solid var(--border-subtle);
+  border-left: none;
   opacity: 1;
   transition:
     width var(--dur-slow) var(--ease-in-out),
@@ -547,7 +741,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   gap: var(--space-2);
   min-height: calc(var(--control-height) + var(--space-3));
   padding: 0 var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
+  border-bottom: none;
   flex-shrink: 0;
 }
 .tab-list {
@@ -635,10 +829,10 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 }
 .section {
   padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-1) 88%, transparent);
-  box-shadow: var(--shadow-xs);
+  background: var(--surface-1);
+  box-shadow: none;
 }
 .section-label {
   margin-bottom: var(--space-2);
@@ -694,7 +888,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   width: var(--control-height);
   height: var(--control-height);
   flex: 0 0 var(--control-height);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
   background: var(--surface-1);
   color: var(--text-secondary);
@@ -702,7 +896,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   transition: var(--transition-colors);
 }
 .path-copy-btn:hover {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -723,7 +916,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   gap: var(--space-1);
   min-height: calc(var(--control-height) - var(--space-2));
   padding: 0 var(--space-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-pill);
   background: var(--surface-1);
   color: var(--text-tertiary);
@@ -744,6 +937,67 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   color: var(--text-secondary);
   font-size: 12.5px;
   line-height: 1.45;
+}
+.bookmark-refresh {
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.bookmark-refresh:hover { color: var(--text-primary); }
+.bookmark-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  margin-top: var(--space-2);
+  padding: 0 0 var(--space-2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.bookmark-open {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  text-align: left;
+  cursor: pointer;
+}
+.bookmark-note {
+  width: 100%;
+  border: none;
+  background: transparent;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 12px;
+}
+.bookmark-note:focus { outline: none; color: var(--text-primary); }
+.bookmark-row:last-child { border-bottom: none; padding-bottom: 0; }
+.bookmark-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bookmark-where {
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+.bookmark-snippet {
+  color: var(--text-primary);
+  font-size: 12.5px;
+  line-height: 1.4;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
 }
 .attachment-count {
   display: inline-flex;
@@ -766,6 +1020,43 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   font-size: 12px;
   line-height: 1.45;
 }
+.gallery-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+.gallery-thumb {
+  aspect-ratio: 1;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  overflow: hidden;
+  cursor: pointer;
+}
+.gallery-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.gallery-more {
+  margin-top: var(--space-2);
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--text-tertiary);
+  font: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.gallery-more:hover { color: var(--text-secondary); }
+.gallery-audio {
+  display: block;
+  width: 100%;
+  margin-top: var(--space-2);
+}
 .session-attachment-list {
   display: grid;
   gap: var(--space-1);
@@ -777,19 +1068,14 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   min-width: 0;
   min-height: calc(var(--control-height) + var(--space-3));
   padding: var(--space-1);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
-  transition:
-    background var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out),
-    box-shadow var(--dur-fast) var(--ease-out);
+  background: var(--surface-0);
+  transition: background var(--dur-fast) var(--ease-out);
 }
 .session-attachment-row:hover,
 .session-attachment-row:focus-within {
-  border-color: var(--border-default);
-  background: color-mix(in srgb, var(--surface-1) 82%, var(--surface-3));
-  box-shadow: var(--shadow-xs);
+  background: var(--surface-3);
 }
 .session-attachment-main {
   width: 100%;
@@ -819,7 +1105,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   height: var(--space-7);
   flex: 0 0 var(--space-7);
   border-radius: var(--radius-sm);
-  border: 1px solid var(--border-subtle);
+  border: none;
   background: var(--surface-2);
   color: var(--text-secondary);
 }
@@ -883,7 +1169,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   justify-content: center;
   width: calc(var(--space-6) + var(--space-1));
   height: calc(var(--space-6) + var(--space-1));
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
   background: var(--surface-overlay);
   color: var(--text-secondary);
@@ -891,7 +1177,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   transition: var(--transition-colors);
 }
 .session-attachment-action:hover {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -927,9 +1212,9 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   display: grid;
   gap: var(--space-2);
   padding: var(--space-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
+  background: var(--surface-0);
   color: var(--text-secondary);
   font: inherit;
   text-align: left;
@@ -940,7 +1225,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
     color var(--dur-fast) var(--ease-out);
 }
 .context-usage-card:hover:not(:disabled) {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -1005,6 +1289,19 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.last-turn-usage {
+  margin-top: var(--space-2);
+  padding: 4px 8px;
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  border: none;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .context-usage-card--success { color: var(--success-500); }
 .context-usage-card--warning { color: var(--warn-500); }
 .context-usage-card--error { color: var(--error-500); }
@@ -1016,7 +1313,7 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   margin-top: var(--space-2);
   padding: 2px 8px;
   border-radius: var(--radius-pill, 9999px);
-  border: 1px solid var(--border-subtle);
+  border: none;
   background: color-mix(in srgb, var(--brand-50) 62%, var(--surface-1));
   color: var(--text-secondary);
   font-size: 11px;
@@ -1039,9 +1336,9 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   justify-content: flex-start;
   gap: var(--space-2);
   padding: 0 var(--space-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
+  background: var(--surface-0);
   color: var(--text-secondary);
   font: inherit;
   font-size: 12px;
@@ -1050,7 +1347,6 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
   transition: var(--transition-colors);
 }
 .panel-action-btn:hover:not(:disabled) {
-  border-color: var(--border-default);
   background: var(--surface-3);
   color: var(--text-primary);
 }
@@ -1070,6 +1366,22 @@ function downloadSessionAttachment(item: AttachmentArtifact) {
 .dot {
   margin: 0 4px;
   color: var(--text-quaternary);
+}
+.compare-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+.compare-text {
+  white-space: pre-wrap;
+}
+.compare-adopt {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  color: var(--text-tertiary);
+  font-size: 12px;
 }
 @media (max-width: 1040px) {
   .inspector {

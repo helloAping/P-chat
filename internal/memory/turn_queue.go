@@ -365,6 +365,46 @@ func rewriteTurnQueuePayloadMessage(payloadJSON, message string) (string, error)
 	return string(raw), nil
 }
 
+// CountPendingTurnQueueUploadRefs counts queued/running/failed payloads that
+// still reference uploadID. Upload cleanup must treat these durable inbox items
+// as live references even though no messages row exists yet.
+func (s *Store) CountPendingTurnQueueUploadRefs(uploadID string) int {
+	uploadID = strings.TrimSpace(uploadID)
+	if uploadID == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rows, err := s.db.Query(`SELECT payload_json FROM turn_queue WHERE status IN (?, ?, ?)`, TurnQueueStatusQueued, TurnQueueStatusRunning, TurnQueueStatusFailed)
+	if err != nil {
+		return 0
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var raw string
+		if rows.Scan(&raw) != nil {
+			continue
+		}
+		var payload struct {
+			Attachments []struct {
+				ID       string `json:"id"`
+				UploadID string `json:"upload_id"`
+			} `json:"attachments"`
+		}
+		if json.Unmarshal([]byte(raw), &payload) != nil {
+			continue
+		}
+		for _, attachment := range payload.Attachments {
+			if attachment.UploadID == uploadID || attachment.ID == uploadID {
+				count++
+				break
+			}
+		}
+	}
+	return count
+}
+
 // RequeueRunningTurnQueueItems 恢复被前端刷新中断的 running 项。
 // RequeueRunningTurnQueueItems reopens claimed items after a disconnected UI.
 func (s *Store) RequeueRunningTurnQueueItems(sessionID string) error {

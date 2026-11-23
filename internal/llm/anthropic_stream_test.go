@@ -3,7 +3,6 @@ package llm
 import (
 	"bufio"
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -101,13 +100,18 @@ func TestAnthropicParseStream_MultiEvent(t *testing.T) {
 func TestAnthropicParseStream_ErrorEvent(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteString("event: error\ndata: {\"type\":\"error\",\"message\":\"upstream says no\"}\n\n")
+	buf.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
 	a := &AnthropicAdapter{}
 	ch := a.ParseStream(&buf)
 	var seenErr error
+	var sawDone bool
 	for c := range ch {
 		if c.Err != nil {
 			seenErr = c.Err
+		}
+		if c.Done {
+			sawDone = true
 		}
 	}
 	if seenErr == nil {
@@ -115,6 +119,9 @@ func TestAnthropicParseStream_ErrorEvent(t *testing.T) {
 	}
 	if !strings.Contains(seenErr.Error(), "upstream says no") {
 		t.Errorf("error = %q, want it to contain the upstream message", seenErr.Error())
+	}
+	if sawDone {
+		t.Error("error must terminate the parser before a trailing message_stop can emit Done")
 	}
 }
 
@@ -198,50 +205,26 @@ func TestAnthropicParseStream_ProxyErrorEnvelope(t *testing.T) {
 	}
 }
 
-// TestAnthropicParseStream_ToolUsePartialDelta simulates a
-// tool_use content block that arrives as an input_json_delta
-// (Anthropic streams large tool inputs as a series of partial
-// JSON deltas). The parser should NOT crash and should emit the
-// partial content as-is so the caller can forward it.
+// TestAnthropicParseStream_ToolUsePartialDelta 验证工具索引、ID、名称及交错参数片段。
+// TestAnthropicParseStream_ToolUsePartialDelta verifies native tool indexes,
+// IDs, names, and interleaved argument fragments.
 func TestAnthropicParseStream_ToolUsePartialDelta(t *testing.T) {
-	type toolUseStart struct {
-		Type  string `json:"type"`
-		Index int    `json:"index"`
-		ID    string `json:"id,omitempty"`
-		Name  string `json:"name,omitempty"`
-	}
-	type toolUseDelta struct {
-		Type   string `json:"type"`
-		Index  int    `json:"index"`
-		Delta  struct {
-			Type        string `json:"type"`
-			PartialJSON string `json:"partial_json"`
-		} `json:"delta"`
-	}
-
 	var buf bytes.Buffer
-
-	start := toolUseStart{Type: "content_block_start", Index: 0, ID: "tu_01", Name: "bash"}
-	b, _ := json.Marshal(start)
-	buf.WriteString(fmt.Sprintf("event: content_block_start\ndata: %s\n\n", string(b)))
-
-	d1 := toolUseDelta{Type: "content_block_delta", Index: 0}
-	d1.Delta.Type = "input_json_delta"
-	d1.Delta.PartialJSON = `{"command":"ls -la","timeout":`
-	b2, _ := json.Marshal(d1)
-	buf.WriteString(fmt.Sprintf("event: content_block_delta\ndata: %s\n\n", string(b2)))
-
-	d2 := d1
-	d2.Delta.PartialJSON = `30}`
-	b3, _ := json.Marshal(d2)
-	buf.WriteString(fmt.Sprintf("event: content_block_delta\ndata: %s\n\n", string(b3)))
-
+	buf.WriteString("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_bash\",\"name\":\"bash\",\"input\":{}}}\n\n")
+	buf.WriteString("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":4,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tu_read\",\"name\":\"read_file\",\"input\":{}}}\n\n")
+	buf.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Inspecting. \"}}\n\n")
+	buf.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"command\\\":\\\"ls -la\\\",\\\"timeout\\\":\"}}\n\n")
+	buf.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":4,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n\n")
+	buf.WriteString("event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"30}\"}}\n\n")
+	buf.WriteString("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":2}\n\n")
+	buf.WriteString("event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":4}\n\n")
 	buf.WriteString("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 
 	a := &AnthropicAdapter{}
 	ch := a.ParseStream(&buf)
 	var gotContent string
 	var gotDone bool
+	gotTools := map[int]*ToolCallDelta{}
 	for c := range ch {
 		if c.Err != nil {
 			t.Fatalf("unexpected error: %v", c.Err)
@@ -250,13 +233,67 @@ func TestAnthropicParseStream_ToolUsePartialDelta(t *testing.T) {
 			gotDone = true
 		}
 		gotContent += c.Content
+		if delta := c.ToolCallDelta; delta != nil {
+			got := gotTools[delta.Index]
+			if got == nil {
+				got = &ToolCallDelta{}
+				gotTools[delta.Index] = got
+			}
+			if delta.ID != "" {
+				got.ID = delta.ID
+			}
+			if delta.Name != "" {
+				got.Name = delta.Name
+			}
+			got.ArgsJSON += delta.ArgsJSON
+		}
 	}
 	if !gotDone {
 		t.Error("expected Done=true from message_stop, got none")
 	}
-	// With the current parser tool_use deltas are ignored; just
-	// assert no crash and that Stop is delivered.
-	_ = gotContent
+	if gotContent != "Inspecting. " {
+		t.Errorf("content = %q, want text delta alongside tool calls", gotContent)
+	}
+	if got := gotTools[2]; got == nil || got.ID != "tu_bash" || got.Name != "bash" || got.ArgsJSON != `{"command":"ls -la","timeout":30}` {
+		t.Errorf("tool 2 = %#v", got)
+	}
+	if got := gotTools[4]; got == nil || got.ID != "tu_read" || got.Name != "read_file" || got.ArgsJSON != `{"path":"README.md"}` {
+		t.Errorf("tool 4 = %#v", got)
+	}
+}
+
+// TestAnthropicParseStream_ToolUseWithoutInput 验证无参数工具获得空对象参数。
+// TestAnthropicParseStream_ToolUseWithoutInput ensures a tool without input
+// deltas receives {} rather than an invalid empty argument string.
+func TestAnthropicParseStream_ToolUseWithoutInput(t *testing.T) {
+	stream := strings.Join([]string{
+		`event: content_block_start`,
+		`data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_noargs","name":"status","input":{}}}`,
+		``,
+		`event: content_block_stop`,
+		`data: {"type":"content_block_stop","index":1}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n")
+
+	var got ToolCallDelta
+	for chunk := range (&AnthropicAdapter{}).ParseStream(strings.NewReader(stream)) {
+		if chunk.ToolCallDelta == nil {
+			continue
+		}
+		if chunk.ToolCallDelta.ID != "" {
+			got.ID = chunk.ToolCallDelta.ID
+		}
+		if chunk.ToolCallDelta.Name != "" {
+			got.Name = chunk.ToolCallDelta.Name
+		}
+		got.ArgsJSON += chunk.ToolCallDelta.ArgsJSON
+	}
+	if got.ID != "tu_noargs" || got.Name != "status" || got.ArgsJSON != "{}" {
+		t.Fatalf("tool = %#v", got)
+	}
 }
 
 // TestAnthropicParseStream_InterruptedStream simulates a transport

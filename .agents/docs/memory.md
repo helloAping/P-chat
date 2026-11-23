@@ -43,6 +43,7 @@ type Store struct {
 - `GetChatMessagesFor(convID, limit)` — 获取消息历史
 - `GetChatMessagesWithMetaPage(convID, beforeID, limit)` — 分页查询
 - `GetChatMessagesAfterIDFor(convID, limit, afterID)` — 从某 ID 之后查询
+- `SearchMessages(q, limit)` / `SearchMessagesByProject(...)` — 只搜索未归档会话中可渲染的文本行，过滤 `ui_hidden`、tool/command/附件行和已归档回复
 - `ListConversations()` — 列出所有会话，并通过查询聚合填充 `UserMessageCount` / `PendingTurnCount`，供服务端判断项目内可复用空白会话
 - `SetConversationMeta(convID, meta)` → 写入会话元数据
 
@@ -62,6 +63,8 @@ todo_items: session_id, item_id, content, status, sort_order
 chunks: id, source, content, metadata, created_at
 embeddings: chunk_id, model, vector, dim, created_at
 subagent_jobs: id, task_id, session_id, status, subagent_type, model, description, result, error, progress_json, created_at, started_at, finished_at, cancelled_at
+turn_changes: 回合文件/命令摘要，不含文件字节
+styles.memory: 风格记忆。remember 追加到已有风格，或据此新建风格
 ```
 
 **Schema 变更规则** → 详见 [versioning.md §二](versioning.md#二schema-迁移规范)。
@@ -90,6 +93,7 @@ subagent_jobs: id, task_id, session_id, status, subagent_type, model, descriptio
 - `origin` — 内部来源标记；自动续跑 nudge 使用 `"auto_resume"`，动态上下文快照使用 `"runtime_context"`
 - `ui_hidden` — `"true"` 表示该消息只参与 LLM 上下文，不应通过历史 API 渲染给用户
 - `thinking` — 原始模型思考文本；`decodeChatMessages()` 恢复到助手文本消息的 `Meta["thinking"]`，供 DeepSeek 回传，展示仍使用 parts
+- `responses_output_items` — OpenAI Responses 的原生 output item JSON；读取时恢复到助手消息 Meta，供工具续轮精确回放 reasoning/message/function_call 的 ID、顺序和加密内容
 - `parts` — 结构化 parts JSON（tool + sub_agent）
 
 `encodeChatMeta()` 会先把 `llm.ChatMessage.Meta` 合并进 metadata，再补充规范字段。
@@ -98,6 +102,10 @@ subagent_jobs: id, task_id, session_id, status, subagent_type, model, descriptio
 
 动态快照沿用 `name=pchat_context_<name>`、`origin`、`ui_hidden` 等既有元数据键，不新增
 数据库字段。助手与工具消息按请求顺序落库，确保下次读取不会把工具结果移到助手文本之前。
+
+搜索可见性必须与历史 API 保持一致：`is_archived=1`、`msg_type` 非文本、
+`role=tool`、`metadata.ui_hidden=true` 和旧版自动续跑 user-style nudge 不得进入搜索结果。
+服务端合并连续 assistant 行时，通过 `source_message_ids[]` 保留原始行身份，供前端把搜索命中映射到可见气泡。
 
 项目空白会话复用不新增 schema 字段。`Conversation.UserMessageCount` 来自
 `messages(role='user', is_archived=0)` 聚合，`PendingTurnCount` 来自

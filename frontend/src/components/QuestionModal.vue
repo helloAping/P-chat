@@ -1,32 +1,59 @@
 <script setup lang="ts">
 import { ref, computed, watch } from 'vue'
-import { NButton, NRadio, NCheckbox, NInput } from 'naive-ui'
+import { NInput, NTooltip } from 'naive-ui'
 import { submitQuestionAnswer, currentPendingQuestion } from '../stores/chat'
-import { ArrowUp, MessageSquare } from './icons'
 
 const CUSTOM_VALUE = '__pchat_custom__'
 
+type DisplayOption = {
+  label: string
+  description: string
+  value: string
+  recommended: boolean
+  free: boolean
+}
+
 const currentIndex = ref(0)
+const collapsed = ref(false)
 const answers = ref<Record<string, string>>({})
 const multiAnswers = ref<Record<string, string[]>>({})
 const customInputs = ref<Record<string, string>>({})
-const emit = defineEmits<{ (e: 'locate-question'): void }>()
 
 const questions = computed(() => currentPendingQuestion.value?.questions || [])
 const currentQuestion = computed(() => questions.value[currentIndex.value] || null)
 const isLast = computed(() => currentIndex.value >= questions.value.length - 1)
 
-watch(currentPendingQuestion, (q) => {
-  if (q) {
-    currentIndex.value = 0
-    answers.value = {}
-    multiAnswers.value = {}
-    customInputs.value = {}
-  }
+function questionSignature(q: { questions?: { header?: string; question?: string }[] } | null): string {
+  if (!q?.questions) return ''
+  return q.questions.map((item) => `${item.header || ''}\n${item.question || ''}`).join('\n---\n')
+}
+
+watch(currentPendingQuestion, (q, prev) => {
+  if (!q) return
+  // A repeated prompt for the same questions must not pop the panel
+  // back open after the user has collapsed it.
+  if (questionSignature(q) === questionSignature(prev)) return
+  currentIndex.value = 0
+  collapsed.value = false
+  answers.value = {}
+  multiAnswers.value = {}
+  customInputs.value = {}
 })
 
 function keyOfQuestion(): string {
   return currentQuestion.value?.question || ''
+}
+
+/** LLM 习惯把「（推荐）」写在 label 末尾；拆出来渲染成小字，正文不再重复。 */
+function splitLabel(label: string): { text: string; recommended: boolean } {
+  const matched = (label || '').match(/^(.*?)\s*[（(]\s*推荐\s*[)）]\s*$/)
+  if (matched && matched[1]) return { text: matched[1].trim(), recommended: true }
+  return { text: label, recommended: false }
+}
+
+function isFreeTextLabel(label: string): boolean {
+  const text = splitLabel(label).text
+  return text === '其他' || text === '自定义'
 }
 
 function selectOption(value: string) {
@@ -38,7 +65,7 @@ function selectOption(value: string) {
     const idx = arr.indexOf(value)
     if (idx >= 0) arr.splice(idx, 1)
     else arr.push(value)
-    if (value === CUSTOM_VALUE && idx >= 0) {
+    if ((value === CUSTOM_VALUE || isFreeTextLabel(value)) && idx >= 0) {
       customInputs.value[key] = ''
     }
     multiAnswers.value[key] = arr
@@ -46,7 +73,7 @@ function selectOption(value: string) {
   }
   if (answers.value[key] === value) {
     answers.value[key] = ''
-    if (value === CUSTOM_VALUE) customInputs.value[key] = ''
+    if (value === CUSTOM_VALUE || isFreeTextLabel(value)) customInputs.value[key] = ''
   } else {
     answers.value[key] = value
   }
@@ -56,37 +83,31 @@ function isSelected(value: string): boolean {
   const q = currentQuestion.value
   if (!q) return false
   const key = keyOfQuestion()
-  if (q.multi_select) {
-    return (multiAnswers.value[key] || []).includes(value)
-  }
+  if (q.multi_select) return (multiAnswers.value[key] || []).includes(value)
   return answers.value[key] === value
 }
 
-function ensureOption(value: string) {
-  if (!isSelected(value)) selectOption(value)
+function selectedValues(): string[] {
+  const q = currentQuestion.value
+  if (!q) return []
+  const key = keyOfQuestion()
+  if (q.multi_select) return multiAnswers.value[key] || []
+  return answers.value[key] ? [answers.value[key]] : []
 }
 
-function isQuestionAnswered(q: { question: string; multi_select?: boolean }): boolean {
-  if (q.multi_select) return (multiAnswers.value[q.question] || []).length > 0
-  return !!answers.value[q.question]
+function needsCustomText(): boolean {
+  return selectedValues().some((value) => value === CUSTOM_VALUE || isFreeTextLabel(value))
 }
 
 function canProceed(): boolean {
-  const q = currentQuestion.value
-  if (!q) return false
-  const key = keyOfQuestion()
-  if (q.multi_select) {
-    const selected = multiAnswers.value[key] || []
-    if (selected.length === 0) return false
-    if (selected.includes(CUSTOM_VALUE) && !(customInputs.value[key] || '').trim()) return false
-    return true
-  }
-  if (!answers.value[key]) return false
-  if (answers.value[key] === CUSTOM_VALUE && !(customInputs.value[key] || '').trim()) return false
+  const selected = selectedValues().filter(Boolean)
+  if (selected.length === 0) return false
+  if (needsCustomText() && !(customInputs.value[keyOfQuestion()] || '').trim()) return false
   return true
 }
 
 function next() {
+  if (!canProceed()) return
   if (isLast.value) submit()
   else currentIndex.value++
 }
@@ -95,445 +116,429 @@ function prev() {
   if (currentIndex.value > 0) currentIndex.value--
 }
 
+function answerFor(key: string, multi: boolean): string {
+  if (multi) {
+    return (multiAnswers.value[key] || []).map((item) => {
+      if (item === CUSTOM_VALUE || isFreeTextLabel(item)) return (customInputs.value[key] || '').trim()
+      return item
+    }).filter(Boolean).join(', ')
+  }
+  const raw = answers.value[key] || ''
+  if (raw === CUSTOM_VALUE || isFreeTextLabel(raw)) return (customInputs.value[key] || '').trim()
+  return raw
+}
+
 function submit() {
   const all: Record<string, string> = {}
   for (const q of questions.value) {
-    const key = q.question
-    let value = ''
-    if (q.multi_select) {
-      value = (multiAnswers.value[key] || []).map((item) => {
-        if (item === CUSTOM_VALUE) return (customInputs.value[key] || '').trim()
-        return item
-      }).filter(Boolean).join(', ')
-    } else {
-      const raw = answers.value[key] || ''
-      value = raw === CUSTOM_VALUE ? (customInputs.value[key] || '').trim() : raw
-    }
+    const value = answerFor(q.question, !!q.multi_select)
     if (value) all[q.header] = value
   }
   submitQuestionAnswer(all)
 }
 
-const regularOptions = computed(() => {
+const optionGroups = computed(() => {
   const q = currentQuestion.value
-  if (!q) return []
-  return q.options.map(opt => ({ ...opt, value: opt.label }))
+  if (!q) return [] as { on: boolean; items: DisplayOption[] }[]
+  const rows: DisplayOption[] = q.options.map((opt) => {
+    const split = splitLabel(opt.label)
+    return {
+      label: split.text,
+      description: opt.description || '',
+      value: opt.label,
+      recommended: split.recommended,
+      free: isFreeTextLabel(opt.label),
+    }
+  })
+  if (!rows.some((row) => row.free)) {
+    rows.push({
+      label: '其他',
+      description: '没有合适选项时自己写一句',
+      value: CUSTOM_VALUE,
+      recommended: false,
+      free: true,
+    })
+  }
+  const groups: { on: boolean; items: DisplayOption[] }[] = []
+  for (const row of rows) {
+    const on = isSelected(row.value)
+    const prev = groups[groups.length - 1]
+    if (prev && prev.on === on) prev.items.push(row)
+    else groups.push({ on, items: [row] })
+  }
+  return groups
 })
 
-/** LLM 习惯把「（推荐）」写在 label 末尾；拆出来渲染成徽标，正文不再重复。
- * LLMs conventionally suffix the recommended option label with （推荐）;
- * split it off so it renders as a badge instead of inline text. */
-function splitLabel(label: string): { text: string; recommended: boolean } {
-  const m = (label || '').match(/^(.*?)\s*[（(]\s*推荐\s*[)）]\s*$/)
-  if (m && m[1]) return { text: m[1].trim(), recommended: true }
-  return { text: label, recommended: false }
-}
-
-/** Show question text once; skip duplicate header echo. */
+const titleText = computed(() => currentQuestion.value?.header || currentQuestion.value?.question || '')
 const promptText = computed(() => {
   const q = currentQuestion.value
   if (!q) return ''
   const text = (q.question || '').trim()
-  if (!text || text === q.header) return q.header
+  if (!text || text === q.header) return ''
   return text
 })
 </script>
 
 <template>
-  <Transition name="question-dock">
-    <section
-      v-if="currentPendingQuestion"
-      class="question-dock"
-      role="region"
-      aria-labelledby="qmodal-title"
-    >
-      <header class="qmodal-header">
-        <div class="qmodal-title-wrap">
-          <MessageSquare :size="14" class="qmodal-header-icon" />
-          <span id="qmodal-title" class="qmodal-title">需要你确认</span>
-          <span v-if="questions.length > 1" class="qmodal-progress">{{ currentIndex + 1 }}/{{ questions.length }}</span>
-          <span v-if="currentQuestion?.multi_select" class="qmulti">多选</span>
-        </div>
-        <NButton
-          size="tiny"
-          quaternary
-          title="定位到聊天中的提问"
-          aria-label="定位到聊天中的提问"
-          @click="emit('locate-question')"
-        >
-          <ArrowUp :size="14" />
-        </NButton>
-      </header>
+  <button
+    v-if="currentPendingQuestion && collapsed"
+    type="button"
+    class="question-float"
+    aria-label="展开确认"
+    @click.stop="collapsed = false"
+  >
+    <span class="question-float-mark">?</span>
+    <span class="question-particles" aria-hidden="true">
+      <i v-for="n in 8" :key="n" :style="{ '--i': String(n - 1) }" />
+    </span>
+  </button>
 
-      <div v-if="questions.length > 1" class="qnav">
-        <button
-          v-for="(q, i) in questions"
-          :key="i"
-          type="button"
-          class="qnav-chip"
-          :class="{ 'qnav-active': i === currentIndex, 'qnav-answered': isQuestionAnswered(q) }"
-          :title="q.header"
-          @click="currentIndex = i"
-        >
-          <span class="qnav-dot" aria-hidden="true" />
-          {{ q.header }}
-        </button>
+  <section
+    v-if="currentPendingQuestion && !collapsed && currentQuestion"
+    class="question-panel"
+    role="region"
+    aria-labelledby="qmodal-title"
+  >
+    <header class="qmodal-header">
+      <span class="qmodal-mark" aria-hidden="true">?</span>
+      <span id="qmodal-title" class="qmodal-title">需要你确认</span>
+      <span class="qmodal-progress">{{ currentIndex + 1 }} / {{ questions.length }}</span>
+      <button type="button" class="qmodal-collapse" @click.stop="collapsed = true">收起</button>
+    </header>
+
+    <div class="qbody">
+      <div class="qtitle-row">
+        <div id="qmodal-question" class="qtitle">{{ titleText }}</div>
+        <span v-if="currentQuestion.multi_select" class="qmulti">可多选</span>
       </div>
+      <p v-if="promptText" class="qprompt" :title="promptText">{{ promptText }}</p>
 
-      <div v-if="currentQuestion" class="qbody">
-        <div class="qprompt">{{ promptText }}</div>
-
-        <div class="qopts">
-          <div
-            v-for="opt in regularOptions"
-            :key="opt.value"
-            class="qopt"
-            :class="{ 'qopt-sel': isSelected(opt.value) }"
-            role="button"
-            tabindex="0"
-            @click="selectOption(opt.value)"
-            @keydown.enter.prevent="selectOption(opt.value)"
-            @keydown.space.prevent="selectOption(opt.value)"
-          >
-            <NRadio
-              v-if="!currentQuestion.multi_select"
-              :checked="isSelected(opt.value)"
-              tabindex="-1"
-              class="qopt-ctrl"
-            />
-            <NCheckbox
-              v-else
-              :checked="isSelected(opt.value)"
-              tabindex="-1"
-              class="qopt-ctrl"
-            />
-            <span class="qopt-text">
-              <span class="qopt-label">
-                {{ splitLabel(opt.label).text }}
-                <span v-if="splitLabel(opt.label).recommended" class="qopt-rec">推荐</span>
+      <div class="qgroups">
+        <div
+          v-for="(group, groupIndex) in optionGroups"
+          :key="groupIndex"
+          class="qgroup"
+          :class="{ 'qgroup-on': group.on }"
+        >
+          <div v-for="(opt, optIndex) in group.items" :key="opt.value">
+            <button
+              type="button"
+              class="qopt"
+              :class="{ 'qopt-split': group.on && optIndex > 0 }"
+              :title="opt.description ? `${opt.label}\n${opt.description}` : opt.label"
+              @click="selectOption(opt.value)"
+            >
+              <span class="qcheck" :class="{ 'qcheck-on': group.on, 'qcheck-round': !currentQuestion.multi_select }" />
+              <span class="qopt-copy">
+                <span class="qopt-label">
+                  <span class="qopt-label-text">{{ opt.label }}</span>
+                  <span v-if="opt.recommended" class="qopt-rec">推荐</span>
+                </span>
+                <NTooltip v-if="opt.description" placement="top-start">
+                  <template #trigger>
+                    <span class="qopt-desc">{{ opt.description }}</span>
+                  </template>
+                  {{ opt.description }}
+                </NTooltip>
               </span>
-              <span v-if="opt.description" class="qopt-desc">{{ opt.description }}</span>
-            </span>
+            </button>
+            <div v-if="group.on && opt.free" class="qcustom" @click.stop>
+              <NInput
+                v-model:value="customInputs[currentQuestion.question]"
+                size="small"
+                :placeholder="opt.label === '自定义' ? '输入自定义内容' : '输入其他内容'"
+                :autofocus="true"
+              />
+            </div>
           </div>
         </div>
-
-        <div
-          class="qcustom"
-          :class="{ 'qcustom-sel': isSelected(CUSTOM_VALUE) }"
-          @click="ensureOption(CUSTOM_VALUE)"
-        >
-          <button
-            type="button"
-            class="qcustom-toggle"
-            @click.stop="selectOption(CUSTOM_VALUE)"
-          >
-            <NRadio
-              v-if="!currentQuestion.multi_select"
-              :checked="isSelected(CUSTOM_VALUE)"
-              tabindex="-1"
-              class="qopt-ctrl"
-            />
-            <NCheckbox
-              v-else
-              :checked="isSelected(CUSTOM_VALUE)"
-              tabindex="-1"
-              class="qopt-ctrl"
-            />
-            <span class="qcustom-label">其他</span>
-          </button>
-          <NInput
-            v-if="isSelected(CUSTOM_VALUE)"
-            v-model:value="customInputs[currentQuestion.question]"
-            size="tiny"
-            placeholder="输入自定义回答…"
-            :autofocus="true"
-            class="qcustom-input"
-            @click.stop
-            @focus="ensureOption(CUSTOM_VALUE)"
-            @keydown.enter.stop
-          />
-        </div>
       </div>
+    </div>
 
-      <footer class="qmodal-footer">
-        <NButton v-if="currentIndex > 0" size="tiny" @click="prev">上一步</NButton>
-        <NButton type="primary" size="tiny" :disabled="!canProceed()" @click="next">
-          {{ isLast ? '提交' : '下一步' }}
-        </NButton>
-      </footer>
-    </section>
-  </Transition>
+    <footer class="qmodal-footer">
+      <button type="button" class="qnav-btn" :disabled="currentIndex === 0" @click="prev">上一题</button>
+      <button type="button" class="qnav-btn qnav-btn-primary" :disabled="!canProceed()" @click="next">
+        {{ isLast ? '确认' : '下一题 →' }}
+      </button>
+    </footer>
+  </section>
 </template>
 
 <style scoped>
-.question-dock {
-  flex: 0 0 auto;
-  margin: 0 var(--space-3) var(--space-2);
-  max-height: min(38vh, 360px);
+.question-float {
+  position: absolute;
+  left: var(--space-3);
+  bottom: calc(100% + var(--space-1) + var(--control-height) - 4px + var(--space-2));
+  z-index: 6;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  pointer-events: auto;
+}
+.question-float-mark { position: relative; z-index: 1; }
+.question-float::before,
+.question-float::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: inherit;
+  border: 1px solid var(--question-green);
+  pointer-events: none;
+  animation: question-edge 1.8s ease-out infinite;
+}
+.question-float::after { animation-delay: 0.9s; }
+.question-particles {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.question-particles i {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 3px;
+  margin: -1.5px 0 0 -1.5px;
+  border-radius: 50%;
+  background: var(--question-green);
+  animation: question-particle 1.8s ease-out infinite;
+  animation-delay: calc(var(--i) * -0.22s);
+}
+@keyframes question-edge {
+  0% { transform: scale(1); opacity: 0.85; }
+  100% { transform: scale(1.7); opacity: 0; }
+}
+@keyframes question-particle {
+  0% { transform: rotate(calc(var(--i) * 45deg)) translateY(12px); opacity: 0.95; }
+  100% { transform: rotate(calc(var(--i) * 45deg)) translateY(22px); opacity: 0; }
+}
+
+.question-panel {
+  position: absolute;
+  left: var(--space-3);
+  /* Sit above the composer capsules. The toolbar is already
+     offset by one gap; add its height so the card floats over
+     the message list instead of pushing that row upward. */
+  bottom: calc(100% + var(--space-1) + var(--control-height) - 4px + var(--space-2));
+  z-index: 4;
+  width: min(420px, calc(100% - var(--space-6)));
+  margin: 0;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
+  max-height: min(46vh, 420px);
   background: var(--surface-1);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-sm);
+  color: var(--text-primary);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  pointer-events: auto;
 }
 .qmodal-header {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--space-2);
-  flex-shrink: 0;
+  padding: 8px 12px;
 }
-.qmodal-title-wrap {
-  min-width: 0;
-  display: flex;
+.qmodal-mark {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
-  flex-wrap: wrap;
+  justify-content: center;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  color: var(--text-tertiary);
+  font-size: 13px;
 }
 .qmodal-title {
-  font-size: 12.5px;
+  font-size: 14px;
   font-weight: 600;
-  color: var(--text-primary);
 }
-.qmodal-header-icon { color: var(--brand-500); }
 .qmodal-progress {
-  display: inline-flex;
-  align-items: center;
-  height: 18px;
-  padding: 0 6px;
-  border-radius: var(--radius-pill);
-  background: var(--surface-2);
+  margin-left: auto;
+  padding: 3px 8px;
   border: 1px solid var(--border-subtle);
-  color: var(--text-tertiary);
-  font: 500 11px/1 var(--font-mono);
-}
-.qmulti {
-  display: inline-flex;
-  align-items: center;
-  height: 18px;
-  padding: 0 6px;
   border-radius: var(--radius-pill);
-  background: var(--brand-50);
-  color: var(--brand-500);
-  font-size: 10.5px;
-  font-weight: 600;
+  color: var(--text-tertiary);
+  font-size: 12px;
   line-height: 1;
 }
-.qnav {
-  display: flex;
-  gap: 4px;
-  flex-wrap: wrap;
-  flex-shrink: 0;
-}
-.qnav-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  max-width: 120px;
-  height: 22px;
+.qmodal-collapse {
+  margin: 0;
+  height: 24px;
   padding: 0 8px;
   border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-pill);
-  background: transparent;
-  color: var(--text-tertiary);
-  font-family: inherit;
-  font-size: 11px;
-  line-height: 1;
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
   cursor: pointer;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  transition:
-    color var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out),
-    background var(--dur-fast) var(--ease-out);
-}
-.qnav-chip:hover {
-  border-color: var(--border-default);
-  color: var(--text-secondary);
-}
-.qnav-chip.qnav-active {
-  border-color: var(--brand-100);
-  background: var(--brand-50);
-  color: var(--brand-600);
-}
-.qnav-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: 50%;
-  background: var(--border-default);
-  flex-shrink: 0;
-}
-.qnav-answered .qnav-dot,
-.qnav-active .qnav-dot {
-  background: currentColor;
 }
 .qbody {
   min-height: 0;
-  flex: 1 1 auto;
   overflow: auto;
-  overscroll-behavior: contain;
+  padding: 2px 12px 6px;
+  border-top: 1px solid var(--border-subtle);
 }
-.qprompt {
-  margin: 0 0 var(--space-2);
-  color: var(--text-primary);
-  font-size: 13px;
+.qtitle-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 8px 0 4px;
+}
+.qtitle {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 14px;
   font-weight: 600;
-  line-height: 1.4;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-
-/* Vertical option list — full label text wraps; description shows as a
- * secondary line instead of hiding behind a tooltip. */
-.qopts {
+.qmulti,
+.qopt-rec {
+  color: var(--text-tertiary);
+  font-size: 12px;
+  font-weight: 500;
+}
+.qopt-rec { color: var(--question-green-ink); }
+.qprompt {
+  display: -webkit-box;
+  margin: 0 0 6px;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1.35;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+.qgroups {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
+}
+.qgroup-on {
+  background: var(--surface-3);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
 }
 .qopt {
   display: flex;
   align-items: flex-start;
-  gap: 6px;
-  min-width: 0;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
   padding: 6px 8px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
+  border: none;
+  background: transparent;
   color: var(--text-primary);
-  font-family: inherit;
+  font: inherit;
+  font-size: 13px;
   text-align: left;
   cursor: pointer;
-  transition:
-    border-color var(--dur-fast) var(--ease-out),
-    background var(--dur-fast) var(--ease-out);
 }
-.qopt:hover {
-  border-color: var(--border-default);
-  background: var(--surface-3);
+.qopt-split { border-top: 1px solid var(--border-subtle); }
+.qcheck {
+  width: 14px;
+  height: 14px;
+  margin-top: 2px;
+  flex: 0 0 auto;
+  border: 1.5px solid var(--text-quaternary);
+  border-radius: 4px;
+  background: transparent;
 }
-.qopt-sel {
-  border-color: var(--brand-100);
-  background: var(--brand-50);
+.qcheck-round { border-radius: 99px; }
+.qcheck-on {
+  position: relative;
+  border: none;
+  background: var(--question-green);
 }
-.qopt-ctrl {
-  flex-shrink: 0;
-  pointer-events: none;
-  margin-top: 1px;
+.qcheck-on::after {
+  content: "";
+  position: absolute;
+  left: 3px;
+  top: 2px;
+  width: 6px;
+  height: 3px;
+  border-left: 1.5px solid var(--question-on-green);
+  border-bottom: 1.5px solid var(--question-on-green);
+  transform: rotate(-45deg);
 }
-.qopt-text {
+.qopt-copy {
   min-width: 0;
   display: flex;
   flex-direction: column;
   gap: 2px;
 }
 .qopt-label {
-  font-size: 12.5px;
-  font-weight: 500;
-  line-height: 1.4;
-  white-space: normal;
-  word-break: break-word;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  line-height: 1.35;
 }
-.qopt-sel .qopt-label { font-weight: 600; }
-.qopt-rec {
-  display: inline-flex;
-  align-items: center;
-  height: 16px;
-  margin-left: var(--space-1);
-  padding: 0 6px;
-  border-radius: var(--radius-pill);
-  background: var(--brand-100);
-  color: var(--brand-600);
-  font-size: 10.5px;
-  font-weight: 600;
-  line-height: 1;
-  vertical-align: 1px;
-}
-.qopt-desc {
-  font-size: 11.5px;
-  line-height: 1.5;
-  color: var(--text-tertiary);
+.qopt-label-text {
   display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
+}
+.qopt-desc {
+  display: -webkit-box;
   overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
 }
-
-.qcustom {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-top: 6px;
-  min-height: 32px;
-  padding: 4px 8px;
-  border: 1px dashed var(--border-default);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  cursor: pointer;
-  transition:
-    border-color var(--dur-fast) var(--ease-out),
-    background var(--dur-fast) var(--ease-out);
-}
-.qcustom:hover {
-  border-color: var(--border-strong);
-  background: var(--surface-3);
-}
-.qcustom.qcustom-sel {
-  border-color: var(--brand-100);
-  border-style: solid;
-  background: var(--brand-50);
-}
-.qcustom-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-  padding: 0;
-  border: 0;
-  background: transparent;
-  color: var(--text-primary);
-  font-family: inherit;
-  cursor: pointer;
-}
-.qcustom-label {
-  font-size: 12.5px;
-  font-weight: 500;
-  white-space: nowrap;
-}
-.qcustom-input {
-  flex: 1;
-  min-width: 0;
-}
+.qcustom { padding: 0 8px 6px 30px; }
 .qmodal-footer {
   display: flex;
-  justify-content: flex-end;
-  align-items: center;
+  justify-content: space-between;
   gap: var(--space-2);
-  padding-top: var(--space-2);
+  padding: 8px 12px;
   border-top: 1px solid var(--border-subtle);
-  flex-shrink: 0;
 }
-@media (max-width: 720px) {
-  .question-dock {
-    margin-inline: var(--space-2);
-    max-height: min(46vh, 400px);
-  }
+.qnav-btn {
+  height: var(--control-height);
+  margin: 0;
+  padding: 0 12px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
 }
-
-.question-dock-enter-active {
-  transition:
-    opacity var(--dur-base) var(--ease-out),
-    transform var(--dur-base) var(--ease-out);
+.qnav-btn:disabled {
+  color: var(--text-quaternary);
+  cursor: default;
 }
-.question-dock-leave-active {
-  transition:
-    opacity var(--dur-fast) var(--ease-in),
-    transform var(--dur-fast) var(--ease-in);
+.qnav-btn-primary {
+  border: none;
+  background: var(--question-green);
+  color: var(--question-on-green);
+  font-weight: 600;
 }
-.question-dock-enter-from,
-.question-dock-leave-to {
-  opacity: 0;
-  transform: translateY(var(--space-3));
+.qnav-btn-primary:disabled {
+  background: var(--surface-3);
+  color: var(--text-quaternary);
 }
 </style>

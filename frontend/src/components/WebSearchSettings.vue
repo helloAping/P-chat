@@ -44,22 +44,27 @@ const testing = ref(false)
 
 // Editable draft. Defaults to empty strings so the inputs
 // don't flicker "undefined" on first load.
+type SearchProvider = 'tavily' | 'openai_compat' | 'deepseek' | 'mimo' | 'qwen'
+
 const form = ref({
   enabled: false,
-  provider: 'tavily' as 'tavily' | 'openai_compat',
+  provider: 'tavily' as SearchProvider,
   apiKey: '',
   clearKey: false,
   baseUrl: '',
   path: '',
   topic: 'general' as '' | 'general' | 'news' | 'finance',
+  model: '',
   dailyQuota: 0,
   requestTimeout: '20s',
 })
 
-// Provider enum. Empty string maps to "tavily" on save.
 const providerOptions = [
-  { label: 'Tavily (推荐)', value: 'tavily' },
+  { label: 'Tavily', value: 'tavily' },
   { label: 'OpenAI 兼容 (自配)', value: 'openai_compat' },
+  { label: 'DeepSeek', value: 'deepseek' },
+  { label: 'MiMo', value: 'mimo' },
+  { label: 'Qwen（百炼）', value: 'qwen' },
 ]
 
 // Topic enum. Only used for tavily; the server silently
@@ -83,6 +88,7 @@ const isDirty = computed(() => {
   if (form.value.baseUrl !== (s.base_url || '')) return true
   if (form.value.path !== (s.path || '')) return true
   if (form.value.topic !== (s.topic || 'general')) return true
+  if (form.value.model !== (s.model || '')) return true
   if (form.value.dailyQuota !== s.daily_quota) return true
   if (form.value.requestTimeout !== (s.request_timeout || '20s')) return true
   return false
@@ -105,6 +111,36 @@ const quotaProgress = computed(() => {
 // isOpenAICompat gates the visibility of the base_url
 // and path fields (only relevant for that provider).
 const isOpenAICompat = computed(() => form.value.provider === 'openai_compat')
+const showsBaseURL = computed(() => form.value.provider !== 'tavily')
+const showsPath = computed(() => form.value.provider === 'openai_compat' || form.value.provider === 'deepseek')
+const showsModel = computed(() => form.value.provider === 'mimo' || form.value.provider === 'qwen')
+const providerHint = computed(() => {
+  switch (form.value.provider) {
+    case 'deepseek':
+      return '搜索按成功请求计费，每 1000 次约 $0.75。可粘贴 DeepSeek 对话 Key。'
+    case 'mimo':
+      return '通过 Chat Completions 的 web_search 搜索，每轮只发 1 个关键词。'
+    case 'qwen':
+      return '通过百炼 Responses API 搜索。Base URL 需要带业务空间。'
+    case 'openai_compat':
+      return '自配 endpoint，请求体为 {query, max_results}。'
+    default:
+      return 'Tavily：有免费额度。主题仅对 Tavily 生效。'
+  }
+})
+const baseURLPlaceholder = computed(() => {
+  switch (form.value.provider) {
+    case 'deepseek':
+      return 'https://api.deepseek.com'
+    case 'mimo':
+      return 'https://api.xiaomimimo.com/v1'
+    case 'qwen':
+      return 'https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1'
+    default:
+      return 'https://s.jina.ai'
+  }
+})
+const modelPlaceholder = computed(() => form.value.provider === 'mimo' ? 'mimo-v2.6-flash' : 'qwen3.8-flash')
 
 // ====================================================================
 // Load / Save / Test
@@ -117,12 +153,13 @@ async function loadSettings() {
     settings.value = s
     form.value = {
       enabled: s.enabled,
-      provider: (s.provider as 'tavily' | 'openai_compat') || 'tavily',
+      provider: (s.provider as SearchProvider) || 'tavily',
       apiKey: '',
       clearKey: false,
       baseUrl: s.base_url || '',
       path: s.path || '',
       topic: (s.topic as 'general' | 'news' | 'finance') || 'general',
+      model: s.model || '',
       dailyQuota: s.daily_quota,
       requestTimeout: s.request_timeout || '20s',
     }
@@ -143,6 +180,7 @@ async function save() {
       base_url: form.value.baseUrl,
       path: form.value.path,
       topic: form.value.topic,
+      model: form.value.model,
       daily_quota: form.value.dailyQuota,
       request_timeout: form.value.requestTimeout,
     }
@@ -170,12 +208,13 @@ function reset() {
   if (!settings.value) return
   form.value = {
     enabled: settings.value.enabled,
-    provider: (settings.value.provider as 'tavily' | 'openai_compat') || 'tavily',
+    provider: (settings.value.provider as SearchProvider) || 'tavily',
     apiKey: '',
     clearKey: false,
     baseUrl: settings.value.base_url || '',
     path: settings.value.path || '',
     topic: (settings.value.topic as 'general' | 'news' | 'finance') || 'general',
+    model: settings.value.model || '',
     dailyQuota: settings.value.daily_quota,
     requestTimeout: settings.value.request_timeout || '20s',
   }
@@ -267,9 +306,7 @@ onMounted(loadSettings)
               size="small"
               style="width: 240px"
             />
-            <div class="form-hint">
-              Tavily: 1000 次/月免费 · OpenAI 兼容: 自配 endpoint
-            </div>
+            <div class="form-hint">{{ providerHint }}</div>
           </div>
 
           <!-- Topic (tavily only) -->
@@ -288,13 +325,12 @@ onMounted(loadSettings)
 
       <NCollapseItem title="凭据" name="credentials">
         <div class="form-grid">
-          <!-- API Key (tavily) -->
-          <div v-if="form.provider === 'tavily'" class="form-row">
+          <div class="form-row">
             <div class="form-label">API Key</div>
             <NInput
               v-model:value="form.apiKey"
               type="password"
-              :placeholder="settings?.has_key ? '已配置 - 留空保留, 填写替换' : 'tvly-...'"
+              :placeholder="settings?.has_key ? '已配置 - 留空保留, 填写替换' : (isOpenAICompat ? '部分服务不需要' : '粘贴 API Key')"
               size="small"
               show-password-on="click"
               style="width: 320px"
@@ -314,61 +350,42 @@ onMounted(loadSettings)
                 删除 Key
               </template>
             </NButton>
-            <div class="form-hint">
+            <div v-if="form.provider === 'tavily'" class="form-hint">
               在 <a href="https://app.tavily.com/home" target="_blank" rel="noopener">app.tavily.com</a> 获取
             </div>
           </div>
 
-          <!-- Base URL (openai_compat) -->
-          <div v-if="isOpenAICompat" class="form-row">
+          <div v-if="showsBaseURL" class="form-row">
             <div class="form-label">Base URL</div>
             <NInput
               v-model:value="form.baseUrl"
-              placeholder="https://s.jina.ai"
+              :placeholder="baseURLPlaceholder"
               size="small"
-              style="width: 320px"
+              style="width: 420px"
             />
-            <div class="form-hint">必须 https://（loopback 例外）</div>
+            <div class="form-hint">公网必须 https://。留空则使用该渠道默认地址；Qwen 必填。</div>
           </div>
 
-          <!-- Optional path override -->
-          <div v-if="isOpenAICompat" class="form-row">
+          <div v-if="showsPath" class="form-row">
             <div class="form-label">Path</div>
             <NInput
               v-model:value="form.path"
-              placeholder="/search"
+              :placeholder="form.provider === 'deepseek' ? '/v1/tools/search' : '/search'"
               size="small"
               style="width: 200px"
             />
-            <div class="form-hint">请求路径，留空默认 /search</div>
+            <div class="form-hint">留空使用渠道默认路径</div>
           </div>
 
-          <!-- Optional API key (openai_compat) -->
-          <div v-if="isOpenAICompat" class="form-row">
-            <div class="form-label">API Key (可选)</div>
+          <div v-if="showsModel" class="form-row">
+            <div class="form-label">模型</div>
             <NInput
-              v-model:value="form.apiKey"
-              type="password"
-              :placeholder="settings?.has_key ? '已配置 - 留空保留, 填写替换' : '部分服务不需要'"
+              v-model:value="form.model"
+              :placeholder="modelPlaceholder"
               size="small"
-              show-password-on="click"
-              style="width: 320px"
+              style="width: 240px"
             />
-            <NButton
-              v-if="settings?.has_key"
-              size="tiny"
-              quaternary
-              type="warning"
-              :disabled="form.clearKey"
-              @click="form.clearKey = !form.clearKey"
-            >
-              <template v-if="form.clearKey">
-                <Check :size="12" /> 将删除
-              </template>
-              <template v-else>
-                删除 Key
-              </template>
-            </NButton>
+            <div class="form-hint">留空使用 {{ modelPlaceholder }}</div>
           </div>
         </div>
       </NCollapseItem>

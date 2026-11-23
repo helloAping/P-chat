@@ -31,14 +31,14 @@
  * this; a future schema migration could move it to the DB).
  */
 import { computed, ref, onMounted, watch, h, type Component } from 'vue'
-import { NButton, NInput, NScrollbar, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
+import { NButton, NCheckbox, NInput, NScrollbar, NTag, NSpin, NDropdown, useMessage, useDialog, useNotification } from 'naive-ui'
 import {
   state, createSession, deleteSessionById, renameSession, switchSession,
-  loadProjects, setActiveProject,
+  loadProjects, setActiveProject, jumpToSearchResult,
 } from '../stores/chat'
 import * as api from '../api/client'
 import type { DropdownMenuProps, DropdownOption } from 'naive-ui'
-import { checkUpdate, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE } from '../api/update'
+import { checkUpdate, clearUpdateCache, downloadUpdate, installDownloadedUpdate, SOFTWARE_RELEASE_PAGE, UpdateVersionChangedError } from '../api/update'
 import type { UpdateArtifact, UpdateDownloadResult, UpdateInfo } from '../api/update'
 import type { SearchResult, Session } from '../api/client'
 import AppModal from './AppModal.vue'
@@ -46,11 +46,12 @@ import ProjectSwitcher from './ProjectSwitcher.vue'
 import TokenStatsModal from './TokenStatsModal.vue'
 import { suggestFilename, dedupeFilename, type ExportFormat } from '../utils/export'
 import { displaySessionTitle, sessionSourceFromID } from '../im/sessionSource'
+import { normalizeSessionTags } from '../utils/sessionTags'
 import {
   Plus, BarChart3, Settings, Info, Bell, Globe, Folder, FolderOpen, MoreHorizontal,
   Search as SearchIcon, Pencil, X as XIcon, Pin, PinOff, Archive,
   ChevronDown, ChevronRight, Circle, MessageSquare, FileText, File,
-  Download, RotateCw, ExternalLink,
+  Download, RotateCw, ExternalLink, Tag,
 } from './icons'
 
 const APP_VERSION = __APP_VERSION__
@@ -74,9 +75,29 @@ const newProjectName = ref('')
 const newProjectPath = ref('')
 const projectNameError = ref('')
 const projectPathError = ref('')
+const canSubmitNewProject = computed(() =>
+  newProjectName.value.trim().length > 0 && newProjectPath.value.trim().length > 0,
+)
+
+function onProjectPathInput(path: string) {
+  newProjectPath.value = path
+  projectPathError.value = ''
+  if (!newProjectName.value.trim()) {
+    const base = basenameFromPath(path)
+    if (base && base !== '新项目') {
+      newProjectName.value = base
+      projectNameError.value = ''
+    }
+  }
+}
 const showConfirmDeleteProject = ref(false)
 const showAbout = ref(false)
 const showRename = ref(false)
+const showTags = ref(false)
+const tagSessionId = ref('')
+const tagDraft = ref('')
+const editingTags = ref<string[]>([])
+const activeTag = ref('')
 const renameId = ref('')
 const renameTitle = ref('')
 const showExport = ref(false)
@@ -85,6 +106,9 @@ const exportFormat = ref<ExportFormat>('pdf')
 const exportSaving = ref(false)
 const updateInfo = ref<UpdateInfo | null>(null)
 const downloadedUpdate = ref<UpdateDownloadResult | null>(null)
+let closeDownloadedUpdateNotice: (() => void) | null = null
+const updateChecking = ref(false)
+const updateCheckFailed = ref(false)
 const updateDownloading = ref(false)
 const updateInstalling = ref(false)
 const pendingDeleteSessionId = ref('')
@@ -103,7 +127,13 @@ const showOlderExpanded = ref(false)
 // ---------------------------------------------------------------------------
 const PINNED_KEY = 'pchat-pinned-sessions'
 const UPDATE_NOTIFY_KEY = 'pchat-update-notified-version'
+const PREVIEW_UPDATES_KEY = 'pchat-include-prerelease-updates'
 const pinnedIds = ref<Set<string>>(new Set())
+const includePrereleaseUpdates = ref(false)
+
+try {
+  includePrereleaseUpdates.value = localStorage.getItem(PREVIEW_UPDATES_KEY) === 'true'
+} catch { /* 本地存储不可用时使用稳定版 / Use stable releases when local storage is unavailable. */ }
 
 function loadPinned() {
   try {
@@ -161,9 +191,28 @@ const sortedSessions = computed(() =>
   [...state.sessions].sort((a, b) => b.updated_at - a.updated_at),
 )
 
+const allTags = computed(() => {
+  const seen = new Set<string>()
+  const tags: string[] = []
+  for (const session of sortedSessions.value) {
+    for (const tag of session.tags || []) {
+      if (seen.has(tag)) continue
+      seen.add(tag)
+      tags.push(tag)
+    }
+  }
+  return tags
+})
+
+const listedSessions = computed(() => {
+  const tag = activeTag.value
+  if (!tag) return sortedSessions.value
+  return sortedSessions.value.filter(session => (session.tags || []).includes(tag))
+})
+
 const groupedSessions = computed(() => {
   const groups: Record<string, typeof sortedSessions.value> = {}
-  for (const s of sortedSessions.value) {
+  for (const s of listedSessions.value) {
     const k = groupKey(s.updated_at, s.id)
     if (!groups[k]) groups[k] = []
     groups[k].push(s)
@@ -276,25 +325,39 @@ function handleMenuSelect(key: string) {
 const searchQuery = ref('')
 const searchResults = ref<SearchResult[]>([])
 const searchLoading = ref(false)
+const searchError = ref('')
+const searchJumpingKey = ref('')
 let searchTimer: ReturnType<typeof setTimeout> | null = null
+let searchRequestID = 0
 
-function doSearch() {
+async function doSearch() {
   const q = searchQuery.value.trim()
   if (!q) {
     searchResults.value = []
+    searchError.value = ''
     searchLoading.value = false
     return
   }
+  const requestID = ++searchRequestID
   searchLoading.value = true
-  api.searchMessages(q, 15, state.activeProjectPath).then(
-    r => { searchResults.value = r.results; searchLoading.value = false },
-    () => { searchLoading.value = false },
-  )
+  searchError.value = ''
+  try {
+    const response = await api.searchMessages(q, 15, state.activeProjectPath)
+    if (requestID !== searchRequestID || q !== searchQuery.value.trim()) return
+    searchResults.value = response.results
+  } catch (error) {
+    if (requestID !== searchRequestID) return
+    searchResults.value = []
+    searchError.value = `搜索失败：${updateErrorMessage(error)}`
+  } finally {
+    if (requestID === searchRequestID) searchLoading.value = false
+  }
 }
 
 watch(searchQuery, () => {
   if (searchTimer) clearTimeout(searchTimer)
-  searchTimer = setTimeout(doSearch, 300)
+  searchError.value = ''
+  searchTimer = setTimeout(() => { void doSearch() }, 300)
 })
 
 watch(showAddProject, (show) => {
@@ -307,13 +370,24 @@ watch(showAddProject, (show) => {
 })
 
 function clearSearch() {
+  searchRequestID++
   searchQuery.value = ''
   searchResults.value = []
+  searchError.value = ''
 }
 
-function jumpToResult(r: SearchResult) {
-  clearSearch()
-  switchSession(r.conversation_id)
+async function jumpToResult(r: SearchResult) {
+  if (searchJumpingKey.value) return
+  const key = `${r.conversation_id}-${r.message_id}`
+  searchJumpingKey.value = key
+  try {
+    await jumpToSearchResult(r.conversation_id, r.message_id)
+    clearSearch()
+  } catch (error) {
+    message.error(`定位消息失败：${updateErrorMessage(error)}`)
+  } finally {
+    searchJumpingKey.value = ''
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +405,7 @@ function sessionMenuOptions(id: string) {
   const pinned = isPinned(id)
   return [
     actionOption('pin', pinned ? '取消置顶' : '置顶', pinned ? PinOff : Pin),
+    actionOption('tags', '标签', Tag),
     actionOption('rename', '重命名', Pencil),
     { type: 'divider' as const, key: 'd' },
     actionOption('export', '导出对话', FileText),
@@ -342,6 +417,7 @@ function sessionMenuOptions(id: string) {
 function onSessionMenu(key: string, id: string) {
   switch (key) {
     case 'pin': togglePin(id); break
+    case 'tags': openTagEditor(id); break
     case 'rename': onRename(id); break
     case 'delete': {
       // Delete needs a synthetic event so the confirmation
@@ -388,9 +464,14 @@ const recentlyExported = new Set<string>()
 const exportTarget = computed(() => state.sessions.find(s => s.id === exportSessionId.value) || null)
 const exportFilename = computed(() => suggestFilename(exportTarget.value?.title || '', exportFormat.value))
 
+const exportFromSeq = ref('')
+const exportToSeq = ref('')
+
 function openExportModal(id: string) {
   exportSessionId.value = id
   exportFormat.value = 'pdf'
+  exportFromSeq.value = ''
+  exportToSeq.value = ''
   showExport.value = true
 }
 
@@ -426,7 +507,13 @@ async function doExport(id: string, format: ExportFormat) {
     // the store, renders the selected archive format, and
     // returns the file with Content-Disposition.
     const fmtQuery = format
-    const exportURL = await api.waitForAPIURL(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}`)
+    const range = new URLSearchParams()
+    const fromSeq = exportFromSeq.value.trim()
+    const toSeq = exportToSeq.value.trim()
+    if (fromSeq) range.set('from_seq', fromSeq)
+    if (toSeq) range.set('to_seq', toSeq)
+    const rangeQuery = range.toString()
+    const exportURL = await api.waitForAPIURL(`/api/v1/sessions/${encodeURIComponent(id)}/export?format=${fmtQuery}${rangeQuery ? '&' + rangeQuery : ''}`)
     const resp = await fetch(exportURL, {
       method: 'GET',
     })
@@ -603,6 +690,52 @@ async function confirmDeleteProject() {
   showConfirmDeleteProject.value = false
 }
 
+function openTagEditor(id: string) {
+  const session = state.sessions.find(item => item.id === id)
+  if (!session) return
+  tagSessionId.value = id
+  editingTags.value = [...(session.tags || [])]
+  tagDraft.value = ''
+  showTags.value = true
+}
+
+function addEditingTag() {
+  const next = normalizeSessionTags([...editingTags.value, tagDraft.value])
+  if (next.error) {
+    message.warning(next.error)
+    return
+  }
+  editingTags.value = next.tags
+  tagDraft.value = ''
+}
+
+function removeEditingTag(tag: string) {
+  editingTags.value = editingTags.value.filter(item => item !== tag)
+}
+
+async function saveTags() {
+  const id = tagSessionId.value
+  if (!id) return
+  const next = normalizeSessionTags(editingTags.value)
+  if (next.error) {
+    message.warning(next.error)
+    return
+  }
+  try {
+    const updated = await api.updateSessionMeta(id, { tags: next.tags })
+    const session = state.sessions.find(item => item.id === id)
+    if (session) session.tags = updated.tags || []
+    if (activeTag.value && !allTags.value.includes(activeTag.value)) activeTag.value = ''
+    showTags.value = false
+  } catch (error: any) {
+    message.error(`保存标签失败：${error?.message || error}`)
+  }
+}
+
+function toggleTagFilter(tag: string) {
+  activeTag.value = activeTag.value === tag ? '' : tag
+}
+
 async function onRename(id: string) {
   const s = state.sessions.find(s => s.id === id)
   if (!s) return
@@ -655,14 +788,7 @@ async function onAddProject() {
 async function pickDirectory() {
   try {
     const { path } = await api.pickFolder()
-    if (path) {
-      newProjectPath.value = path
-      projectPathError.value = ''
-      if (!newProjectName.value.trim()) {
-        newProjectName.value = basenameFromPath(path)
-        projectNameError.value = ''
-      }
-    }
+    if (path) onProjectPathInput(path)
   } catch (e: any) {
     message.error(e.message || '选取目录失败')
   }
@@ -836,6 +962,7 @@ function notifyUpdateAvailable(info: UpdateInfo) {
 }
 
 function notifyDownloadedUpdate(update: UpdateDownloadResult) {
+  closeDownloadedUpdateNotice?.()
   const packageLabel = updateArtifactLabel(update)
   let close: (() => void) | null = null
   const notice = notification.success({
@@ -851,7 +978,8 @@ function notifyDownloadedUpdate(update: UpdateDownloadResult) {
         disabled: updateInstalling.value,
         onClick: () => {
           close?.()
-          confirmRestartUpdate(update)
+          closeDownloadedUpdateNotice = null
+          if (downloadedUpdate.value?.downloadPath === update.downloadPath) confirmRestartUpdate(update)
         },
       },
       {
@@ -861,16 +989,45 @@ function notifyDownloadedUpdate(update: UpdateDownloadResult) {
     ),
   })
   close = () => notice.destroy()
+  closeDownloadedUpdateNotice = close
+}
+
+function clearDownloadedUpdate() {
+  downloadedUpdate.value = null
+  closeDownloadedUpdateNotice?.()
+  closeDownloadedUpdateNotice = null
 }
 
 async function refreshUpdate(force = false, notify = false) {
-  const info = await checkUpdate(force)
-  if (!info) return
+  const requestID = ++updateCheckRequestID
+  const includePrerelease = includePrereleaseUpdates.value
+  updateChecking.value = true
+  const info = await checkUpdate(force, includePrerelease)
+  if (requestID !== updateCheckRequestID || includePrerelease !== includePrereleaseUpdates.value) return
+  updateChecking.value = false
+  updateCheckFailed.value = !info
+  if (!info) {
+    updateInfo.value = null
+    clearDownloadedUpdate()
+    return
+  }
   updateInfo.value = info
   if (!info.hasUpdate || info.latest !== downloadedUpdate.value?.latest) {
-    downloadedUpdate.value = null
+    clearDownloadedUpdate()
   }
   if (notify) notifyUpdateAvailable(info)
+}
+
+let updateCheckRequestID = 0
+
+function onUpdateChannelChange(checked: boolean) {
+  includePrereleaseUpdates.value = checked
+  try { localStorage.setItem(PREVIEW_UPDATES_KEY, String(checked)) } catch { /* 本地存储不可用时仅当前窗口生效 / Keep this window's choice when storage is unavailable. */ }
+  clearUpdateCache()
+  updateInfo.value = null
+  clearDownloadedUpdate()
+  updateCheckFailed.value = false
+  void refreshUpdate(true)
 }
 
 async function openUpdateURL() {
@@ -919,19 +1076,27 @@ async function onDownloadUpdate() {
 
   updateDownloading.value = true
   try {
-    const result = await downloadUpdate()
+    const result = await downloadUpdate(includePrereleaseUpdates.value, info.latest)
     downloadedUpdate.value = result
     updateInfo.value = result
     notifyDownloadedUpdate(result)
   } catch (err) {
-    message.error(`下载更新失败: ${updateErrorMessage(err)}`)
+    if (err instanceof UpdateVersionChangedError) {
+      clearUpdateCache()
+      updateInfo.value = null
+      clearDownloadedUpdate()
+      message.warning('更新版本已变化，正在重新检查，请确认后再下载')
+      await refreshUpdate(true)
+    } else {
+      message.error(`下载更新失败: ${updateErrorMessage(err)}`)
+    }
   } finally {
     updateDownloading.value = false
   }
 }
 
 function confirmRestartUpdate(update = downloadedUpdate.value) {
-  if (!update) return
+  if (!update || downloadedUpdate.value?.downloadPath !== update.downloadPath) return
   const busyText = hasUpdateBlockingWork.value
     ? '当前仍有会话或后台任务运行，重启会中断这些任务。'
     : ''
@@ -945,7 +1110,7 @@ function confirmRestartUpdate(update = downloadedUpdate.value) {
 }
 
 async function installUpdateNow(update = downloadedUpdate.value) {
-  if (!update) return
+  if (!update || downloadedUpdate.value?.downloadPath !== update.downloadPath) return
   updateInstalling.value = true
   try {
     await installDownloadedUpdate(update)
@@ -1016,17 +1181,38 @@ onMounted(() => {
         </button>
       </div>
 
+      <div v-if="!searchQuery.trim() && allTags.length" class="tag-filters">
+        <button
+          type="button"
+          class="tag-filter"
+          :class="{ 'tag-filter--active': !activeTag }"
+          @click="activeTag = ''"
+        >全部</button>
+        <button
+          v-for="tag in allTags"
+          :key="tag"
+          type="button"
+          class="tag-filter"
+          :class="{ 'tag-filter--active': activeTag === tag }"
+          @click="toggleTagFilter(tag)"
+        >{{ tag }}</button>
+      </div>
+
       <NScrollbar class="session-scroll">
         <!-- Search results -->
         <div v-if="searchQuery.trim()" class="search-results">
-          <NSpin :show="searchLoading" size="small">
-            <div v-if="searchResults.length === 0 && !searchLoading" class="search-empty">
+          <NSpin :show="searchLoading || !!searchJumpingKey" size="small">
+            <div v-if="searchError && !searchLoading" class="search-empty search-error">
+              {{ searchError }}
+            </div>
+            <div v-else-if="searchResults.length === 0 && !searchLoading" class="search-empty">
               无匹配结果
             </div>
             <div
               v-for="r in searchResults"
               :key="`${r.conversation_id}-${r.message_id}`"
               class="search-result-item"
+              :class="{ 'is-locating': searchJumpingKey === `${r.conversation_id}-${r.message_id}` }"
               @click="jumpToResult(r)"
             >
               <div class="result-header">
@@ -1040,6 +1226,9 @@ onMounted(() => {
 
         <!-- Session list, grouped by relative time. -->
         <div v-else class="session-list">
+          <div v-if="activeTag && groupedSessions.length === 0" class="search-empty">
+            没有带「{{ activeTag }}」的会话
+          </div>
           <template v-for="group in groupedSessions" :key="group.key">
             <div class="group">
               <div class="group-header">
@@ -1068,6 +1257,12 @@ onMounted(() => {
                       <span>{{ sessionSourceFromID(s.id)?.label }}</span>
                     </span>
                     <span class="item-title">{{ sessionDisplayTitle(s) }}</span>
+                    <span
+                      v-for="tag in (s.tags || []).slice(0, 2)"
+                      :key="tag"
+                      class="item-tag"
+                    >{{ tag }}</span>
+                    <span v-if="(s.tags || []).length > 2" class="item-tag">+{{ (s.tags || []).length - 2 }}</span>
                     <span v-if="state.streaming[s.id]" class="streaming-dot" title="正在生成" aria-label="正在生成">
                       <Circle :size="7" fill="currentColor" />
                     </span>
@@ -1158,37 +1353,31 @@ onMounted(() => {
       size="md"
     >
       <div class="add-project-form">
-        <p class="add-project-lead">
-          选择一个本地项目根目录，后续会话会自动归入该项目空间。
-        </p>
+        <p class="add-project-lead">选择本地根目录，之后的会话会归到这个项目。</p>
         <div class="form-field">
           <label for="add-project-path">项目路径</label>
           <div class="path-row">
             <NInput
               id="add-project-path"
-              v-model:value="newProjectPath"
+              :value="newProjectPath"
               size="small"
               placeholder="例如：D:\Workspace\P-Chat"
               class="path-input"
               :status="projectPathError ? 'error' : undefined"
-              @update:value="projectPathError = ''"
+              @update:value="onProjectPathInput"
               @keyup.enter="onAddProject"
             />
-            <NButton
-              size="small"
-              secondary
+            <button
+              type="button"
               class="path-browse"
               title="选择目录"
+              aria-label="选择目录"
               @click="pickDirectory"
             >
-              <template #icon>
-                <FolderOpen :size="14" />
-              </template>
-              浏览
-            </NButton>
+              <FolderOpen :size="14" />
+            </button>
           </div>
           <p v-if="projectPathError" class="field-error">{{ projectPathError }}</p>
-          <p v-else class="field-hint">选择项目的根目录（含源代码的那一层）</p>
         </div>
         <div class="form-field">
           <label for="add-project-name">项目名称</label>
@@ -1203,20 +1392,11 @@ onMounted(() => {
           />
           <p v-if="projectNameError" class="field-error">{{ projectNameError }}</p>
         </div>
-        <div class="project-create-notes" aria-label="项目创建说明">
-          <div class="project-create-note">
-            <Circle :size="8" />
-            <span>仅登记本地目录，不修改项目文件</span>
-          </div>
-          <div class="project-create-note">
-            <Circle :size="8" />
-            <span>存在 AGENTS.md 时，会在项目会话中作为上下文读取</span>
-          </div>
-        </div>
+        <p class="add-project-note">只登记目录，不修改文件。目录里有 AGENTS.md 时，会作为项目上下文。</p>
       </div>
       <template #footer>
         <NButton size="small" quaternary @click="showAddProject = false">取消</NButton>
-        <NButton size="small" type="primary" @click="onAddProject">新建项目</NButton>
+        <NButton size="small" type="primary" :disabled="!canSubmitNewProject" @click="onAddProject">新建项目</NButton>
       </template>
     </AppModal>
 
@@ -1245,6 +1425,32 @@ onMounted(() => {
       <template #footer>
         <NButton size="small" quaternary @click="showConfirmDeleteProject = false">取消</NButton>
         <NButton size="small" type="error" @click="confirmDeleteProject">删除</NButton>
+      </template>
+    </AppModal>
+
+    <AppModal
+      v-model:show="showTags"
+      title="会话标签"
+      size="sm"
+    >
+      <div class="tag-editor">
+        <button
+          v-for="tag in editingTags"
+          :key="tag"
+          type="button"
+          class="tag-editor-chip"
+          @click="removeEditingTag(tag)"
+        >{{ tag }} ×</button>
+        <span v-if="editingTags.length === 0" class="tag-editor-empty">还没有标签</span>
+      </div>
+      <NInput
+        v-model:value="tagDraft"
+        placeholder="输入标签后回车，最多 8 个"
+        @keyup.enter="addEditingTag"
+      />
+      <template #footer>
+        <NButton size="small" quaternary @click="showTags = false">取消</NButton>
+        <NButton size="small" type="primary" @click="saveTags">保存</NButton>
       </template>
     </AppModal>
 
@@ -1303,6 +1509,10 @@ onMounted(() => {
             </span>
           </button>
         </div>
+        <div class="export-range">
+          <NInput v-model:value="exportFromSeq" placeholder="起始序号，可空" />
+          <NInput v-model:value="exportToSeq" placeholder="结束序号，可空" />
+        </div>
       </div>
       <template #footer>
         <NButton size="small" quaternary :disabled="exportSaving" @click="showExport = false">取消</NButton>
@@ -1322,9 +1532,20 @@ onMounted(() => {
         <p class="about-desc">Go + Vue 3 + Vite + SQLite · Wails v2</p>
         <p class="about-desc">OpenAI / Anthropic 双协议 · ReAct 工具调用循环</p>
 
+        <div class="update-channel">
+          <NCheckbox
+            v-model:checked="includePrereleaseUpdates"
+            :disabled="updateDownloading || updateInstalling"
+            @update:checked="onUpdateChannelChange"
+          >接收预览版本（Beta）</NCheckbox>
+          <NButton size="tiny" quaternary :loading="updateChecking" @click="refreshUpdate(true)">重新检查</NButton>
+        </div>
+        <p class="update-channel-hint">默认只检查稳定版；勾选后也会检查和下载较新的 Beta 版本。</p>
+
         <template v-if="updateInfo">
           <div v-if="updateInfo.hasUpdate" class="update-banner">
             <NTag type="warning" size="small">发现新版本</NTag>
+            <NTag v-if="updateInfo.channel === 'beta'" type="info" size="small">Beta 预览版</NTag>
             <p>最新版本 <strong>{{ versionLabel(updateInfo.latest) }}</strong></p>
             <p class="update-body" v-if="updateInfo.body">{{ updateInfo.body }}</p>
             <p class="update-meta">{{ updatePackageSummary(updateInfo) }}</p>
@@ -1385,8 +1606,9 @@ onMounted(() => {
               </NButton>
             </div>
           </div>
-          <p v-else class="update-ok">当前已是最新版本 {{ versionLabel(updateInfo.current || APP_VERSION) }}</p>
+          <p v-else class="update-ok">当前没有可用的{{ includePrereleaseUpdates ? '稳定版或 Beta' : '稳定版' }}更新（版本 {{ versionLabel(updateInfo.current || APP_VERSION) }}）</p>
         </template>
+        <p v-else-if="updateCheckFailed" class="update-ok">检查更新失败，请点击“重新检查”。</p>
         <p v-else class="update-ok">正在检查更新…</p>
 
         <button type="button" class="about-docs" @click="openDocs">
@@ -1411,7 +1633,7 @@ onMounted(() => {
   width: var(--sidebar-width);
   min-width: 0;
   background: var(--surface-1);
-  border-right: 1px solid var(--border-subtle);
+  border-right: none;
   display: flex;
   flex-shrink: 0;
   overflow: hidden;
@@ -1439,13 +1661,19 @@ onMounted(() => {
   align-items: stretch;
   gap: var(--space-2);
   flex-shrink: 0;
-  border-bottom: 1px solid var(--border-subtle);
 }
 /* --- Search bar -------------------------------------------------------- */
 .search-bar {
-  padding: var(--space-3) var(--space-3) var(--space-2);
-  border-bottom: 1px solid var(--border-subtle);
+  padding: 0 var(--space-3) var(--space-2);
   flex-shrink: 0;
+}
+.search-bar :deep(.n-input) {
+  --n-border: 1px solid transparent;
+  --n-border-hover: 1px solid transparent;
+  --n-border-focus: var(--control-focus-border);
+  --n-box-shadow-focus: var(--control-focus-ring);
+  --n-color: var(--surface-2);
+  --n-color-focus: var(--surface-2);
 }
 .search-bar :deep(.search-icon) { color: var(--text-tertiary); }
 
@@ -1465,8 +1693,8 @@ onMounted(() => {
   /* Calm outline CTA — avoid large saturated brand fill */
   background: var(--surface-2);
   color: var(--text-primary);
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
@@ -1476,9 +1704,9 @@ onMounted(() => {
     color var(--dur-fast) var(--ease-out);
 }
 .new-session-btn:hover {
-  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-2));
-  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
-  color: var(--brand-600);
+  background: var(--surface-3);
+  border-color: transparent;
+  color: var(--text-primary);
 }
 .new-session-btn:active {
   background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-2));
@@ -1491,6 +1719,60 @@ onMounted(() => {
 }
 .session-list { padding: 4px 8px 8px; }
 .group { margin-bottom: 4px; }
+.tag-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 0 var(--space-3) var(--space-2);
+}
+.tag-filter {
+  border: var(--control-border);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.4;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.tag-filter--active {
+  color: var(--text-primary);
+  border-color: var(--border-default);
+  background: color-mix(in srgb, var(--brand-500) 8%, transparent);
+}
+.item-tag {
+  flex-shrink: 0;
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 999px;
+  padding: 0 6px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--text-secondary);
+  background: var(--surface-3);
+}
+.tag-editor {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 28px;
+  margin-bottom: var(--space-2);
+}
+.tag-editor-chip {
+  border: 1px solid var(--border-default);
+  background: var(--surface-2);
+  color: var(--text-primary);
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+.tag-editor-empty {
+  color: var(--text-tertiary);
+  font-size: 12px;
+}
 .group-header {
   display: flex;
   align-items: center;
@@ -1659,11 +1941,13 @@ onMounted(() => {
   cursor: pointer; background: var(--surface-2); transition: background var(--dur-fast) var(--ease-out);
 }
 .search-result-item:hover { background: var(--surface-3); }
+.search-result-item.is-locating { opacity: 0.72; cursor: progress; }
 .result-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
 .result-title { font-size: 12px; font-weight: 600; }
 .result-time { font-size: 10px; color: var(--text-tertiary); }
 .result-snippet { font-size: 12px; color: var(--text-secondary); line-height: 1.4; white-space: pre-wrap; word-break: break-all; }
 .search-empty { text-align: center; padding: 24px; color: var(--text-tertiary); font-size: 13px; }
+.search-error { color: var(--error-500); }
 
 /* --- Footer user card ------------------------------------------------- */
 .user-card {
@@ -1671,8 +1955,7 @@ onMounted(() => {
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 10px 12px;
-  border-top: 1px solid var(--border-subtle);
+  padding: 12px;
   background: var(--surface-1);
   flex-shrink: 0;
 }
@@ -1736,12 +2019,18 @@ onMounted(() => {
 .add-project-form {
   display: flex;
   flex-direction: column;
-  gap: var(--space-5);
+  gap: var(--space-4);
 }
 .add-project-lead {
   margin: 0;
   color: var(--text-secondary);
   font-size: 12.5px;
+  line-height: 1.5;
+}
+.add-project-note {
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: 12px;
   line-height: 1.5;
 }
 .form-field {
@@ -1763,37 +2052,41 @@ onMounted(() => {
 }
 .path-row {
   display: flex;
-  gap: var(--space-2);
-  align-items: center;
+  align-items: stretch;
   min-width: 0;
+  border: var(--control-border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-input);
+  overflow: hidden;
+}
+.path-row:focus-within {
+  border: var(--control-focus-border);
+  box-shadow: var(--control-focus-ring);
 }
 .path-input { flex: 1; min-width: 0; }
+.path-row :deep(.n-input) {
+  --n-border: 1px solid transparent;
+  --n-border-hover: 1px solid transparent;
+  --n-border-focus: 1px solid transparent;
+  --n-box-shadow-focus: none;
+  --n-color: transparent;
+  --n-color-focus: transparent;
+}
 .path-browse {
-  flex-shrink: 0;
-  height: var(--control-height) !important;
-  padding: 0 var(--space-3);
-}
-.project-create-notes {
-  display: grid;
-  gap: var(--space-2);
-  padding: var(--space-3);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  background: color-mix(in srgb, var(--surface-2) 82%, transparent);
-}
-.project-create-note {
-  display: flex;
+  flex: 0 0 var(--control-height);
+  width: var(--control-height);
+  display: inline-flex;
   align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.45;
+  justify-content: center;
+  border: none;
+  border-left: var(--control-border);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
 }
-.project-create-note svg {
-  flex: 0 0 auto;
-  color: var(--brand-500);
-  fill: currentColor;
+.path-browse:hover {
+  background: var(--surface-2);
+  color: var(--text-primary);
 }
 .field-hint {
   margin: 0;
@@ -1844,6 +2137,12 @@ onMounted(() => {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: var(--space-3);
+}
+.export-range {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
 }
 .export-format-card {
   display: flex;
@@ -1917,6 +2216,16 @@ onMounted(() => {
 }
 .about-version { font-size: 12.5px; color: var(--text-tertiary); margin: 0 0 10px; }
 .about-desc { font-size: 12.5px; color: var(--text-secondary); margin: 0 0 3px; line-height: 1.45; }
+.update-channel {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+.update-channel-hint { margin: var(--space-1) 0; color: var(--text-tertiary); font-size: 12px; line-height: 1.45; }
 .update-banner {
   margin: var(--space-3) 0;
   padding: var(--space-3);

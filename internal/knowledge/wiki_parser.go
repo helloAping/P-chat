@@ -4,6 +4,25 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
+)
+
+type extractedTextCacheEntry struct {
+	size    int64
+	modNano int64
+	text    string
+}
+
+var extractedTextCache = struct {
+	sync.Mutex
+	entries    map[string]extractedTextCacheEntry
+	totalBytes int
+}{entries: make(map[string]extractedTextCacheEntry)}
+
+const (
+	maxExtractedTextCacheEntries   = 64
+	maxExtractedTextCacheBytes     = 32 << 20
+	maxExtractedTextCacheEntrySize = 4 << 20
 )
 
 // headingRe matches H1-H3 markdown headings. Level is controlled by includeLevel.
@@ -69,8 +88,8 @@ func BuildHeadingTree(text string, includeLevel int) []*HeadingNode {
 	}
 
 	var roots []*HeadingNode
-	var leaf *HeadingNode          // current deepest node collecting text
-	var stack []*HeadingNode       // path from root to leaf
+	var leaf *HeadingNode    // current deepest node collecting text
+	var stack []*HeadingNode // path from root to leaf
 	preambleDone := false
 
 	flushLeaf := func() {
@@ -177,20 +196,73 @@ func WalkHeadingTree(roots []*HeadingNode, fn func(*HeadingNode)) {
 // ReadFileText reads a file and returns its text content, dispatching
 // PDFs and Office documents through their respective extractors.
 func ReadFileText(path string) (string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	key := path
+	if cached, ok := lookupExtractedTextCache(key, info.Size(), info.ModTime().UnixNano()); ok {
+		return cached, nil
+	}
 	ext := strings.ToLower("")
 	if dot := strings.LastIndex(path, "."); dot >= 0 {
 		ext = strings.ToLower(path[dot:])
 	}
+	var text string
 	switch {
 	case ext == ".pdf":
-		return ExtractPDFText(path)
+		text, err = ExtractPDFText(path)
 	case ext == ".docx", ext == ".docm", ext == ".xlsx", ext == ".xlsm", ext == ".pptx", ext == ".pptm":
-		return ExtractOfficeText(path)
+		text, err = ExtractOfficeText(path)
 	default:
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return "", err
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return "", readErr
 		}
-		return string(data), nil
+		text = string(data)
 	}
+	if err != nil {
+		return "", err
+	}
+	storeExtractedTextCache(key, info.Size(), info.ModTime().UnixNano(), text)
+	return text, nil
+}
+
+func lookupExtractedTextCache(path string, size, modNano int64) (string, bool) {
+	extractedTextCache.Lock()
+	defer extractedTextCache.Unlock()
+	entry, ok := extractedTextCache.entries[path]
+	if !ok {
+		return "", false
+	}
+	if entry.size != size || entry.modNano != modNano {
+		extractedTextCache.totalBytes -= len(entry.text)
+		delete(extractedTextCache.entries, path)
+		return "", false
+	}
+	return entry.text, true
+}
+
+func storeExtractedTextCache(path string, size, modNano int64, text string) {
+	extractedTextCache.Lock()
+	defer extractedTextCache.Unlock()
+	if len(text) > maxExtractedTextCacheEntrySize {
+		return
+	}
+	if previous, ok := extractedTextCache.entries[path]; ok {
+		extractedTextCache.totalBytes -= len(previous.text)
+		delete(extractedTextCache.entries, path)
+	}
+	for len(extractedTextCache.entries) >= maxExtractedTextCacheEntries || extractedTextCache.totalBytes+len(text) > maxExtractedTextCacheBytes {
+		for key := range extractedTextCache.entries {
+			extractedTextCache.totalBytes -= len(extractedTextCache.entries[key].text)
+			delete(extractedTextCache.entries, key)
+			break
+		}
+		if len(extractedTextCache.entries) == 0 {
+			break
+		}
+	}
+	extractedTextCache.entries[path] = extractedTextCacheEntry{size: size, modNano: modNano, text: text}
+	extractedTextCache.totalBytes += len(text)
 }

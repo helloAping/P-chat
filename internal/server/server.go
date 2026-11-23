@@ -18,7 +18,6 @@ import (
 	"github.com/p-chat/pchat/internal/agent"
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
-	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
@@ -31,13 +30,14 @@ import (
 )
 
 type Server struct {
-	cfg      *config.Config
-	agent    *agent.Agent
-	store    *memory.Store
-	styleMgr *style.Manager
-	engine   *gin.Engine
-	handler  *Handler
-	srv      *http.Server
+	cfg        *config.Config
+	configPath string
+	agent      *agent.Agent
+	store      *memory.Store
+	styleMgr   *style.Manager
+	engine     *gin.Engine
+	handler    *Handler
+	srv        *http.Server
 
 	// rulesWatchStop stops the file watcher that polls the
 	// rules directories for changes. Started in
@@ -68,12 +68,6 @@ func (s *Server) Handler() *Handler { return s.handler }
 // server. Call this after New() and before Run().
 func (s *Server) SetBrowserManager(bm *browser.Manager) {
 	s.handler.SetBrowserManager(bm)
-}
-
-// SetIMGateway 挂载 IM Gateway。
-// SetIMGateway wires the IM Gateway into server handlers.
-func (s *Server) SetIMGateway(gateway *im.Gateway) {
-	s.handler.SetIMGateway(gateway)
 }
 
 // SetSubagentRunner wires the sub-agent runner for config hot reloads.
@@ -107,6 +101,16 @@ func NewWithStaticDir(cfg *config.Config, agt *agent.Agent, store *memory.Store,
 // production pchat-server passes http.FS(embeddedWebFS) so the
 // frontend ships inside the binary and works from any CWD.
 func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticFS http.FileSystem, mcpMgr *mcp.Manager) *Server {
+	return NewWithStaticFSAndConfigPath(cfg, agt, store, styleMgr, toolReg, staticFS, mcpMgr, "")
+}
+
+// NewWithStaticFSAndConfigPath 使用显式配置 overlay 路径构造服务器。
+// NewWithStaticFSAndConfigPath constructs a server with an explicit config
+// overlay path.
+// 旧构造器传入空路径以保留全局配置行为；pchat-server 传入 --config，确保写入与热重载使用同一 overlay。
+// Existing constructors pass an empty path to retain global-config behavior;
+// pchat-server passes --config so writes and hot reloads use the same overlay.
+func NewWithStaticFSAndConfigPath(cfg *config.Config, agt *agent.Agent, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, staticFS http.FileSystem, mcpMgr *mcp.Manager, configPath string) *Server {
 	if os.Getenv("PC_HTTP_DEBUG") == "1" {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -149,7 +153,10 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 	// ctx via trace.FromContext.
 	r.Use(traceIDMiddleware())
 
-	h := NewHandler(agt, cfg, store, styleMgr, toolReg, mcpMgr)
+	h := NewHandlerWithConfigPath(agt, cfg, store, styleMgr, toolReg, mcpMgr, configPath)
+	fileJournal := tool.NewFileJournal()
+	h.SetFileJournal(fileJournal)
+	agt.SetFileJournal(fileJournal)
 
 	// Wire the summarizer so /compress and auto-compact work.
 	if lc := agt.LLM(); lc != nil && cfg.LLM.Default != "" {
@@ -170,6 +177,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/styles", h.CreateStyle)
 		api.GET("/styles/:id", h.GetStyle)
 		api.PATCH("/styles/:id", h.UpdateStyle)
+		api.POST("/styles/:id/memory-line/delete", h.DeleteStyleMemoryLine)
 		api.DELETE("/styles/:id", h.DeleteStyle)
 		// stylegen: generate / optimize an AI style from the current
 		// conversation. POST submits a background job (202 {job_id}),
@@ -206,6 +214,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.PATCH("/diagnostics/config", h.DiagnosticsConfigUpdate)
 		api.GET("/diagnostics/snapshot/heap", h.DiagnosticsHeapSnapshot)
 		api.GET("/diagnostics/snapshot/goroutine", h.DiagnosticsGoroutineSnapshot)
+		api.GET("/storage/gc", h.PreviewStorageGC)
+		api.POST("/storage/gc", h.RunStorageGC)
 
 		// Uploads
 		api.POST("/uploads", h.Upload)
@@ -225,6 +235,10 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 
 		// Sessions
 		api.GET("/sessions", h.ListSessions)
+		// Session-scoped instruction diagnostics use the same project
+		// root as an agent turn, instead of the server's CWD.
+		api.GET("/sessions/:id/rules", h.ListSessionRules)
+		api.GET("/sessions/:id/agents", h.GetSessionAgents)
 		api.GET("/search", h.SearchMessages)
 		api.GET("/token-stats", h.TokenStats)
 		api.POST("/sessions", h.CreateSession)
@@ -261,6 +275,11 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		// rendering happens server-side. See
 		// handler.go:ExportSession.
 		api.GET("/sessions/:id/export", h.ExportSession)
+		api.GET("/bookmarks", h.ListAllBookmarks)
+		api.GET("/sessions/:id/bookmarks", h.ListBookmarks)
+		api.GET("/sessions/:id/user-turns", h.ListUserTurns)
+		api.POST("/sessions/:id/bookmarks/:message_id", h.ToggleBookmark)
+		api.PATCH("/sessions/:id/bookmarks/:message_id", h.UpdateBookmarkNote)
 		// P1-3 / P1-4: regenerate the assistant reply for a
 		// given user message. P1-3 physically deleted
 		// everything after that user message; P1-4
@@ -303,6 +322,9 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.POST("/sessions/:id/question-response", h.QuestionResponse)
 		api.POST("/sessions/:id/confirm-response", h.ConfirmResponse)
 		api.POST("/sessions/:id/execute-plan", h.ExecutePlan)
+		api.POST("/sessions/:id/style-compare", h.StyleCompare)
+		api.POST("/sessions/:id/style-compare/adopt", h.AdoptStyleCompare)
+		api.GET("/sessions/:id/turn-changes", h.ListTurnChanges)
 		// Client-side abort: cancels the in-flight SendMessage turn
 		// so the session lock releases promptly even when the TCP
 		// connection stays open (frozen renderer).
@@ -322,6 +344,8 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.DELETE("/sessions/:id/messages", h.ClearSessionMessages)
 		api.POST("/sessions/:id/rollback", h.RollbackMessages)
 		api.POST("/sessions/:id/rollback/undo", h.UndoRollback)
+		api.GET("/sessions/:id/file-changes", h.GetFileChanges)
+		api.POST("/sessions/:id/file-changes/undo", h.UndoFileChanges)
 		api.POST("/sessions/:id/fork", h.ForkSession)
 
 		// Projects
@@ -371,6 +395,9 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/settings/web_search", h.GetWebSearchSettings)
 		api.PUT("/settings/web_search", h.UpdateWebSearchSettings)
 		api.POST("/settings/web_search/test", h.TestWebSearchConnection)
+		api.GET("/settings/web_fetch", h.GetWebFetchSettings)
+		api.PUT("/settings/web_fetch", h.UpdateWebFetchSettings)
+		api.POST("/settings/web_fetch/test", h.TestWebFetchConnection)
 
 		// Browser control
 		api.GET("/browser/status", h.BrowserStatus)
@@ -381,16 +408,6 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		api.GET("/browser/extension", h.BrowserExtensionDownload)
 		api.GET("/browser/ws", h.BrowserWebSocket)
 
-		// IM bridge
-		api.GET("/im/health", h.IMHealth)
-		api.GET("/im/config", h.GetIMConfig)
-		api.PATCH("/im/config", h.UpdateIMConfig)
-		api.POST("/im/test", h.TestIMConnection)
-		api.POST("/im/:type/test", h.TestIMConnection)
-		api.POST("/im/wechat/qr", h.StartWeChatQR)
-		api.GET("/im/wechat/qr/:id", h.PollWeChatQR)
-		api.GET("/im/events", h.IMEvents)
-		api.POST("/im/feishu/webhook", h.FeishuWebhook)
 	}
 
 	// Static files (web frontend). Both the Wails GUI and the
@@ -399,7 +416,7 @@ func NewWithStaticFS(cfg *config.Config, agt *agent.Agent, store *memory.Store, 
 		r.StaticFS("/app", staticFS)
 	}
 
-	s := &Server{cfg: cfg, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
+	s := &Server{cfg: cfg, configPath: configPath, agent: agt, store: store, styleMgr: styleMgr, engine: r, handler: h}
 	// Hot-reload rules when the user edits files in the rules
 	// directories. The agent's Reload() re-reads AGENTS.md,
 	// rules, and skills and rebuilds the cached system prompt.

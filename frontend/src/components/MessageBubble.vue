@@ -30,11 +30,12 @@
 import { computed, h, nextTick, ref, useTemplateRef, watch, type Component } from 'vue'
 import { renderMarkdown } from '../utils/markdownCache'
 import { formatMessageTime } from '../utils/format'
+import { buildTurnSummary, resolveTurnPath, shouldShowTurnSummary, turnFileLabel } from '../utils/turnSummary'
 import {
   ImageIcon, Volume2, Film, FileText, File,
-  Clipboard, Download, AlertTriangle, Undo2, GitBranch,
+  Clipboard, Download, AlertTriangle, Undo2, GitBranch, Bookmark,
   ArrowDown, ArrowUp, MoreHorizontal, Sparkles,
-  Check, Loader2, XCircle, CornerDownLeft, Maximize2, Play,
+  Check, Loader2, RotateCcw, XCircle, CornerDownLeft, Maximize2, Play,
 } from './icons'
 import RoleAvatar from './RoleAvatar.vue'
 
@@ -56,8 +57,9 @@ const renderMd = renderMarkdown
 import { NDropdown, useMessage, useDialog, type DropdownMenuProps, type DropdownOption } from 'naive-ui'
 import type { Message, MessageAttachment, MessagePart } from '../api/client'
 import * as api from '../api/client'
-import { state, regenerateMessage, fetchReplies, activateReply } from '../stores/chat'
+import { state, regenerateMessage, fetchReplies, activateReply, currentFileChangeBanner } from '../stores/chat'
 import ThinkingBlock from './ThinkingBlock.vue'
+import TurnTodoCard from './TurnTodoCard.vue'
 import SkillCallCard from './SkillCallCard.vue'
 import ToolCallCard from './ToolCallCard.vue'
 import ToolCallGroup from './ToolCallGroup.vue'
@@ -84,10 +86,16 @@ import {
 
 const dialog = useDialog()
 
-const props = defineProps<{ message: Message; streaming?: boolean }>()
+const props = defineProps<{
+  message: Message
+  streaming?: boolean
+  bookmarked?: boolean
+  replay?: { tool: string; path?: string; preview?: string }[]
+}>()
 const emit = defineEmits<{
   rollback: []
   fork: []
+  'toggle-bookmark': []
   /** Inline-edit a user message and re-send. */
 }>()
 
@@ -1001,8 +1009,58 @@ const statusLines = computed(() => {
 // Token usage badge — only show if we have it.
 const hasTokens = computed(() =>
   props.message.role === 'assistant'
-  && (props.message.tokens_in || props.message.tokens_out)
+  && (props.message.tokens_in || props.message.tokens_out
+    || props.message.cache_hit_tokens != null
+    || props.message.cache_miss_tokens != null)
 )
+
+// AE-03: hit/(hit+miss)*100 when the provider reported cache usage.
+const cacheHitRate = computed(() => {
+  if (props.message.cache_hit_tokens == null && props.message.cache_miss_tokens == null) {
+    return null
+  }
+  const hit = props.message.cache_hit_tokens ?? 0
+  const miss = props.message.cache_miss_tokens ?? 0
+  const total = hit + miss
+  if (total <= 0) return 0
+  return Math.round((hit / total) * 1000) / 10
+})
+
+const replayItems = computed(() => props.replay || [])
+const turnSummary = computed(() => {
+  if (props.message.role !== 'assistant' || props.streaming) return null
+  const summary = buildTurnSummary(props.message)
+  if (shouldShowTurnSummary(summary) || replayItems.value.length) return summary
+  return null
+})
+const replayFiles = computed(() => {
+  const seen = new Set(turnSummary.value?.files || [])
+  return replayItems.value
+    .map(item => item.path || '')
+    .filter(path => path && !seen.has(path))
+})
+const replayCommands = computed(() =>
+  replayItems.value
+    .filter(item => !item.path && item.preview)
+    .map(item => item.preview as string),
+)
+const turnFilesOpen = ref(false)
+watch(() => props.message.id, () => { turnFilesOpen.value = false })
+
+async function openTurnFile(raw: string) {
+  const full = resolveTurnPath(raw, state.activeProjectPath)
+  const desktop = typeof window !== 'undefined'
+    && typeof (window as any).go?.main?.App?.OpenExplorer === 'function'
+  if (desktop) {
+    try {
+      await api.openExplorer(full)
+      return
+    } catch { /* browser or missing path: copy instead */ }
+  }
+  const ok = await copyText(full)
+  if (ok) toast.success('已复制路径')
+  else toast.error('无法打开或复制路径')
+}
 
 // "Image not supported" — when the LLM rejects the
 // user's image with the "this model does not support
@@ -1132,6 +1190,10 @@ const isLast = computed(() => {
 const canRegenerate = computed(() =>
   props.message.role === 'assistant' && isLast.value && !props.streaming
 )
+const byteUndoHere = computed(() =>
+  props.message.role === 'assistant' && isLast.value && !!currentFileChangeBanner.value
+)
+const turnTodos = computed(() => props.message.turn_todos || [])
 // P1-4: regen siblings are loaded on demand the first
 // time the user hovers a paginated bubble. The fetch
 // is debounced via a per-bubble ref so rapid hover
@@ -1682,12 +1744,49 @@ function findPrecedingUserMessageId(): number {
             <span class="bubble-archived-label">上一版回答</span>
           </div>
 
-          <!-- Footer for assistant: tokens / elapsed -->
-          <div v-if="hasTokens" class="msg-meta">
+          <!-- Footer: turn recap + tokens / cache / elapsed (plain meta, no chip). -->
+          <div v-if="turnSummary || hasTokens || message.elapsed" class="msg-meta">
+            <span v-if="turnSummary" class="msg-meta-turn-block">
+              <button
+                v-if="turnSummary.files.length || replayFiles.length || replayCommands.length"
+                type="button"
+                class="msg-meta-turn msg-meta-turn--btn"
+                :aria-expanded="turnFilesOpen"
+                title="查看本轮改过的文件和命令"
+                @click="turnFilesOpen = !turnFilesOpen"
+              >{{ turnSummary.line || '本回合改动' }}</button>
+              <span v-else class="msg-meta-turn" :title="turnSummary.line">{{ turnSummary.line }}</span>
+              <ul v-if="turnFilesOpen && (turnSummary.files.length || replayFiles.length || replayCommands.length)" class="msg-turn-files">
+                <li v-for="file in turnSummary.files" :key="file">
+                  <button
+                    type="button"
+                    class="msg-turn-file"
+                    :title="file"
+                    @click="openTurnFile(file)"
+                  >{{ turnFileLabel(file) }}</button>
+                </li>
+                <li v-for="file in replayFiles" :key="`replay-${file}`">
+                  <button
+                    type="button"
+                    class="msg-turn-file"
+                    :title="file"
+                    @click="openTurnFile(file)"
+                  >{{ turnFileLabel(file) }}</button>
+                </li>
+                <li v-for="command in replayCommands" :key="command" class="msg-turn-file">{{ command }}</li>
+                <li v-if="!byteUndoHere" class="msg-turn-note">摘要会留下。字节撤销只作用于最近一轮，重启后不可用。</li>
+              </ul>
+            </span>
+            <span v-if="turnSummary && hasTokens" class="msg-meta-sep">·</span>
             <span v-if="message.tokens_in || message.tokens_out" class="msg-meta-tokens">
               {{ message.tokens_in || 0 }}<ArrowDown :size="10" class="msg-meta-arrow" /> / {{ message.tokens_out || 0 }}<ArrowUp :size="10" class="msg-meta-arrow" />
             </span>
-            <span v-if="message.elapsed" class="msg-elapsed">· {{ message.elapsed }}</span>
+            <span
+              v-if="cacheHitRate != null"
+              class="msg-meta-cache"
+              :title="`prompt cache 命中 ${message.cache_hit_tokens ?? 0} / 未命中 ${message.cache_miss_tokens ?? 0}`"
+            >· cache {{ cacheHitRate }}%</span>
+            <span v-if="message.elapsed" class="msg-elapsed"><template v-if="turnSummary || hasTokens || cacheHitRate != null">· </template>{{ message.elapsed }}</span>
             <span v-if="message.model" class="msg-model">· {{ message.model }}</span>
           </div>
 
@@ -1728,6 +1827,11 @@ function findPrecedingUserMessageId(): number {
         </div>
       </div>
 
+      <TurnTodoCard
+        v-if="message.role === 'user' && turnTodos.length"
+        :todos="turnTodos"
+      />
+
       <!-- 消息级操作统一停靠在正文下方；附件只保留预览、复制和下载。
            Message-level actions share one quiet footer below the content;
            attachment cards keep only preview/copy/download controls. -->
@@ -1754,34 +1858,30 @@ function findPrecedingUserMessageId(): number {
             <Check v-if="isAction('copy', 'feedback')" :size="13" :key="`copy-ok-${pulseKey}`" class="bubble-action-icon" />
             <Clipboard v-else :size="13" :key="`copy-idle-${pulseKey}`" class="bubble-action-icon" />
           </button>
-          <!-- P1-3 regenerate. Only shown on the trailing
-               assistant message (we don't allow re-running
-               a reply that's no longer the latest one).
-               Click pops the local bubble, calls the
-               /regenerate endpoint, and re-streams the new
-               reply through the regular chat store path.
-
-               Visual states (see .bubble-action-regenerate
-               + .bubble-action-regenerate--busy in <style>):
-                 - idle: pill shape, brand-coloured surface,
-                   icon + "重答" text (auto-sized to content).
-                 - busy: collapses to a 26×24 icon square with
-                   a transparent surface, so the spinner
-                   doesn't draw the eye away from the
-                   streaming reply. Width transitions smoothly
-                   via the existing --dur-fast easing. -->
+          <button
+            v-if="message.id"
+            type="button"
+            class="bubble-action-btn"
+            :class="{ 'is-feedback': bookmarked }"
+            :title="bookmarked ? '取消书签' : '加书签'"
+            :aria-label="bookmarked ? '取消书签' : '加书签'"
+            :aria-pressed="bookmarked ? 'true' : 'false'"
+            @click="emit('toggle-bookmark')"
+          >
+            <Bookmark :size="13" class="bubble-action-icon" />
+          </button>
+          <!-- Regenerate only the latest assistant reply. Icon only. -->
           <button
             v-if="canRegenerate"
             type="button"
-            class="bubble-action-btn bubble-action-regenerate"
-            :class="{ 'bubble-action-regenerate--busy': regenerating }"
+            class="bubble-action-btn"
             :disabled="regenerating"
             title="重新生成回复"
             aria-label="重新生成回复"
             @click="onRegenerate"
           >
-            <Loader2 :size="13" :class="regenerating ? 'bubble-action-icon bubble-action-icon--spin' : 'bubble-action-icon'" />
-            <span v-if="!regenerating" class="bubble-action-text">重答</span>
+            <Loader2 v-if="regenerating" :size="13" class="bubble-action-icon bubble-action-icon--spin" />
+            <RotateCcw v-else :size="13" class="bubble-action-icon" />
           </button>
           <NDropdown
             v-if="messageActionMenuOptions.length"
@@ -2012,21 +2112,26 @@ function findPrecedingUserMessageId(): number {
 }
 .msg.user .bubble--attachments .attachments {
   display: grid;
-  grid-template-columns: minmax(0, min(calc(var(--space-8) * 10), 100%));
+  grid-template-columns: minmax(0, 1fr);
   align-items: start;
   justify-content: end;
-  gap: var(--space-2);
-  margin-bottom: 0;
-  width: 100%;
+  justify-items: end;
+  gap: var(--space-1);
+  margin: 0 0 0 auto;
+  width: min(340px, 100%);
 }
-.msg.user .bubble--attachments .attachments--multi {
-  grid-template-columns: repeat(auto-fit, minmax(min(calc(var(--space-8) * 5), 100%), 1fr));
+.msg.user .bubble--attachments .attachments--multi:has(.media-thumbnail) {
+  width: min(420px, 100%);
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
+  justify-items: stretch;
 }
 .msg.user .bubble--attachments .attachments > :only-child {
   grid-column: 1 / -1;
 }
 .msg.user .bubble--attachments .user-message-caption {
   align-self: flex-end;
+  width: fit-content;
+  max-width: min(340px, 100%);
   padding: var(--space-2) var(--space-3);
   background: var(--user-bubble-bg, color-mix(in srgb, var(--brand-500) 10%, var(--surface-1)));
   color: var(--text-primary);
@@ -2042,30 +2147,20 @@ function findPrecedingUserMessageId(): number {
   display: flex;
   flex-direction: column;
   gap: 0;
-  margin: var(--space-2) 0;
+  margin: var(--space-1) 0 var(--space-2);
   padding: 0;
-  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-xs);
-  overflow: hidden;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: visible;
 }
 .event-timeline > :deep(.tool-card),
 .event-timeline > :deep(.skill-card),
 .event-timeline > :deep(.sub-agent-card),
 .event-timeline > :deep(.tool-group) {
   margin: 0;
-}
-.event-timeline > :deep(.tool-card + .tool-card),
-.event-timeline > :deep(.skill-card + .skill-card),
-.event-timeline > :deep(.tool-card + .skill-card),
-.event-timeline > :deep(.skill-card + .tool-card),
-.event-timeline > :deep(.tool-card + .sub-agent-card),
-.event-timeline > :deep(.sub-agent-card + .tool-card),
-.event-timeline > :deep(.skill-card + .sub-agent-card),
-.event-timeline > :deep(.sub-agent-card + .skill-card),
-.event-timeline > :deep(.sub-agent-card + .sub-agent-card) {
-  border-top: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
 }
 
 /* "展开全文" affordance for truncated text parts. */
@@ -2097,17 +2192,6 @@ function findPrecedingUserMessageId(): number {
   align-items: center;
   gap: var(--space-1);
   padding: 0;
-  opacity: 0;
-  transform: translateY(calc(-1 * var(--space-1)));
-  pointer-events: none;
-  transition: opacity var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
-}
-.msg:hover .bubble-actions,
-.bubble-actions:focus-within {
-  opacity: 1;
-  transform: translateY(0);
-  pointer-events: auto;
 }
 .bubble-action-btn {
   width: var(--control-height);
@@ -2115,20 +2199,17 @@ function findPrecedingUserMessageId(): number {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
-  background: var(--surface-1);
+  background: transparent;
   color: var(--text-tertiary);
   box-shadow: none;
   cursor: pointer;
   padding: 0;
-  transition: background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
+  transition: color var(--dur-fast) var(--ease-out);
 }
 .bubble-action-btn:hover {
-  background: var(--surface-2);
-  border-color: var(--border-strong);
+  background: transparent;
   color: var(--text-primary);
 }
 .bubble-action-btn:active {
@@ -2148,79 +2229,17 @@ function findPrecedingUserMessageId(): number {
  * colour is bound to --success-50 / --success-500
  * defined in style.css. */
 .bubble-action-btn.is-feedback {
-  background: var(--success-50);
+  background: transparent;
   color: var(--success-500);
   animation: bubble-action-feedback var(--dur-base) var(--ease-out);
 }
 .bubble-action-btn.is-feedback:hover {
-  background: var(--success-50);
+  background: transparent;
   color: var(--success-500);
 }
 .bubble-action-rollback:hover {
-  background: var(--warn-50);
-  color: var(--warn-500);
-}
-
-/* Regenerate is the only "primary action" in the toolbar —
- * the other buttons are icon-only utilities. To mark it as
- * the affordance the user is most likely to want next, it
- * gets a brand-coloured surface in the idle state. The
- * width: auto / padding: 0 8px / gap: 4px makes the pill
- * snug around "重答" + icon, and the min-width: 26px keeps
- * it from collapsing to nothing if the text is ever
- * localised to a wider string. The "transition: width"
- * line is what makes the pill shrink smoothly back to a
- * 26×24 square when it goes busy. */
-.bubble-action-btn.bubble-action-regenerate {
-  width: auto;
-  min-width: 26px;
-  height: 24px;
-  padding: 0 8px;
-  gap: 4px;
-  background: var(--brand-50);
-  color: var(--brand-600);
-  border: 1px solid var(--brand-100);
-  font-size: 12px;
-  font-weight: 500;
-  transition: width var(--dur-fast) var(--ease-out),
-              padding var(--dur-fast) var(--ease-out),
-              background var(--dur-fast) var(--ease-out),
-              color var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out),
-              transform var(--dur-fast) var(--ease-out);
-}
-.bubble-action-btn.bubble-action-regenerate:hover {
-  background: var(--brand-100);
-  color: var(--brand-700);
-  border-color: var(--brand-200);
-}
-.bubble-action-btn.bubble-action-regenerate--busy {
-  /* Collapse to the same 26×24 square the other icon-only
-   * buttons use, but keep the surface transparent so the
-   * spinner blends in rather than competing with the
-   * streaming reply. */
-  width: 26px;
-  padding: 0;
   background: transparent;
-  color: var(--text-tertiary);
-  border-color: transparent;
-  gap: 0;
-}
-.bubble-action-btn.bubble-action-regenerate--busy:hover {
-  background: var(--surface-3);
-  color: var(--text-primary);
-}
-.bubble-action-text {
-  line-height: 1;
-  /* Tiny slide+fade when the text reappears after a regen
-   * completes — matches the icon's own fade-in
-   * (bubble-action-icon-in) so the icon+text come back as
-   * a single unit rather than the text popping in late. */
-  animation: bubble-action-text-in var(--dur-fast) var(--ease-out);
-}
-@keyframes bubble-action-text-in {
-  from { opacity: 0; transform: translateX(-2px); }
-  to   { opacity: 1; transform: translateX(0); }
+  color: var(--warn-500);
 }
 /* Press pulse for fork: a tiny scale
  * bump that re-triggers on every :key bump from the
@@ -2327,8 +2346,7 @@ function findPrecedingUserMessageId(): number {
 }
 .media-thumbnail:hover,
 .media-thumbnail:focus-visible {
-  border-color: var(--border-strong);
-  box-shadow: var(--shadow-md);
+  box-shadow: none;
 }
 .media-thumbnail:focus-visible {
   outline: 2px solid var(--accent);
@@ -2520,11 +2538,11 @@ function findPrecedingUserMessageId(): number {
 .attachment-audio-card,
 .attachment-file-card {
   box-sizing: border-box;
-  width: min(calc(var(--space-8) * 12), 100%);
+  width: 100%;
   background: var(--surface-1);
-  border: 1px solid var(--border-default);
+  border: none;
   border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
   color: var(--text-primary);
 }
 .attachment-audio-card {
@@ -2539,15 +2557,15 @@ function findPrecedingUserMessageId(): number {
   align-items: center;
   gap: var(--space-2);
 }
-.attachment-file-card { padding: var(--space-2); }
+.attachment-file-card { padding: 6px 8px; }
 .attachment-card-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: var(--space-8);
-  height: var(--space-8);
+  width: 28px;
+  height: 28px;
   background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
+  border: none;
   border-radius: var(--radius-sm);
   color: var(--text-secondary);
   flex-shrink: 0;
@@ -2800,9 +2818,57 @@ function findPrecedingUserMessageId(): number {
   display: flex;
   gap: 4px;
   flex-wrap: wrap;
+  align-items: flex-start;
 }
 .msg-elapsed, .msg-model { color: var(--text-quaternary); }
+.msg-meta-turn {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.msg-meta-turn-block {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  max-width: 100%;
+}
+.msg-meta-turn--btn {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.msg-meta-turn--btn:hover { color: var(--text-secondary); }
+.msg-turn-files {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.msg-turn-file {
+  border: none;
+  background: transparent;
+  padding: 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+}
+.msg-turn-file:hover { color: var(--text-primary); }
+.msg-turn-note {
+  color: var(--text-quaternary);
+  font-size: 11px;
+}
+.msg-meta-sep { color: var(--text-quaternary); }
 .msg-meta-tokens { display: inline-flex; align-items: center; gap: 1px; }
+.msg-meta-cache { color: var(--accent); }
 .msg-meta-arrow { color: var(--text-quaternary); margin: 0 1px; }
 .stream-status {
   margin-bottom: 6px;

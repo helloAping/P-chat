@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -41,6 +42,8 @@ func (mockBase) GetCurrentSessionMessages(context.Context) ([]httpcli.Message, e
 func (mockBase) NewSession(context.Context, httpcli.CreateSessionOpts) (*httpcli.Session, error) {
 	return nil, nil
 }
+func (mockBase) ProjectPath() string                                 { return "" }
+func (mockBase) SetProjectPath(string) error                         { return nil }
 func (mockBase) RenameSession(context.Context, string, string) error { return nil }
 func (mockBase) DeleteSession(context.Context, string) error         { return nil }
 func (mockBase) PatchSession(context.Context, string, httpcli.SessionPatchOpts) (*httpcli.Session, error) {
@@ -153,26 +156,29 @@ func (mockBase) SetSandbox(bool)                           {}
 func (mockBase) BypassSandboxOnce()                        {}
 func (mockBase) RebuildSandbox() error                     { return nil }
 func (mockBase) ExpandList() []ToolResultView              { return nil }
-func (mockBase) ExpandByIndex(int) (ToolResultView, bool) {
-	return ToolResultView{}, false
+func (mockBase) ExpandByIndex(int) (ToolResultView, bool, error) {
+	return ToolResultView{}, false, nil
 }
-func (mockBase) ExpandLast() (ToolResultView, bool) {
-	return ToolResultView{}, false
+func (mockBase) ExpandLast() (ToolResultView, bool, error) {
+	return ToolResultView{}, false, nil
 }
 func (mockBase) SubAgentStats() (int, int, int, int, float64, bool) {
 	return 0, 0, 0, 0, 0, false
 }
-func (mockBase) MemoryStats() (int, int, string, bool)     { return 0, 0, "", false }
-func (mockBase) Flush() error                              { return nil }
-func (mockBase) ListKBs() ([]KBView, error)                { return nil, nil }
-func (mockBase) AddKB(string) error                        { return nil }
-func (mockBase) RemoveKB(string) error                     { return nil }
-func (mockBase) ScanKBs() (int, int, error)                { return 0, 0, nil }
+func (mockBase) MemoryStats() (int, int, string, bool) { return 0, 0, "", false }
+func (mockBase) Flush() error                          { return nil }
+func (mockBase) ListKBs() ([]KBView, error)            { return nil, nil }
+func (mockBase) AddKB(string) error                    { return nil }
+func (mockBase) RemoveKB(string) error                 { return nil }
+func (mockBase) ScanKBs() (int, int, error)            { return 0, 0, nil }
+func (mockBase) GetKBScanStatus(context.Context, string) (httpcli.KnowledgeScanStatus, error) {
+	return httpcli.KnowledgeScanStatus{}, nil
+}
 func (mockBase) Recall(context.Context, string, int) error { return nil }
 func (mockBase) InitProject(string) error                  { return nil }
 func (mockBase) ListSkills() ([]string, error)             { return nil, nil }
-func (mockBase) ListRules() ([]string, error)              { return nil, nil }
-func (mockBase) AgentsContext() (string, string, error)    { return "", "", nil }
+func (mockBase) ListRules() ([]RuleView, error)            { return nil, nil }
+func (mockBase) AgentsContext() (AgentsContextView, error) { return AgentsContextView{}, nil }
 
 // modelConfigShim is the real type used by cliContext's
 // AddModelFull / UpdateModel methods. The actual type
@@ -186,17 +192,18 @@ type modelConfigShim = config.ModelConfig
 // and exposes the fields each test reads back.
 type mockCtx struct {
 	mockBase
-	provider    string
-	model       string
-	sessionID   string
-	msgCount    int
-	setModelArg struct{ p, m string }
-	setProvArg  string
-	title       string
-	styleArg    string
-	modeArg     string
-	autoArg     string
-	err         error
+	provider      string
+	model         string
+	sessionID     string
+	msgCount      int
+	setModelArg   struct{ p, m string }
+	setProvArg    string
+	title         string
+	styleArg      string
+	modeArg       string
+	autoArg       string
+	err           error
+	setSessionErr error
 
 	// Recordings for additional commands.
 	clearedSessionID   string
@@ -206,6 +213,10 @@ type mockCtx struct {
 	forkedBeforeID     int64
 	kbAction           string // "list" | "add" | "remove" | "scan"
 	kbPath             string
+	kbStatusNames      []string
+	kbStatus           httpcli.KnowledgeScanStatus
+	kbStatusErr        error
+	kbs                []KBView
 	planSet            bool
 	newSessionOpts     httpcli.CreateSessionOpts
 	undoCalled         bool
@@ -213,6 +224,8 @@ type mockCtx struct {
 	sessionList        []httpcli.Session
 	forgotID           string
 	toolsEnabled       bool
+	projectPath        string
+	setProjectPathArgs []string
 	patchOpts          httpcli.SessionPatchOpts
 	compressSessionID  string
 	contextSessionID   string
@@ -270,6 +283,15 @@ func (m *mockCtx) ListAllModels(_ string) []ModelView {
 func (m *mockCtx) GetCurrentSessionID() string { return m.sessionID }
 func (m *mockCtx) SetCurrentSession(id string) error {
 	m.setSessionArg = id
+	if m.setSessionErr != nil {
+		return m.setSessionErr
+	}
+	return m.err
+}
+func (m *mockCtx) ProjectPath() string { return m.projectPath }
+func (m *mockCtx) SetProjectPath(path string) error {
+	m.setProjectPathArgs = append(m.setProjectPathArgs, path)
+	m.projectPath = path
 	return m.err
 }
 func (m *mockCtx) CurrentMessageCount() int { return m.msgCount }
@@ -283,11 +305,14 @@ func (m *mockCtx) ForgetSession(string) error {
 func (m *mockCtx) ListSkills() ([]string, error) {
 	return []string{"pchat-skill-a", "pchat-skill-b"}, m.err
 }
-func (m *mockCtx) ListRules() ([]string, error) {
-	return []string{"rule-1", "rule-2"}, m.err
+func (m *mockCtx) ListRules() ([]RuleView, error) {
+	return []RuleView{{Name: "rule-1", Scope: "global", Path: "/global/rule-1.md"}, {Name: "rule-2", Scope: "project", Path: "/project/rule-2.md"}}, m.err
 }
-func (m *mockCtx) AgentsContext() (string, string, error) {
-	return "global-agents-md", "project-agents-md", m.err
+func (m *mockCtx) AgentsContext() (AgentsContextView, error) {
+	return AgentsContextView{
+		Candidates: []httpcli.AgentsCandidate{{Label: "全局", Path: "/global/AGENTS.md", Exists: true}, {Label: "项目根", Path: "/project/AGENTS.md", Exists: true, Selected: true}},
+		Prompt:     "## Agent Instructions\n\n### Project (root)\n\nproject-agents-md\n",
+	}, m.err
 }
 func (m *mockCtx) GetCurrentSessionMessages(context.Context) ([]httpcli.Message, error) {
 	// Return a non-empty list so cmdRollback / cmdFork
@@ -361,8 +386,15 @@ func (m *mockCtx) ScanKBs() (int, int, error) {
 	m.kbAction = "scan"
 	return 0, 0, m.err
 }
+func (m *mockCtx) GetKBScanStatus(_ context.Context, name string) (httpcli.KnowledgeScanStatus, error) {
+	m.kbStatusNames = append(m.kbStatusNames, name)
+	return m.kbStatus, m.kbStatusErr
+}
 func (m *mockCtx) ListKBs() ([]KBView, error) {
 	m.kbAction = "list"
+	if m.kbs != nil {
+		return m.kbs, m.err
+	}
 	return []KBView{{Path: "/kb/a"}, {Path: "/kb/b"}}, m.err
 }
 func (m *mockCtx) SetPlanMode(on bool) error {
@@ -533,6 +565,28 @@ func TestCmdModel_Valid(t *testing.T) {
 	}
 	if ctx.setModelArg.p != "openai" || ctx.setModelArg.m != "gpt-4o-mini" {
 		t.Errorf("SetModel = %+v, want openai/gpt-4o-mini", ctx.setModelArg)
+	}
+}
+
+func TestCmdModel_FailedSelectionsDoNotSwitchProvider(t *testing.T) {
+	forms := []string{"1", "openai/gpt-4o-mini", "cs"}
+	for _, form := range forms {
+		t.Run(form, func(t *testing.T) {
+			ctx := &mockCtx{
+				provider: "openai",
+				model:    "gpt-4o",
+				err:      errors.New("model unavailable"),
+			}
+			if err := cmdModel(ctx, form); err != nil {
+				t.Fatalf("cmdModel(%q): %v", form, err)
+			}
+			if ctx.setProvArg != "" {
+				t.Fatalf("SetCurrentProvider called with %q after selection failure", ctx.setProvArg)
+			}
+			if ctx.provider != "openai" || ctx.model != "gpt-4o" {
+				t.Fatalf("current selection changed to %s/%s", ctx.provider, ctx.model)
+			}
+		})
 	}
 }
 
@@ -856,11 +910,46 @@ func TestCmdNew(t *testing.T) {
 	if err := cmdNew(ctx, ""); err != nil {
 		t.Fatalf("cmdNew: %v", err)
 	}
+	if ctx.setSessionArg != "new-sess-1234567890" {
+		t.Fatalf("current session = %q, want newly created session", ctx.setSessionArg)
+	}
 	// We don't assert on opts here because cmdNew passes a
 	// zero CreateSessionOpts{} — the call's existence is
 	// the assertion. Mocked NewSession returns a session
 	// with ID ≥ 16 chars so the [:16] slice in cmdNew is
 	// safe.
+}
+
+func TestCmdNew_ReturnsSessionSwitchError(t *testing.T) {
+	ctx := &mockCtx{setSessionErr: errors.New("switch failed")}
+	if err := cmdNew(ctx, ""); err == nil {
+		t.Fatal("cmdNew succeeded after SetCurrentSession failed")
+	}
+}
+
+func TestCmdProject_SwitchesScopeAndStartsNewSession(t *testing.T) {
+	projectDir := t.TempDir()
+	ctx := &mockCtx{projectPath: "D:/previous-project"}
+	if err := cmdProject(ctx, projectDir); err != nil {
+		t.Fatalf("cmdProject: %v", err)
+	}
+	want := filepath.Clean(projectDir)
+	if ctx.projectPath != want {
+		t.Fatalf("project path = %q, want %q", ctx.projectPath, want)
+	}
+	if ctx.setSessionArg != "new-sess-1234567890" {
+		t.Fatalf("current session = %q, want new session", ctx.setSessionArg)
+	}
+}
+
+func TestCmdProject_OffDetachesScope(t *testing.T) {
+	ctx := &mockCtx{projectPath: "D:/previous-project"}
+	if err := cmdProject(ctx, "off"); err != nil {
+		t.Fatalf("cmdProject off: %v", err)
+	}
+	if ctx.projectPath != "" {
+		t.Fatalf("project path = %q, want global scope", ctx.projectPath)
+	}
 }
 
 // =====================================================================
@@ -904,6 +993,18 @@ func TestCmdKB_Remove(t *testing.T) {
 	}
 }
 
+func TestCmdKB_MissingPathDoesNotMutateKnowledgeBases(t *testing.T) {
+	ctx := &mockCtx{}
+	for _, command := range []string{"add", "remove"} {
+		if err := cmdKB(ctx, command); err != nil {
+			t.Fatalf("cmdKB %s: %v", command, err)
+		}
+		if ctx.kbAction != "" {
+			t.Fatalf("cmdKB %s invoked %q without a path", command, ctx.kbAction)
+		}
+	}
+}
+
 func TestCmdKB_Scan(t *testing.T) {
 	ctx := &mockCtx{}
 	if err := cmdKB(ctx, "scan"); err != nil {
@@ -911,6 +1012,52 @@ func TestCmdKB_Scan(t *testing.T) {
 	}
 	if ctx.kbAction != "scan" {
 		t.Errorf("ScanKBs not called, action = %q", ctx.kbAction)
+	}
+}
+
+func TestCmdKB_StatusAfterAsyncStart(t *testing.T) {
+	ctx := &mockCtx{
+		kbs:      []KBView{{Name: "docs", Path: "/kb/docs"}},
+		kbStatus: httpcli.KnowledgeScanStatus{Message: "扫描中...", Current: 2, Total: 5},
+	}
+	if err := cmdKB(ctx, "scan"); err != nil {
+		t.Fatalf("cmdKB scan: %v", err)
+	}
+	if err := cmdKB(ctx, "status"); err != nil {
+		t.Fatalf("cmdKB status: %v", err)
+	}
+	if len(ctx.kbStatusNames) != 1 || ctx.kbStatusNames[0] != "docs" {
+		t.Fatalf("status queries = %v, want [docs]", ctx.kbStatusNames)
+	}
+}
+
+func TestFormatKBScanStatus(t *testing.T) {
+	tests := []struct {
+		name   string
+		status httpcli.KnowledgeScanStatus
+		want   string
+	}{
+		{name: "no job", status: httpcli.KnowledgeScanStatus{Chunks: 7}, want: "当前没有扫描任务（已索引 7 个节点）"},
+		{name: "running", status: httpcli.KnowledgeScanStatus{Message: "扫描中...", Current: 2, Total: 5}, want: "扫描中...（2/5，节点 0，变更 0，跳过 0，删除 0，失败 0）"},
+		{name: "done", status: httpcli.KnowledgeScanStatus{Done: true, Chunks: 9, Changed: 2}, want: "扫描完成（节点 9，变更 2，跳过 0，删除 0，失败 0）"},
+		{name: "error", status: httpcli.KnowledgeScanStatus{Done: true, Error: "读取失败", Failed: 1}, want: "扫描错误：读取失败（节点 0，变更 0，跳过 0，删除 0，失败 1）"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := formatKBScanStatus(tt.status); got != tt.want {
+				t.Fatalf("formatKBScanStatus() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCmdKBStatus_EmptyKnowledgeBasesDoesNotQueryStatus(t *testing.T) {
+	ctx := &mockCtx{kbs: []KBView{}}
+	if err := cmdKB(ctx, "status"); err != nil {
+		t.Fatalf("cmdKB status: %v", err)
+	}
+	if len(ctx.kbStatusNames) != 0 {
+		t.Fatalf("status queries = %v, want none", ctx.kbStatusNames)
 	}
 }
 

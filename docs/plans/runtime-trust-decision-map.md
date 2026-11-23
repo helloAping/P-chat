@@ -2,7 +2,7 @@
 
 状态：完成 — 全部 8 票已决策（2026-09-24）
 
-目标：让一个 Runtime Instance 只接受被明确授权的调用主体，同时保持默认本机 GUI、CLI、Web、Browser Extension 与已签名 IM webhook 可用。本文只记录待决策问题和答案；实现细节放在后续 ticket 资产中。
+目标：让一个 Runtime Instance 只接受被明确授权的调用主体，同时保持默认本机 GUI、CLI、Web 与 Browser Extension 可用。本文只记录待决策问题和答案；实现细节放在后续 ticket 资产中。
 
 ## 已确认事实
 
@@ -10,7 +10,6 @@
 - 默认监听 `127.0.0.1`，但 `server.host` 是可配置项；非 loopback 请求已有 rate limit，说明源码允许这种运行形态，却没有身份验证。
 - Web、Wails 与 Browser Extension 是三种真实 adapter：same-origin HTTP、`wails.localhost` 跨域 HTTP/SSE、`chrome-extension://` WebSocket。
 - CORS / Origin 只约束浏览器来源，不是调用主体身份；无 `Origin` 的客户端仍可访问。
-- IM webhook 不能套用普通客户端登录流程，必须继续通过各平台的签名 adapter 验证。
 - `allow_eval_write=false` 尚未形成可执行策略；这是独立的 fail-closed 修复，不应被鉴权设计长期阻塞。
 
 ## #1：非本机访问是不是正式产品能力？
@@ -44,25 +43,23 @@ Type: Discuss
 
 ### Question
 
-确定最小调用主体集合，以及每类主体能获得哪些能力。候选主体：Desktop Host、Local Web Client、CLI Client、Browser Extension、Remote Client、Signed Webhook。需要决定能力是 Runtime Profile 级长期凭证，还是 Runtime Instance 级短期 capability，及其撤销语义。
+确定最小调用主体集合，以及每类主体能获得哪些能力。候选主体：Desktop Host、Local Web Client、CLI Client、Browser Extension、Remote Client。需要决定能力是 Runtime Profile 级长期凭证，还是 Runtime Instance 级短期 capability，及其撤销语义。
 
-推荐把入口归并为四类主体，而不是每个客户端各造一套权限：
+推荐把入口归并为三类主体，而不是每个客户端各造一套权限：
 
 1. **Local Operator**：Desktop Host、同机 Web 与 CLI；默认本机体验不需要人工复制 token。
 2. **Paired Extension**：每个 Browser Extension 独立配对、独立撤销，只获得浏览器桥接能力。
 3. **Remote Operator**：用户显式创建的 Runtime Profile 级凭据，可按操作与管理能力分级。
-4. **Signed Webhook**：只允许平台签名验证后的 IM 入站，不获得通用 HTTP 能力。
 
 Runtime Instance 级短期 capability 用于自动启动的 Desktop/CLI 进程身份；Runtime Profile 级凭据只用于需要跨进程重启保持有效的配对与远程访问。
 
 ### Answer
 
-已确认（2026-09-24）：采用四类调用主体模型；Local Operator 的身份边界是持票进程，不是 loopback 网卡。
+已确认（2026-09-24，2026-10-10 随 IM 退役调整）：采用三类调用主体模型；Local Operator 的身份边界是持票进程，不是 loopback 网卡。
 
 - **Local Operator（本机操作者）**：Desktop Host、同机 Web 与 CLI。身份 = 持有 Runtime Instance 短期 capability 的本机进程；capability 由实例启动时随机生成并自动分发（spawn 环境、仅本用户可读的启动公告、Web UI 服务时注入），默认本机体验零配置、无需手工复制 token。loopback 只是 Runtime Access Mode 的网络范围，不是身份本身。该 capability 不防御同用户恶意软件（其本就能读 Data Home），防的是恶意网页与跨安全上下文越界——当前 Browser WebSocket 无 Origin 检查、DNS rebinding 可绕过 same-origin CORS 判定，"loopback 即信任"等于把浏览器控制面暴露给任何网页。
 - **Paired Extension（已配对扩展）**：每个 Browser Extension 安装独立配对、独立撤销，只获得浏览器桥接能力。配对独立于网络路径成立（扩展的 serverURL 用户可改，可能指向非本机地址）。
 - **Remote Operator（远程操作者）**：用户显式创建的 Runtime Profile 级长期凭据，仅在非本机模式存在；操作能力与管理能力可分级。不存在隐式远程主体（#1 的 fail-closed 已保证）。
-- **Signed Webhook（已签名 Webhook）**：IM 入站只经平台签名 adapter 验证（当前飞书竖切为 verification token，加密回调待补），不获得通用 HTTP 能力，也不套用 Operator 凭据。
 
 凭据生命周期：
 
@@ -75,7 +72,7 @@ Runtime Instance 级短期 capability 用于自动启动的 Desktop/CLI 进程�
 - 本机与非本机模式共用同一套主体校验路径；Runtime Access Mode 只决定凭据来源与是否允许远程主体，不改变校验逻辑本身。
 - Wails webview 不能随意加请求 header（现有 trace_id 走 body 的变通为证），WebSocket 握手也不能带自定义 header；各 adapter 的凭据传输方式由 #3 与新增 #8 分别设计，不影响本主体模型。
 - `/api/v1/health` 保持无凭据可达（父进程就绪探测与身份发现），其公开字段不得包含任何 capability。
-- 根 `CONTEXT.md` 新增规范术语：调用主体（Runtime Caller）、本机操作者（Local Operator）、已配对扩展（Paired Extension）、远程操作者（Remote Operator）、已签名 Webhook（Signed Webhook）、实例凭据（Instance Capability）、运行配置凭据（Profile Credential）。
+- 根 `CONTEXT.md` 新增规范术语：调用主体（Runtime Caller）、本机操作者（Local Operator）、已配对扩展（Paired Extension）、远程操作者（Remote Operator）、实例凭据（Instance Capability）、运行配置凭据（Profile Credential）。
 
 ## #3：Browser Extension 如何配对和撤销？
 
@@ -119,15 +116,15 @@ Type: Discuss
 
 ### Question
 
-将 route 按能力而不是按 URL 前缀分类。至少区分：公开健康探测、静态 Web、普通会话读写、配置与 secret、工具执行、诊断/pprof、Browser WebSocket、平台签名 webhook。明确每类失败默认值。
+将 route 按能力而不是按 URL 前缀分类。至少区分：公开健康探测、静态 Web、普通会话读写、配置与 secret、工具执行、诊断/pprof、Browser WebSocket。明确每类失败默认值。
 
 ### Answer
 
-已确认（2026-09-24）：八个能力类 + 主体映射 + 失败默认值。全量路由逐条分类见资产文档 [`runtime-trust-route-matrix.md`](runtime-trust-route-matrix.md)（#7 "route classification" 切片以它为准）。本轮无需提问：分类骨架由本题给定，主体映射是 #2 的直接推论，失败默认值是机械落地。
+已确认（2026-09-24，2026-10-10 随 IM 退役调整）：七个能力类 + 主体映射 + 失败默认值。全量路由逐条分类见资产文档 [`runtime-trust-route-matrix.md`](runtime-trust-route-matrix.md)（#7 "route classification" 切片以它为准）。本轮无需提问：分类骨架由本题给定，主体映射是 #2 的直接推论，失败默认值是机械落地。
 
-- **八个能力类**：P0 公开探测（health/version）、P1 静态资产（/app、扩展 zip）、IO 普通会话读写、X 工具执行（触发 agent/LLM/工具/沙箱批准的端点）、M 配置与 secret、D 诊断（含 pprof）、B 浏览器桥接 WS、S 平台签名 webhook。
-- **主体映射**：Local Operator 全能力；Paired Extension 仅 B；Remote Operator 操作级 = IO+X、管理级 = IO+X+M+D（管理级包含操作级）；Signed Webhook 仅 S。B 与 S 永不要求 Operator 凭据。
-- **失败默认值**：P0/P1 放行；IO/X 无凭据或凭据无效 → 401（`auth_required` / `auth_invalid`）；M/D 另加级别不足 → 403（`auth_forbidden`）；B 无凭据 → 待配对（#3）、凭据无效 → WS 关闭 4002；S 验签失败 → 401。SSE 在流开始前失败，流中不降级。错误形态统一 `{error, error_kind}`。
+- **七个能力类**：P0 公开探测（health/version）、P1 静态资产（/app、扩展 zip）、IO 普通会话读写、X 工具执行（触发 agent/LLM/工具/沙箱批准的端点）、M 配置与 secret、D 诊断（含 pprof）、B 浏览器桥接 WS。
+- **主体映射**：Local Operator 全能力；Paired Extension 仅 B；Remote Operator 操作级 = IO+X、管理级 = IO+X+M+D（管理级包含操作级）。B 永不要求 Operator 凭据。
+- **失败默认值**：P0/P1 放行；IO/X 无凭据或凭据无效 → 401（`auth_required` / `auth_invalid`）；M/D 另加级别不足 → 403（`auth_forbidden`）；B 无凭据 → 待配对（#3）、凭据无效 → WS 关闭 4002。SSE 在流开始前失败，流中不降级。错误形态统一 `{error, error_kind}`。
 - **关键裁定**：
   - pprof 默认值从"开"翻转为"关"（`PC_PPROF=1` opt-in），开启后仍按 D 类要求管理级凭据；
   - `GET /providers*` 当前回传明文 `api_key`，其 IO 归类以 #5 脱敏落地为前提（脱敏前视同 M）；
@@ -143,7 +140,7 @@ Type: Discuss
 
 ### Question
 
-Provider API key、custom headers、IM token 与动态工具 secret 是否永远不再回传明文；前端如何表达“已配置 / 保持原值 / 清空 / 替换”，以及是否在本轮引入 OS credential store。
+Provider API key、custom headers 与动态工具 secret 是否永远不再回传明文；前端如何表达“已配置 / 保持原值 / 清空 / 替换”，以及是否在本轮引入 OS credential store。
 
 ### Answer
 
@@ -159,7 +156,6 @@ Provider API key、custom headers、IM token 与动态工具 secret 是否永远
 
 - Provider `api_key`：当前明文回传（`ProviderFull`，GET 与 PATCH 响应；`AppSettingsModal.vue` 依赖明文预填编辑框）。目标：读侧改 `has_api_key`；HTTP 层 `UpdateProviderRequest` 补 `clear_api_key`——config 层 `ProviderPatch` 本已支持保持/清空/替换三态，缺的只是 HTTP 字段。
 - Provider `custom_headers`：当前整个 map 明文回传。目标：header 名可见、值全部脱敏（值皆视为潜在 secret，名不敏感）；写侧保持现有 nil=保持 / 空 map=清空 / 非空=整体替换语义。
-- IM 平台 8 个 secret 字段：当前明文回传（`GET /im/config` 及 PATCH 响应），且 `IMConfigPatch.Platforms` 是数组整体替换——客户端必须持有明文才能改任何字段，与脱敏目标强耦合。目标：读侧逐字段 `has_*`；写侧重构为逐平台、逐字段三态 patch。这是本票唯一的结构性改动，其余都是响应层收窄。
 - web_search `api_key`：已是目标契约，不动。
 - MCP `env`：当前不回传（`ServerInfo` 只含 name/state/tool_count/error），仅创建时写入、无编辑端点。保持写后不读。
 - 动态工具 `dynamic.*.config`：无 API 回传，仅文件编辑。保持。
@@ -218,9 +214,9 @@ Type: Discuss
 
 1. **行为测试基线**：为信任相关表面补 characterization 测试——SSE 事件形态、CORS Origin 矩阵、WS hello 流程、无 Origin 客户端、health 字段、扩展 zip 分发。只 pin 不得改变的行为；即将被 #5 改变的明文回传不 pin。验收：新基线全绿。
 2. **Authority module（dark launch）**：`internal/auth` 落生产形态；serverproc / pchat-gui spawn 环境变量下发（含 `watchAndRestart` 重建路径）；GUI 经 `WindowExecJS` 注入 `__PCHAT_CAPABILITY__`；前端 `client.ts` 集中挂 `Authorization` 头；CLI `httpcli` 挂 Bearer；server 启动 `ResolveCapability` + `/health` 广告 `auth_required`。**只分发不强制**——无任何路由拒绝。**关键约束：bootstrap 铸造端点不得在本片出现**（它从诞生起就必须是 M 类，否则任何人可铸 token 换凭据，整个机制失效）。
-3. **Route classification + HTTP 强制**：按 [`runtime-trust-route-matrix.md`](runtime-trust-route-matrix.md) 给路由分组挂 `RequireCapability`；全局挂 `HostAllowlist`；P0/P1 放行，IO/X/M/D 要凭据，S 验签不变（Local Operator 凭据亦可通行），B 暂保持现状（既有暴露，由 #4 片关闭）；pprof 默认值翻转为关（`PC_PPROF=1` opt-in）；bootstrap mint/unlock 端点与前端引导页、GUI「在浏览器中打开」、CLI 打印登录链接同片落地。验收：SSE 在流开始前 401、流中不降级；旧客户端 401 文案可操作。
+3. **Route classification + HTTP 强制**：按 [`runtime-trust-route-matrix.md`](runtime-trust-route-matrix.md) 给路由分组挂 `RequireCapability`；全局挂 `HostAllowlist`；P0/P1 放行，IO/X/M/D 要凭据，B 暂保持现状（既有暴露，由 #4 片关闭）；pprof 默认值翻转为关（`PC_PPROF=1` opt-in）；bootstrap mint/unlock 端点与前端引导页、GUI「在浏览器中打开」、CLI 打印登录链接同片落地。验收：SSE 在流开始前 401、流中不降级；旧客户端 401 文案可操作。
 4. **Browser pairing**：`Pairer` 接入 `BrowserWebSocket`；配对管理端点（M 类）；GUI 批准界面；扩展 JS（凭据 hello、pair_required/approved/denied、4xxx 关闭码处理、凭据持久化）；扩展 zip 重打包；删除「连接即自动启用」旧语义。
-5. **Secret redaction**：providers 读侧 `has_api_key` + custom_headers 值脱敏、HTTP 层补 `clear_api_key`；IM 配置逐字段 `has_*` + 逐平台逐字段三态 patch 重构；前端设置页改四态 UX（模板：`WebSearchSettings.vue`）。MCP / 动态工具不动（本就不回传）。
+5. **Secret redaction**：providers 读侧 `has_api_key` + custom_headers 值脱敏、HTTP 层补 `clear_api_key`；前端设置页改四态 UX（模板：`WebSearchSettings.vue`）。MCP / 动态工具不动（本就不回传）。
 6. **Non-loopback enforcement**：**含 Remote Operator 凭据签发**（候选清单的隐含缺口——没有它 fail-closed 的非本机模式永远无法启用）；启动闸门（非 loopback 绑定 + 无有效凭据配置 → 拒绝启动并给出可操作错误）；操作/管理分级在 M/D 路由生效；配置新增字段按 versioning 文档确认是否需 upgrade 步骤。
 7. **删除旧浅规则 + 收尾**：移除过渡残留；全量不变量测试套件定稿；更新 `.agents/docs`（server.md 等）与 README。`allow_eval_write` 不在本片——已确认事实将其列为独立的 fail-closed 修复。
 
@@ -229,11 +225,11 @@ Type: Discuss
 - 片 2：子进程环境变量含 `PCHAT_INSTANCE_CAPABILITY`（serverproc / GUI 各一）；`httpcli` 请求带 Bearer（httptest 断言）；前端 `tests/` 新增头部附加测试（node --test 设施已存在）；`/health` 广告字段。
 - 片 3：**路由分类可执行测试**——枚举 `engine.Routes()` 对照分类表，未知路由即测试失败（分类表成为唯一权威，新路由不得未分类落地）；逐类中间件集成测试；bootstrap 一次性/过期/重放；unlock cookie 属性。
 - 片 4：WS 握手状态机与关闭码（#3 原型已备）+ 接线集成 + `pairing.json` 重启持久化（已备）。
-- 片 5：逐端点响应形态测试（`api_key` 字段不存在、`has_api_key` 存在）；IM patch 三态。
+- 片 5：逐端点响应形态测试（`api_key` 字段不存在、`has_api_key` 存在）。
 - 片 6：启动闸门测试（非 loopback 无凭据 → 退出；loopback 无凭据 → 正常）。
 - 片 7：全量回归 + 不变量套件。
 
-**票面必测清单映射**：错误/过期/重放凭据 → 片 2/3（原型已备）；撤销 → 片 4；恶意 Origin → 片 3（CORS 矩阵 + HostAllowlist）；无 Origin 客户端 → 片 3（无 Origin ≠ 可信，由凭据层裁决）；signed webhook → 片 3（验签通过无需凭据、验签失败 401）；SSE → 片 3；WebSocket → 片 4；实例重启 → 片 2（凭据轮换拒绝旧值，已备）+ 片 4（配对存续，已备）；旧客户端失败提示 → 片 3（#6 已备，集成复验）。
+**票面必测清单映射**：错误/过期/重放凭据 → 片 2/3（原型已备）；撤销 → 片 4；恶意 Origin → 片 3（CORS 矩阵 + HostAllowlist）；无 Origin 客户端 → 片 3（无 Origin ≠ 可信，由凭据层裁决）；SSE → 片 3；WebSocket → 片 4；实例重启 → 片 2（凭据轮换拒绝旧值，已备）+ 片 4（配对存续，已备）；旧客户端失败提示 → 片 3（#6 已备，集成复验）。
 
 **全计划无 SQLite schema 变更、无 `~/.p-chat` 目录结构变更**（pairing.json 为新增文件、凭据仅存内存、配置为可选新增字段），故不触发 §2.5 强制 upgrade 步骤；片 6 配置新增按 versioning 文档复核。
 

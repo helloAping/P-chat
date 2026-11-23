@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -243,6 +244,46 @@ func ClassifyAPIError(providerName string, err error) error {
 	return err
 }
 
+// newResponsesAPIError 保留 Responses SSE/JSON 错误码，使重试和 UI 能正确分类。
+// newResponsesAPIError preserves Responses error codes for retry and UI classification.
+func newResponsesAPIError(providerName, errorType, code, message string) error {
+	message = sanitizeProviderDetail(message, 1024)
+	if message == "" {
+		message = "OpenAI Responses request failed"
+	}
+	// 网关可能把上游的永久性 4xx 包装成可重试的 SSE server_error。
+	// A gateway may wrap a permanent upstream 4xx in a retryable SSE server_error.
+	if status, ok := nestedProviderRequestStatus(message); ok {
+		return ClassifyAPIError(providerName, &openai.APIError{
+			HTTPStatusCode: status,
+			Message:        "provider request failed",
+			Type:           errorType,
+			Code:           code,
+		})
+	}
+	if strings.TrimSpace(errorType) == "" {
+		errorType = code
+	}
+	return ClassifyAPIError(providerName, &openai.APIError{
+		Message: message,
+		Type:    errorType,
+		Code:    code,
+	})
+}
+
+var providerRequestStatusRe = regexp.MustCompile(`(?i)provider request failed:\s*status=([45][0-9]{2})(?:\b|,)`)
+
+// nestedProviderRequestStatus 仅识别网关明确报告的上游 HTTP 状态。
+// nestedProviderRequestStatus accepts only an explicit upstream HTTP status from a gateway error.
+func nestedProviderRequestStatus(message string) (int, bool) {
+	match := providerRequestStatusRe.FindStringSubmatch(message)
+	if len(match) != 2 {
+		return 0, false
+	}
+	status, err := strconv.Atoi(match[1])
+	return status, err == nil
+}
+
 func isTransientProviderUnavailable(msg string) bool {
 	lc := strings.ToLower(msg)
 	if strings.Contains(lc, "provider_unavailable") {
@@ -261,8 +302,9 @@ func isTransientProviderUnavailable(msg string) bool {
 // when msg is not one of those envelopes.
 func parseHTTPStatusError(msg string) (int, string, bool) {
 	const (
-		llmPrefix    = "llm http "
-		openaiPrefix = "openai http "
+		llmPrefix       = "llm http "
+		openaiPrefix    = "openai http "
+		anthropicPrefix = "anthropic http "
 	)
 	var rest string
 	switch {
@@ -270,6 +312,8 @@ func parseHTTPStatusError(msg string) (int, string, bool) {
 		rest = msg[len(llmPrefix):]
 	case strings.HasPrefix(msg, openaiPrefix):
 		rest = msg[len(openaiPrefix):]
+	case strings.HasPrefix(msg, anthropicPrefix):
+		rest = msg[len(anthropicPrefix):]
 	default:
 		return 0, "", false
 	}

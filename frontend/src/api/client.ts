@@ -3,7 +3,7 @@
 // (POST /sessions/:id/messages) is handled separately via
 // streamMessages().
 
-import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
+import { abortableDelay, consumeSSEStream, isDuplicateClientMessageError, shouldRetryStreamError, StreamHTTPError, STREAM_IDLE_AFTER_LLM_MS, type StreamEventLike } from './sse'
 
 const BASE = (import.meta.env?.VITE_PCHAT_BACKEND || '').replace(/\/$/, '')
 
@@ -122,6 +122,7 @@ export interface Session {
   title: string
   created_at: number
   updated_at: number
+  tags?: string[]
   // Resolved per-session picker state, included by the server
   // in the SessionResponse (see internal/server/handler.go
   // sessionToResponse). These may be empty when the session has
@@ -264,6 +265,10 @@ export interface TodoItem {
 
 export interface Message {
   id?: number
+  // 服务端会把同一 ReAct 回合的多条 assistant 行合并成一个气泡。
+  // The server folds multiple assistant rows from one ReAct turn into one
+  // bubble. These IDs let an exact search hit resolve to that bubble's anchor.
+  source_message_ids?: number[]
   // Per-conversation logical position. The new stable
   // identity for any cross-render / cross-rollback
   // reference: Vue :key, pagination cursor, undo
@@ -293,6 +298,8 @@ export interface Message {
   // post-stream redactor may rewrite this if the LLM
   // produced a phantom error in the thinking block.
   thinking?: string
+  // Plan kept on the user message that started the turn. History keeps this copy.
+  turn_todos?: TodoItem[]
   created_at?: number
   tool_call_id?: string
   name?: string
@@ -303,6 +310,10 @@ export interface Message {
   // assistant message when the 'done' event arrives.
   tokens_in?: number
   tokens_out?: number
+  // AE-03: prompt-cache telemetry when the provider reported it.
+  // Present (even as 0) only when cache_reported; omitted otherwise.
+  cache_hit_tokens?: number
+  cache_miss_tokens?: number
   elapsed?: string
   // visionUnsupported is set on a *user* message when the
   // LLM rejected the user's image with the "this model
@@ -391,6 +402,7 @@ export interface UpdateSessionMetaResponse {
   sub_agent_model_enabled?: boolean
   sub_agent_provider?: string
   sub_agent_model?: string
+  tags?: string[]
   created_at?: number
   updated_at?: number
 }
@@ -518,9 +530,76 @@ export const generateSessionTitle = (id: string, options: GenerateSessionTitleOp
     body: JSON.stringify(options),
   })
 
+export interface BookmarkIndexItem {
+  message_id: number
+  conversation_id: string
+  title: string
+  project_path: string
+  snippet: string
+  note?: string
+  seq?: number
+  created_at: number
+}
+
+export const listAllBookmarks = () =>
+  jsonFetch<{ bookmarks: BookmarkIndexItem[] }>('/api/v1/bookmarks')
+
+export const listUserTurns = (id: string) =>
+  jsonFetch<{ turns: { message_id: number; seq?: number; content: string }[] }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/user-turns`,
+  )
+
+export const listBookmarks = (id: string) =>
+  jsonFetch<{ bookmarks: { message_id: number; note?: string; seq?: number; created_at: number }[] }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks`,
+  )
+
+export const toggleBookmark = (id: string, messageID: number) =>
+  jsonFetch<{ bookmarked: boolean; message_id: number }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks/${messageID}`,
+    { method: 'POST' },
+  )
+
+export const updateBookmarkNote = (id: string, messageID: number, note: string) =>
+  jsonFetch<{ ok: boolean; message_id: number; note: string }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/bookmarks/${messageID}`,
+    { method: 'PATCH', body: JSON.stringify({ note }) },
+  )
+
+export interface StyleCompareVariant {
+  style: string
+  label: string
+  text?: string
+  error?: string
+}
+
+export const styleCompare = (id: string, text: string, styles?: string[]) =>
+  jsonFetch<{ source: string; current: string; variants: StyleCompareVariant[] }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/style-compare`,
+    { method: 'POST', body: JSON.stringify({ text, ...(styles && styles.length ? { styles } : {}) }) },
+  )
+
+export const adoptStyleCompare = (id: string, text: string, style: string) =>
+  jsonFetch<{ ok: boolean; message_id: number }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/style-compare/adopt`,
+    { method: 'POST', body: JSON.stringify({ text, style }) },
+  )
+
+export interface TurnChangeItem {
+  message_id: number
+  tool: string
+  path?: string
+  preview?: string
+}
+
+export const listTurnChanges = (id: string) =>
+  jsonFetch<{ changes: TurnChangeItem[]; note?: string }>(
+    `/api/v1/sessions/${encodeURIComponent(id)}/turn-changes`,
+  )
+
 export const updateSessionMeta = (
   id: string,
-  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; turn_mode_policy: TurnModePolicy; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string }>,
+  fields: Partial<{ style: string; work_mode: string; provider: string; model: string; title: string; plan_mode: boolean; turn_mode_policy: TurnModePolicy; permission_level: string; vector_store: string; knowledge_base: string; auto_continue: boolean; todo_long_run_mode: 'off' | 'adaptive' | 'unlimited'; use_image_recognition: boolean; enabled_recognition_capabilities: MediaKind[]; enabled_generation_operations: GenerationOperation[]; sub_agent_model_enabled: boolean; sub_agent_provider: string; sub_agent_model: string; tags: string[] }>,
 ) =>
   jsonFetch<UpdateSessionMetaResponse>(`/api/v1/sessions/${id}`, {
     method: 'PATCH',
@@ -927,6 +1006,30 @@ export const undoRollback = (sessionId: string, messages: Message[]) =>
     { method: 'POST', body: JSON.stringify({ messages }) },
   )
 
+// AE-07: file-change journal for undoing the latest agent turn's writes.
+export interface FileChangeEntry {
+  path: string
+  tool: string
+  existed: boolean
+  added?: number
+  deleted?: number
+}
+
+export interface FileChangeSummary {
+  count: number
+  started_at?: string
+  entries: FileChangeEntry[]
+}
+
+export const getFileChanges = (sessionId: string) =>
+  jsonFetch<FileChangeSummary>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/file-changes`)
+
+export const undoFileChanges = (sessionId: string) =>
+  jsonFetch<{ ok: boolean; summary: FileChangeSummary }>(
+    `/api/v1/sessions/${encodeURIComponent(sessionId)}/file-changes/undo`,
+    { method: 'POST' },
+  )
+
 // --- Fork ---
 export const forkSession = (sessionId: string, beforeId: number) =>
   jsonFetch<Session>(
@@ -935,14 +1038,23 @@ export const forkSession = (sessionId: string, beforeId: number) =>
   )
 
 // --- Uploads ---
-export async function uploadFile(file: File): Promise<UploadMeta> {
+export async function uploadFile(file: File, sessionID: string): Promise<UploadMeta> {
+  if (!sessionID) throw new Error('upload requires a session id')
   const fd = new FormData()
   fd.append('file', file)
+  fd.append('session_id', sessionID)
   const backend = await waitForDirectBackend()
   const res = await fetch(`${backend}/api/v1/uploads`, { method: 'POST', body: fd, credentials: 'omit' })
   if (!res.ok) {
-    const t = await res.text()
-    throw new Error(`HTTP ${res.status}: ${t}`)
+    const body = await res.text()
+    let detail = ''
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown }
+      if (typeof parsed.error === 'string') detail = parsed.error
+    } catch {
+      // Some proxies return plain text or HTML instead of JSON.
+    }
+    throw new Error(detail || `HTTP ${res.status}: ${body.slice(0, 200)}`)
   }
   const meta = await res.json() as UploadMeta
   if (!meta || meta.size <= 0) {
@@ -951,13 +1063,14 @@ export async function uploadFile(file: File): Promise<UploadMeta> {
   return meta
 }
 
-export function uploadURL(id: string): string {
-  return `${BASE}/api/v1/uploads/${encodeURIComponent(id)}`
+export function uploadURL(id: string, sessionID: string): string {
+	return `${BASE}/api/v1/uploads/${encodeURIComponent(id)}?session_id=${encodeURIComponent(sessionID)}`
 }
 
 // --- Providers / Models ---
 export interface ModelInfo {
   name: string
+  protocol?: ProviderProtocol
   api_endpoint?: string
   type?: ModelType
   display_name?: string
@@ -1035,7 +1148,12 @@ export interface ProviderInfo {
   base_url: string
   // Returned only by pre-V12 servers; the settings form reads it as a fallback.
   api_url?: string
-  api_key: string
+  // Secret Redaction Contract: plaintext api_key is never returned.
+  // has_api_key tells the UI whether a key is stored.
+  has_api_key?: boolean
+  /** @deprecated Never returned by current servers; kept for type narrowing only. */
+  api_key?: string
+  // Header names are returned; values are always redacted to "".
   custom_headers?: Record<string, string>
   is_default: boolean
   // Slim view from GET /api/v1/providers.
@@ -1095,6 +1213,12 @@ export const updateStyle = (id: string, req: UpdateStyleRequest) =>
   jsonFetch<{ ok: boolean; id: string }>(`/api/v1/styles/${encodeURIComponent(id)}`, {
     method: 'PATCH',
     body: JSON.stringify(req),
+  })
+
+export const deleteStyleMemoryLine = (id: string, line: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/v1/styles/${encodeURIComponent(id)}/memory-line/delete`, {
+    method: 'POST',
+    body: JSON.stringify({ line }),
   })
 
 export const deleteStyle = (id: string) =>
@@ -1188,10 +1312,10 @@ export interface CommandSpec {
 export const listCommands = () =>
   jsonFetch<{ commands: CommandSpec[] }>('/api/v1/commands')
 
-export const runCommand = (name: string, args: string) =>
+export const runCommand = (name: string, args: string, sessionID?: string) =>
   jsonFetch<{ output: string }>(`/api/v1/commands/${encodeURIComponent(name)}`, {
     method: 'POST',
-    body: JSON.stringify({ args }),
+    body: JSON.stringify({ args, session_id: sessionID }),
   })
 
 // --- App-level provider configuration ---
@@ -1250,7 +1374,9 @@ export interface UpdateProviderRequest {
   strategy_variant?: string
   protocol?: ProviderProtocol
   base_url?: string
+  // omit = keep; non-empty = replace; use clear_api_key to delete.
   api_key?: string
+  clear_api_key?: boolean
   custom_headers?: Record<string, string>
   set_default?: boolean
 }
@@ -1264,6 +1390,7 @@ export const updateProvider = (name: string, req: UpdateProviderRequest) =>
 // --- Per-model CRUD ---
 export interface AddModelRequest {
   name: string
+  protocol?: ProviderProtocol
   api_endpoint?: string
   type?: ModelType
   display_name?: string
@@ -1280,6 +1407,8 @@ export const addModel = (provider: string, req: AddModelRequest) =>
   )
 
 export interface UpdateModelRequest {
+  // Empty string clears the override and restores provider inheritance.
+  protocol?: ProviderProtocol | ''
   api_endpoint?: string
   type?: ModelType
   display_name?: string
@@ -1630,9 +1759,8 @@ export interface StreamEvent {
     tool_retryable?: boolean
   tool_requires_user?: boolean
   tool_next_action?: string
-  // tool_args is the JSON-encoded arguments string the tool
-  // was called with. Best-effort: LLM clients only surface this
-  // once the call is complete.
+  // tool_args is the JSON-encoded arguments (or an AE-01 fragment
+  // when tool_status === 'args'). Full args still arrive on start/ok.
   tool_args?: string
   // Sub-agent fields. When sub_agent is true, the event
   // originated from a `task` tool's child run. The client
@@ -1656,6 +1784,9 @@ export interface StreamEvent {
   thinking_rewrite?: string
   tokens_in?: number
   tokens_out?: number
+  // AE-03: present only when the provider reported cache usage.
+  cache_hit_tokens?: number
+  cache_miss_tokens?: number
   elapsed?: string
   provider?: string
   model?: string
@@ -1719,10 +1850,35 @@ export interface StreamEvent {
 
 export type ConfirmAction = 'reject' | 'once' | 'always'
 
-export async function submitConfirmResponse(sessionId: string, approved: boolean, action?: ConfirmAction): Promise<void> {
-  await jsonFetch(`/api/v1/sessions/${encodeURIComponent(sessionId)}/confirm-response`, {
+export interface ConfirmDecision {
+  action: ConfirmAction
+  styleId?: string
+  newStyleLabel?: string
+}
+
+export interface ConfirmResponseResult {
+  ok: boolean
+  confirm_id?: string
+  action?: ConfirmAction
+  explicit?: boolean
+}
+
+export async function submitConfirmResponse(
+  sessionId: string,
+  approved: boolean,
+  action?: ConfirmAction,
+  confirmId?: string,
+  style?: { styleId?: string; newStyleLabel?: string },
+): Promise<ConfirmResponseResult> {
+  return jsonFetch<ConfirmResponseResult>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/confirm-response`, {
     method: 'POST',
-    body: JSON.stringify({ approved, action }),
+    body: JSON.stringify({
+      approved,
+      action,
+      confirm_id: confirmId,
+      style_id: style?.styleId || '',
+      new_style_label: style?.newStyleLabel || '',
+    }),
   })
 }
 
@@ -1824,9 +1980,9 @@ async function consumeStreamRequest(request: StreamRequest): Promise<void> {
     body: request.body,
     signal: request.signal,
   })
-  if (!resp.ok || !resp.body) {
+  if (!resp.ok) {
     const bodyText = await resp.text().catch(() => '')
-    const err = new Error(`${request.label}: HTTP ${resp.status}: ${bodyText || resp.statusText}`)
+    const err = new StreamHTTPError(request.label, resp.status, bodyText, resp.statusText)
     // Special-case `duplicate_client_message` (HTTP 409, server's
     // idempotency check found the user row already persisted). The
     // request was accepted the first time; the SSE connection was
@@ -1854,6 +2010,16 @@ async function consumeStreamRequest(request: StreamRequest): Promise<void> {
     if (!request.signal?.aborted && request.onStreamDrop && shouldRetryStreamError(err)) {
       try {
         request.onStreamDrop({ lastSeq: -1, reason: `HTTP ${resp.status}` })
+      } catch { /* Drop reporting must not mask the transport error. */ }
+    }
+    throw err
+  }
+
+  if (!resp.body) {
+    const err = new Error(`${request.label}: response body missing`)
+    if (!request.signal?.aborted && request.onStreamDrop) {
+      try {
+        request.onStreamDrop({ lastSeq: -1, reason: 'response body missing' })
       } catch { /* Drop reporting must not mask the transport error. */ }
     }
     throw err
@@ -2443,236 +2609,6 @@ export const getGenerationOptions = (sessionId?: string) =>
     `/api/v1/generation/options${sessionId ? `?session_id=${encodeURIComponent(sessionId)}` : ''}`,
   )
 
-// ---- IM bridge settings ----
-
-export interface IMSessionPolicy {
-  scope: 'per_sender' | 'per_chat' | 'per_thread' | string
-  record_sender: boolean
-  cross_platform: boolean
-}
-
-export interface IMAutoLinkPolicy {
-  enabled: boolean
-  trust: 'manual' | 'high' | 'none' | string
-}
-
-export interface IMAccount {
-  platform: string
-  id: string
-}
-
-export interface IMIdentityLink {
-  principal: string
-  accounts?: IMAccount[]
-}
-
-export interface IMIdentityPolicy {
-  links?: IMIdentityLink[]
-  auto_link: IMAutoLinkPolicy
-}
-
-export interface IMCommandPolicy {
-  prefix: string
-  forward_unknown_to_agent: boolean
-  admin_senders?: string[]
-  require_mention_in_group: boolean
-}
-
-export interface IMRateLimitRule {
-  scope: string
-  key?: string
-  rps: number
-  burst: number
-}
-
-export interface IMPersona {
-  style?: string
-  work_mode?: string
-  model?: string
-  tools_allow?: string[]
-  prompt_inject?: string
-}
-
-export interface IMCronConfig {
-  enabled: boolean
-  jobs?: Array<{
-    id: string
-    schedule: string
-    timezone?: string
-    platform: string
-    chat_id: string
-    prompt: string
-    persona?: string
-  }>
-}
-
-export interface IMFallbackRule {
-  from: { platform: string; chat_id?: string }
-  to: { platform: string; chat_id?: string }
-  trigger: string
-}
-
-export interface IMProviderModelConfig {
-  provider?: string
-  model?: string
-}
-
-export interface IMTTSConfig {
-  provider?: string
-  voice?: string
-  enabled_in?: string[]
-}
-
-export interface IMMediaConfig {
-  stt: IMProviderModelConfig
-  tts: IMTTSConfig
-  vision: { enabled: boolean; max_image_bytes: number }
-  file_extract: { enabled: boolean; max_file_bytes: number; types?: string[] }
-}
-
-export interface IMWebhookConfig {
-  listen?: string
-  path?: string
-}
-
-export interface IMOutboundConfig {
-  use_openapi?: boolean
-  api_base?: string
-}
-
-export interface IMPlatformConfig {
-  type: string
-  variant?: string
-  enabled: boolean
-  mode?: string
-  token?: string
-  app_id?: string
-  app_secret?: string
-  verification_token?: string
-  encrypt_key?: string
-  corp_id?: string
-  corp_secret?: string
-  agent_id?: number
-  callback_aes_key?: string
-  callback_token?: string
-  endpoint?: string
-  api_key?: string
-  webhook?: IMWebhookConfig
-  out?: IMOutboundConfig
-  allowed_senders?: string[]
-  extra?: Record<string, unknown>
-}
-
-export interface IMConfig {
-  enabled: boolean
-  session: IMSessionPolicy
-  identity: IMIdentityPolicy
-  command: IMCommandPolicy
-  rate_limit?: IMRateLimitRule[]
-  audit_log: boolean
-  audit_local_only: boolean
-  tools_allowlist_default?: string[]
-  personas?: Record<string, IMPersona>
-  cron: IMCronConfig
-  fallback?: IMFallbackRule[]
-  media: IMMediaConfig
-  platforms?: IMPlatformConfig[]
-}
-
-export interface IMHealthStatus {
-  platform: string
-  variant?: string
-  enabled: boolean
-  status: string
-  error?: string
-  last_error?: string
-  started_at?: string
-  last_poll_at?: string
-  last_inbound_at?: string
-}
-
-export interface IMHealth {
-  enabled: boolean
-  running: boolean
-  platforms: IMHealthStatus[]
-}
-
-export interface IMTestResult {
-  ok: boolean
-  platform: string
-  variant?: string
-  status: string
-  error?: string
-}
-
-export interface WeChatQRSession {
-  id: string
-  status: 'waiting' | 'scanned' | 'confirmed' | 'expired' | 'canceled' | string
-  qrcode?: string
-  qr_data?: string
-  qr_url?: string
-  message?: string
-  expires_at?: string
-  poll_after_ms: number
-  account?: Record<string, string>
-}
-
-export interface IMLifecycleEvent {
-  type?: string
-  seq?: number
-  time?: string
-  platform?: string
-  variant?: string
-  message?: string
-  error?: string
-  [key: string]: unknown
-}
-
-export const getIMConfig = () =>
-  jsonFetch<IMConfig>('/api/v1/im/config')
-
-export const updateIMConfig = (patch: Partial<IMConfig>) =>
-  jsonFetch<IMConfig>('/api/v1/im/config', {
-    method: 'PATCH',
-    body: JSON.stringify(patch),
-  })
-
-export const getIMHealth = () =>
-  jsonFetch<IMHealth>('/api/v1/im/health')
-
-export const testIMConnection = (type: string, variant?: string) =>
-  jsonFetch<IMTestResult>(`/api/v1/im/${encodeURIComponent(type)}/test`, {
-    method: 'POST',
-    body: JSON.stringify({ type, variant }),
-  })
-
-export const startWeChatQR = () =>
-  jsonFetch<WeChatQRSession>('/api/v1/im/wechat/qr', { method: 'POST' })
-
-export const pollWeChatQR = (id: string) =>
-  jsonFetch<WeChatQRSession>(`/api/v1/im/wechat/qr/${encodeURIComponent(id)}`)
-
-export async function streamIMEvents(
-  onEvent: (ev: IMLifecycleEvent) => void,
-  signal?: AbortSignal,
-): Promise<void> {
-  const base = await waitForDirectBackend()
-  const resp = await fetch(`${base}/api/v1/im/events`, {
-    method: 'GET',
-    headers: { Accept: 'text/event-stream' },
-    signal,
-  })
-  if (!resp.ok || !resp.body) {
-    throw new Error(`im events: HTTP ${resp.status}: ${resp.statusText}`)
-  }
-  await consumeSSEStream<IMLifecycleEvent>({
-    reader: resp.body.getReader(),
-    signal,
-    label: 'im-events',
-    onEvent,
-  })
-}
-
 // ---- Web search settings ----
 
 export interface WebSearchSettings {
@@ -2686,6 +2622,7 @@ export interface WebSearchSettings {
   base_url?: string
   path?: string
   topic?: string
+  model?: string
   daily_quota: number
   request_timeout: string
   used_today: number
@@ -2706,6 +2643,7 @@ export interface UpdateWebSearchRequest {
   base_url?: string
   path?: string
   topic?: string
+  model?: string
   daily_quota?: number
   request_timeout?: string
 }
@@ -2725,6 +2663,46 @@ export const testWebSearchConnection = () =>
     { method: 'POST' },
   )
 
+// ---- Web fetch settings ----
+
+export interface WebFetchSettings {
+  provider: string
+  has_key: boolean
+  base_url?: string
+  path?: string
+  model?: string
+  daily_quota: number
+  request_timeout: string
+  used_today: number
+  resets_at: string
+}
+
+export const getWebFetchSettings = () =>
+  jsonFetch<WebFetchSettings>('/api/v1/settings/web_fetch')
+
+export interface UpdateWebFetchRequest {
+  provider?: string
+  api_key?: string
+  clear_api_key?: boolean
+  base_url?: string
+  path?: string
+  model?: string
+  daily_quota?: number
+  request_timeout?: string
+}
+
+export const updateWebFetchSettings = (patch: UpdateWebFetchRequest) =>
+  jsonFetch<WebFetchSettings>('/api/v1/settings/web_fetch', {
+    method: 'PUT',
+    body: JSON.stringify(patch),
+  })
+
+export const testWebFetchConnection = () =>
+  jsonFetch<{ ok: boolean; provider?: string; title?: string; error?: string }>(
+    '/api/v1/settings/web_fetch/test',
+    { method: 'POST' },
+  )
+
 // ---- Diagnostics (内存监控) ----
 
 export interface MemorySnapshot {
@@ -2740,6 +2718,7 @@ export interface DiagnosticsConfig {
   mem_heartbeat_sec: number
   heap_dump_mb: number
   pprof_enabled: boolean
+  snapshot_enabled: boolean
   heap_dump_dir: string
 }
 
@@ -2772,6 +2751,30 @@ export function downloadDiagnosticsSnapshot(kind: 'heap' | 'goroutine') {
   a.click()
   a.remove()
 }
+
+export interface StorageGCItem {
+  id: string
+  label: string
+  detail: string
+  count: number
+  bytes: number
+}
+
+export interface StorageGCReport {
+  items: StorageGCItem[]
+  total_bytes: number
+  vacuumed: boolean
+  vacuum_error?: string
+}
+
+export const previewStorageGC = () =>
+  jsonFetch<StorageGCReport>('/api/v1/storage/gc')
+
+export const runStorageGC = (actions: string[]) =>
+  jsonFetch<StorageGCReport>('/api/v1/storage/gc', {
+    method: 'POST',
+    body: JSON.stringify({ actions }),
+  })
 
 // ---- Browser control ----
 

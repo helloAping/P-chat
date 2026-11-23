@@ -336,6 +336,33 @@ func TestClassifyAPIError_HTTPStatusEnvelope(t *testing.T) {
 	}
 }
 
+func TestResponsesGatewayNestedStatus(t *testing.T) {
+	cases := []struct {
+		name    string
+		message string
+		want    ErrorKind
+		status  int
+	}{
+		{"upstream bad request", `Provider request failed: status=400, body={"model":"gpt-test"}`, KindBadRequest, 400},
+		{"upstream rate limit", `Provider request failed: status=429, body={}`, KindRateLimit, 429},
+		{"upstream unavailable", `Provider request failed: status=503, body={}`, KindServer, 503},
+		{"ordinary gateway error", `gateway unavailable`, KindServer, 0},
+		{"unrelated status", `status=400`, KindServer, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := newResponsesAPIError("proxy", "server_error", "PROVIDER_BAD_RESPONSE", tc.message)
+			var apiErr *APIError
+			if !errors.As(got, &apiErr) {
+				t.Fatalf("error = %T, want *APIError", got)
+			}
+			if apiErr.Kind != tc.want || apiErr.StatusCode != tc.status {
+				t.Fatalf("Kind=%v StatusCode=%d, want %v/%d", apiErr.Kind, apiErr.StatusCode, tc.want, tc.status)
+			}
+		})
+	}
+}
+
 // TestParseHTTPStatusError covers the envelope parser's reject cases.
 func TestParseHTTPStatusError(t *testing.T) {
 	if _, _, ok := parseHTTPStatusError("llm http 500: x"); !ok {

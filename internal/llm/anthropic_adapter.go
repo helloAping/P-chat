@@ -341,6 +341,9 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 
 		reader := bufio.NewReaderSize(r, 1<<20)
 		var eventType string
+		streamState := newAnthropicStreamState()
+		rawEvents := 0
+		parseFailures := 0
 		for {
 			line, err := readSSELine(reader)
 			// Single dispatch path. The previous version
@@ -355,7 +358,25 @@ func (a *AnthropicAdapter) ParseStream(r io.Reader) <-chan StreamChunk {
 				case strings.HasPrefix(line, "event: "):
 					eventType = strings.TrimPrefix(line, "event: ")
 				case strings.HasPrefix(line, "data: "):
-					a.handleStreamEvent(eventType, strings.TrimPrefix(line, "data: "), ch)
+					payload := strings.TrimPrefix(line, "data: ")
+					if payload == "[DONE]" {
+						ch <- StreamChunk{Done: true}
+						return
+					}
+					rawEvents++
+					if rawEvents <= 3 {
+						// 调试模式只记录有界、脱敏预览。Debug mode logs bounded, redacted previews only.
+						logLLMDebugPayload(fmt.Sprintf("[llm/%s/anthropic]", a.name), rawEvents, []byte(payload))
+					}
+					var envelope any
+					if parseErr := json.Unmarshal([]byte(payload), &envelope); parseErr != nil {
+						parseFailures++
+						logMalformedSSE(fmt.Sprintf("[llm/%s/anthropic]", a.name), rawEvents, parseFailures, []byte(payload), parseErr)
+						break
+					}
+					if a.handleStreamEvent(eventType, payload, ch, streamState) {
+						return
+					}
 					// Comment lines (": something"), id lines,
 					// or unknown fields fall through and are
 					// ignored on the next iteration.
@@ -436,9 +457,9 @@ func (a *AnthropicAdapter) Send(ctx context.Context, req *ProtocolRequest) (*htt
 		return nil, ClassifyAPIError(a.name, err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		resp.Body.Close()
-		return nil, ClassifyAPIError(a.name, fmt.Errorf("anthropic http %d: %s", resp.StatusCode, string(bodyBytes)))
+		return nil, ClassifyAPIError(a.name, upstreamHTTPError("anthropic", resp.StatusCode, bodyBytes))
 	}
 
 	// Start streaming; the caller reads from the response body
@@ -446,11 +467,61 @@ func (a *AnthropicAdapter) Send(ctx context.Context, req *ProtocolRequest) (*htt
 	return resp, nil
 }
 
-// handleStreamEvent processes a single Anthropic SSE event.
-func (a *AnthropicAdapter) handleStreamEvent(eventType, dataJSON string, ch chan<- StreamChunk) {
+// anthropicToolUseStream 保存每个内容块的工具输入状态；块索引用于关联交错事件。
+// anthropicToolUseStream stores tool input state by content block index so
+// interleaved Anthropic events can be reassembled.
+type anthropicToolUseStream struct {
+	id, name      string
+	input         string
+	sawInputDelta bool
+}
+
+type anthropicStreamState struct {
+	tools map[int]*anthropicToolUseStream
+}
+
+func newAnthropicStreamState() *anthropicStreamState {
+	return &anthropicStreamState{tools: make(map[int]*anthropicToolUseStream)}
+}
+
+// handleStreamEvent 处理单个 Anthropic SSE 事件；终止事件返回 true，避免重复 Done。
+// handleStreamEvent processes one Anthropic SSE event and returns true for
+// terminal events so ParseStream does not emit a duplicate Done.
+func (a *AnthropicAdapter) handleStreamEvent(eventType, dataJSON string, ch chan<- StreamChunk, state *anthropicStreamState) bool {
 	switch eventType {
 	case "content_block_start":
-		// Tracked if needed; deltas are self-describing.
+		var start struct {
+			Index        int                   `json:"index"`
+			ContentBlock anthropicContentBlock `json:"content_block"`
+			// Some Anthropic-compatible gateways flatten content_block fields
+			// onto the event, so retain those as a compatibility fallback.
+			ID    string          `json:"id,omitempty"`
+			Name  string          `json:"name,omitempty"`
+			Input json.RawMessage `json:"input,omitempty"`
+		}
+		if err := json.Unmarshal([]byte(dataJSON), &start); err != nil {
+			return false
+		}
+		block := start.ContentBlock
+		if block.Type == "" {
+			block = anthropicContentBlock{Type: "tool_use", ID: start.ID, Name: start.Name, Input: start.Input}
+		}
+		if block.Type != "tool_use" || block.ID == "" || block.Name == "" {
+			return false
+		}
+		state.tools[start.Index] = &anthropicToolUseStream{
+			id:    block.ID,
+			name:  block.Name,
+			input: strings.TrimSpace(string(block.Input)),
+		}
+		// 块开始时只有 ID 和名称；参数随后以片段到达，不能提前发送 input:{}。
+		// ID and name arrive at block start; argument fragments follow, so do not
+		// emit input:{} early because the Agent appends every ArgsJSON delta.
+		ch <- StreamChunk{ToolCallDelta: &ToolCallDelta{
+			Index: start.Index,
+			ID:    block.ID,
+			Name:  block.Name,
+		}}
 	case "content_block_delta":
 		var delta anthropicContentBlockDelta
 		if err := json.Unmarshal([]byte(dataJSON), &delta); err == nil {
@@ -463,10 +534,41 @@ func (a *AnthropicAdapter) handleStreamEvent(eventType, dataJSON string, ch chan
 				if delta.Delta.Thinking != "" {
 					ch <- StreamChunk{Thinking: delta.Delta.Thinking}
 				}
+			case "input_json_delta":
+				if toolUse, ok := state.tools[delta.Index]; ok && delta.Delta.PartialJSON != "" {
+					toolUse.sawInputDelta = true
+					ch <- StreamChunk{ToolCallDelta: &ToolCallDelta{
+						Index:    delta.Index,
+						ArgsJSON: delta.Delta.PartialJSON,
+					}}
+				}
 			}
+		}
+	case "content_block_stop":
+		var stop struct {
+			Index int `json:"index"`
+		}
+		if err := json.Unmarshal([]byte(dataJSON), &stop); err != nil {
+			return false
+		}
+		toolUse, ok := state.tools[stop.Index]
+		if !ok {
+			return false
+		}
+		delete(state.tools, stop.Index)
+		if !toolUse.sawInputDelta {
+			args := toolUse.input
+			if args == "" || args == "{}" {
+				args = "{}"
+			}
+			ch <- StreamChunk{ToolCallDelta: &ToolCallDelta{
+				Index:    stop.Index,
+				ArgsJSON: args,
+			}}
 		}
 	case "message_stop":
 		ch <- StreamChunk{Done: true}
+		return true
 	case "message_delta":
 		var delta anthropicMessageDelta
 		if err := json.Unmarshal([]byte(dataJSON), &delta); err == nil {
@@ -478,9 +580,11 @@ func (a *AnthropicAdapter) handleStreamEvent(eventType, dataJSON string, ch chan
 			Message string `json:"message"`
 		}
 		if err := json.Unmarshal([]byte(dataJSON), &errResp); err == nil {
-			ch <- StreamChunk{Err: fmt.Errorf("anthropic error: %s", errResp.Message)}
+			ch <- StreamChunk{Err: fmt.Errorf("anthropic error: %s", sanitizeProviderDetail(errResp.Message, 1024))}
+			return true
 		}
 	}
+	return false
 }
 
 // anthropicRole maps our role constants to Anthropic roles.

@@ -7,6 +7,7 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,14 +17,40 @@ import (
 	"github.com/p-chat/pchat/internal/server"
 )
 
+func createUploadSession(t *testing.T, srvURL string) string {
+	t.Helper()
+	resp, err := http.Post(srvURL+"/api/v1/sessions", "application/json", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("create session status = %d", resp.StatusCode)
+	}
+	var body struct {
+		ID string `json:"id"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ID == "" {
+		t.Fatal("create session returned empty id")
+	}
+	return body.ID
+}
+
 // TestUploads_PostAndGet exercises the happy path: POST a file,
 // then GET it back via the returned id.
 func TestUploads_PostAndGet(t *testing.T) {
 	srv := newWebServer(t)
 	defer srv.Close()
+	sessionID := createUploadSession(t, srv.URL)
 
 	body := &bytes.Buffer{}
 	w := multipart.NewWriter(body)
+	if err := w.WriteField("session_id", sessionID); err != nil {
+		t.Fatal(err)
+	}
 	payload := []byte("hello, world\nthis is a test file\n")
 	fw, err := w.CreateFormFile("file", "hello.txt")
 	if err != nil {
@@ -62,7 +89,7 @@ func TestUploads_PostAndGet(t *testing.T) {
 	}
 
 	// GET it back.
-	r2, err := http.Get(srv.URL + "/api/v1/uploads/" + meta.ID)
+	r2, err := http.Get(srv.URL + "/api/v1/uploads/" + meta.ID + "?session_id=" + url.QueryEscape(sessionID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,6 +119,7 @@ func TestUploads_RejectsMissingFile(t *testing.T) {
 func TestUploads_Classify(t *testing.T) {
 	srv := newWebServer(t)
 	defer srv.Close()
+	sessionID := createUploadSession(t, srv.URL)
 
 	cases := map[string]string{
 		"shot.png":   "image",
@@ -106,6 +134,9 @@ func TestUploads_Classify(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			body := &bytes.Buffer{}
 			w := multipart.NewWriter(body)
+			if err := w.WriteField("session_id", sessionID); err != nil {
+				t.Fatal(err)
+			}
 			fw, _ := w.CreateFormFile("file", name)
 			fw.Write([]byte("test"))
 			w.Close()
@@ -643,9 +674,10 @@ func TestUpdateProvider_PatchBaseURL(t *testing.T) {
 		t.Fatalf("status = %d, want 200", r.StatusCode)
 	}
 	var body struct {
-		Name    string `json:"name"`
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
+		Name      string `json:"name"`
+		BaseURL   string `json:"base_url"`
+		HasAPIKey bool   `json:"has_api_key"`
+		APIKey    string `json:"api_key"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		t.Fatal(err)
@@ -653,8 +685,11 @@ func TestUpdateProvider_PatchBaseURL(t *testing.T) {
 	if body.BaseURL != "http://new.example.com/v1" {
 		t.Errorf("base_url = %q", body.BaseURL)
 	}
-	if body.APIKey == "" {
-		t.Error("api_key must be preserved on partial patch")
+	if !body.HasAPIKey {
+		t.Error("has_api_key must remain true on partial patch")
+	}
+	if body.APIKey != "" {
+		t.Error("api_key plaintext must not appear in PATCH response")
 	}
 }
 
@@ -683,8 +718,12 @@ func TestProviderCustomHeadersCRUD(t *testing.T) {
 	if err := json.NewDecoder(get.Body).Decode(&provider); err != nil {
 		t.Fatal(err)
 	}
-	if provider.CustomHeaders["x-opencode-session"] != "{{conversation_id}}" {
-		t.Fatalf("custom_headers = %#v", provider.CustomHeaders)
+	// Read side redacts values; names remain so the UI can list configured headers.
+	if _, ok := provider.CustomHeaders["x-opencode-session"]; !ok {
+		t.Fatalf("custom_headers missing name: %#v", provider.CustomHeaders)
+	}
+	if provider.CustomHeaders["x-opencode-session"] != "" {
+		t.Fatalf("custom_headers value must be redacted: %#v", provider.CustomHeaders)
 	}
 
 	clearReq, _ := http.NewRequest(http.MethodPatch, srv.URL+"/api/v1/providers/headers", strings.NewReader(`{"custom_headers":{}}`))

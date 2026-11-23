@@ -8,6 +8,23 @@
 
 ## 已完成 ✅
 
+### v1.0.14 — 稳定版
+- 发布版本从 `1.0.14.beta` 提升为稳定版 `1.0.14`
+- GitHub Actions 构建 Windows amd64、Linux amd64 与 macOS arm64 的安装包和更新包
+
+### 未发布 — IM 功能退役
+- 移除 IM Gateway、平台 adapter、管理 API 和 GUI 设置入口；保留已有 IM 会话历史
+- 数据目录升级到 V18 时，从受管理的全局 `config.json` 移除顶层 `im` 配置及其中的凭据；项目级和显式 `--config` 覆盖文件不自动改写
+
+### v1.0.14.beta — 安全与可靠性收口
+- LLM retry 开始前重置失败 attempt 的 partial output，避免续写内容重复叠加
+- 原始 SSE、malformed payload、proxy error 与非 2xx 响应正文不再进入默认日志；`PC_LLM_DEBUG=1` 仅输出有界、统一脱敏的诊断预览
+- `browser_evaluate` 改为三态 fail-closed：明确副作用硬拒绝、明确只读走正常 BR-04、未知表达式强制逐次确认且不受 allowlist / `never` / `full` 静默绕过
+- `/debug/pprof/*` 与 diagnostics snapshot 均改为显式 opt-in 且仅限 TCP loopback（不信任转发头）；profile 文件使用 owner-only 权限
+- 恢复 CLI 本地知识库命令与进度反馈，搜索结果支持精确跳转到目标消息
+- `pchat-server --config` 的 Provider/Model、系统配置、Web Search、IM、Browser、MCP 与知识库写入统一落到活动 overlay，并保留未修改的未知/继承字段
+- 发布版本真源更新为 `1.0.14.beta`，同步 README、模块文档与项目结构说明
+
 ### v1.0.13.beta — 多环境运行隔离
 - dev / prod 由 data home 派生独立 runtime profile，可同时打开各自 GUI
 - GUI 单实例 mutex、托盘窗口、WebView2 状态、日志、配置和会话按 profile 隔离

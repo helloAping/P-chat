@@ -182,7 +182,7 @@ func TestSkillLoadFailurePartsArePersisted(t *testing.T) {
 	acc.update(ChatStreamChunk{Phase: "skill", SkillName: "broken", SkillStatus: "start", Message: "当前调用 Skill：broken"})
 	acc.update(ChatStreamChunk{Phase: "skill", SkillName: "broken", SkillStatus: "error", SkillError: "dependency missing"})
 
-	persistAssistant(sessionID, store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", acc, 0, 0, "")
+	persistAssistant(sessionID, store, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText}, "", acc, 0, 0, 0, 0, false, "")
 	if err := store.Flush(); err != nil {
 		t.Fatal(err)
 	}

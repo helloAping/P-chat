@@ -11,8 +11,8 @@ import (
 )
 
 // TestRegisterPprof verifies the /debug/pprof endpoints are reachable when
-// enabled (default), so the user can capture a live heap/goroutine profile
-// while the server's memory is spiking.
+// explicitly enabled (PC_PPROF=1), so the user can capture a live
+// heap/goroutine profile while the server's memory is spiking.
 func TestRegisterPprof(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	t.Setenv("PC_PPROF", "1")
@@ -28,6 +28,7 @@ func TestRegisterPprof(t *testing.T) {
 	} {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.RemoteAddr = "127.0.0.1:43210"
 		r.ServeHTTP(w, req)
 		// The bare /debug/pprof path 301-redirects to /debug/pprof/ — that is
 		// net/http/pprof's standard behaviour and browsers follow it.
@@ -41,18 +42,38 @@ func TestRegisterPprof(t *testing.T) {
 	}
 }
 
-// TestRegisterPprof_Disabled verifies PC_PPROF=0 turns the endpoint off.
-func TestRegisterPprof_Disabled(t *testing.T) {
+// TestRegisterPprofRejectsRemote verifies opt-in pprof remains local-only.
+func TestRegisterPprofRejectsRemote(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	t.Setenv("PC_PPROF", "0")
+	t.Setenv("PC_PPROF", "1")
 	r := gin.New()
 	registerPprof(r)
 
+	req := httptest.NewRequest(http.MethodGet, "/debug/pprof/heap", nil)
+	req.RemoteAddr = "192.0.2.10:43210"
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
 	r.ServeHTTP(w, req)
-	if w.Code == http.StatusOK {
-		t.Error("pprof should be disabled when PC_PPROF=0")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("remote pprof = %d, want 403", w.Code)
+	}
+}
+
+// TestRegisterPprof_Disabled verifies the endpoint stays off unless
+// PC_PPROF=1: both an explicit "0" and the unset/empty default must disable
+// it, because heap/goroutine snapshots can contain secrets.
+func TestRegisterPprof_Disabled(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, v := range []string{"0", ""} {
+		t.Setenv("PC_PPROF", v)
+		r := gin.New()
+		registerPprof(r)
+
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+		r.ServeHTTP(w, req)
+		if w.Code == http.StatusOK {
+			t.Errorf("pprof should be disabled when PC_PPROF=%q (default off)", v)
+		}
 	}
 }
 
@@ -76,13 +97,17 @@ func TestMemoryMonitor_ConfigUpdate(t *testing.T) {
 	t.Setenv("PC_MEM_HEARTBEAT_SEC", "11")
 	t.Setenv("PC_HEAP_DUMP_MB", "22")
 	t.Setenv("PC_PPROF", "1")
+	t.Setenv("PC_DIAGNOSTICS_SNAPSHOTS", "1")
 	m := newMemoryMonitor()
 	c := m.config()
 	if c.MemHeartbeatSec != 11 || c.HeapDumpMB != 22 {
 		t.Fatalf("config = %+v, want heartbeat=11 dump=22", c)
 	}
 	if !c.PprofEnabled {
-		t.Error("pprof should be enabled when PC_PPROF != 0")
+		t.Error("pprof should be enabled when PC_PPROF == 1")
+	}
+	if !c.SnapshotEnabled {
+		t.Error("snapshot downloads should be enabled when PC_DIAGNOSTICS_SNAPSHOTS == 1")
 	}
 
 	sec, mb := 60, 4096
@@ -103,6 +128,7 @@ func TestMemoryMonitor_ConfigUpdate(t *testing.T) {
 // a gin router: memory read, config read/update, and both snapshot downloads.
 func TestDiagnosticsEndpoints(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	t.Setenv("PC_DIAGNOSTICS_SNAPSHOTS", "1")
 	mm := newMemoryMonitor()
 	mm.heapDumpDir = t.TempDir() // don't write into the user's ~/.p-chat during tests
 	h := &Handler{memMon: mm}
@@ -155,7 +181,10 @@ func TestDiagnosticsEndpoints(t *testing.T) {
 	}
 
 	for _, path := range []string{"/diagnostics/snapshot/heap", "/diagnostics/snapshot/goroutine"} {
-		w = do("GET", path, "")
+		var req = httptest.NewRequest("GET", path, nil)
+		req.RemoteAddr = "127.0.0.1:43210"
+		w = httptest.NewRecorder()
+		r.ServeHTTP(w, req)
 		if w.Code != http.StatusOK {
 			t.Fatalf("%s = %d: %s", path, w.Code, w.Body.String())
 		}
@@ -165,6 +194,34 @@ func TestDiagnosticsEndpoints(t *testing.T) {
 		if w.Body.Len() == 0 {
 			t.Errorf("%s returned empty body", path)
 		}
+	}
+}
+
+// TestDiagnosticsSnapshotsFailClosed 验证快照默认关闭，显式开启后也拒绝非本机调用。
+// TestDiagnosticsSnapshotsFailClosed verifies snapshots default off and still reject non-loopback callers when enabled.
+func TestDiagnosticsSnapshotsFailClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	mm := newMemoryMonitor()
+	mm.heapDumpDir = t.TempDir()
+	h := &Handler{memMon: mm}
+	r := gin.New()
+	r.GET("/diagnostics/snapshot/heap", h.DiagnosticsHeapSnapshot)
+
+	req := httptest.NewRequest("GET", "/diagnostics/snapshot/heap", nil)
+	req.RemoteAddr = "127.0.0.1:43210"
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "diagnostics_snapshot_disabled") {
+		t.Fatalf("default snapshot response = %d %s, want disabled 403", w.Code, w.Body.String())
+	}
+
+	t.Setenv("PC_DIAGNOSTICS_SNAPSHOTS", "1")
+	req = httptest.NewRequest("GET", "/diagnostics/snapshot/heap", nil)
+	req.RemoteAddr = "192.0.2.10:43210"
+	w = httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "diagnostics_snapshot_local_only") {
+		t.Fatalf("remote snapshot response = %d %s, want local-only 403", w.Code, w.Body.String())
 	}
 }
 

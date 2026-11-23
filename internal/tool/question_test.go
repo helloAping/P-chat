@@ -250,6 +250,60 @@ func TestWaitForAnswerSkipsSecondSendFnWhenAnswersEmpty(t *testing.T) {
 	}
 }
 
+func TestWaitForAnswerHasNoWaitTimeout(t *testing.T) {
+	sessionID := "test-question-no-timeout"
+	defer clearQuestionState(t, sessionID)()
+
+	questions := []Question{{Header: "心情", Question: "你今天心情怎么样？"}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := WaitForAnswer(context.Background(), sessionID, questions, nil)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("WaitForAnswer returned before the user submitted: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	if !SubmitAnswer(sessionID, QuestionResponse{Questions: questions, Answers: map[string]string{"心情": "好"}}) {
+		t.Fatal("SubmitAnswer returned false")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitForAnswer: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForAnswer did not unblock after submit")
+	}
+}
+
+func TestWaitForAnswerStopsWhenContextCancelled(t *testing.T) {
+	sessionID := "test-question-cancel"
+	defer clearQuestionState(t, sessionID)()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	questions := []Question{{Header: "心情", Question: "你今天心情怎么样？"}}
+	done := make(chan error, 1)
+	go func() {
+		_, err := WaitForAnswer(ctx, sessionID, questions, nil)
+		done <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("WaitForAnswer returned nil after cancel")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WaitForAnswer did not return after cancel")
+	}
+}
+
 func TestWaitForAnswerIgnoresShortToolDeadline(t *testing.T) {
 	sessionID := "test-question-interactive"
 	defer clearQuestionState(t, sessionID)()

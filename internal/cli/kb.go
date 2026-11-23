@@ -14,12 +14,15 @@ import (
 
 // KBManager manages knowledge bases for the CLI REPL.
 type KBManager struct {
-	cfg *config.Config
+	cfg        *config.Config
+	configPath string
 }
 
-// NewKBManager creates a KBManager backed by the active config.
-func NewKBManager(cfg *config.Config) *KBManager {
-	return &KBManager{cfg: cfg}
+// NewKBManager 创建绑定活动配置路径的知识库管理器。NewKBManager creates a
+// knowledge-base manager bound to the active config path; an empty path means
+// the normal global config.
+func NewKBManager(cfg *config.Config, configPath string) *KBManager {
+	return &KBManager{cfg: cfg, configPath: configPath}
 }
 
 // Views returns the current knowledge base entries with section counts.
@@ -54,18 +57,24 @@ func (m *KBManager) AddPath(path string) error {
 	}
 	name := filepath.Base(abs)
 	enabled := true
-	patch := config.KnowledgeConfigPatch{}
-	patch.Enabled = &enabled
-	patch.Bases = append(m.cfg.Knowledge.Bases, config.KnowledgeBase{
+	newBase := config.KnowledgeBase{
 		Name:    name,
 		Path:    abs,
 		Enabled: true,
-	})
-	if _, err := config.UpdateKnowledgeConfig(patch); err != nil {
+	}
+	bases := append([]config.KnowledgeBase(nil), m.cfg.Knowledge.Bases...)
+	bases = append(bases, newBase)
+	patch := config.KnowledgeConfigPatch{}
+	patch.Enabled = &enabled
+	patch.Bases = &bases
+	updated, err := config.UpdateKnowledgeConfigAt(m.configPath, patch)
+	if err != nil {
 		return fmt.Errorf("save config: %w", err)
 	}
-	m.cfg.Knowledge.Enabled = true
-	m.cfg.Knowledge.Bases = append(m.cfg.Knowledge.Bases, patch.Bases[0])
+	// 使用持久化层返回的完整结果刷新内存，避免重复追加已有的第一个知识库。
+	// Refresh memory from the persisted result so an existing first base is not
+	// appended a second time.
+	m.cfg.Knowledge = *updated
 	return nil
 }
 
@@ -85,10 +94,15 @@ func (m *KBManager) RemovePath(path string) error {
 	if idx < 0 {
 		return fmt.Errorf("knowledge base at %q not found", abs)
 	}
-	if err := config.RemoveKnowledgeBaseRecord(m.cfg.Knowledge.Bases[idx].Name); err != nil {
-		return err
+	name := m.cfg.Knowledge.Bases[idx].Name
+	bases := append([]config.KnowledgeBase(nil), m.cfg.Knowledge.Bases[:idx]...)
+	bases = append(bases, m.cfg.Knowledge.Bases[idx+1:]...)
+	patch := config.KnowledgeConfigPatch{Bases: &bases}
+	updated, err := config.UpdateKnowledgeConfigAt(m.configPath, patch)
+	if err != nil {
+		return fmt.Errorf("remove knowledge base %s: %w", name, err)
 	}
-	m.cfg.Knowledge.Bases = append(m.cfg.Knowledge.Bases[:idx], m.cfg.Knowledge.Bases[idx+1:]...)
+	m.cfg.Knowledge = *updated
 	return nil
 }
 
@@ -222,7 +236,8 @@ func (m *KBManager) Scan(name string) error {
 		seenFiles := map[string]int{}
 		var nodes []knowledge.IndexNode
 		nodes = append(nodes, l1)
-		for _, n := range allNodes {
+		for i := range allNodes {
+			n := &allNodes[i]
 			fid, ok := seenFiles[n.Source]
 			if !ok {
 				fid = nodeID
@@ -242,7 +257,7 @@ func (m *KBManager) Scan(name string) error {
 			n.ParentID = fid
 			n.Base = base.Name
 			nodeID++
-			nodes = append(nodes, n)
+			nodes = append(nodes, *n)
 		}
 		for i := range allContents {
 			allContents[i].NodeID = allNodes[i].ID
@@ -258,8 +273,6 @@ func (m *KBManager) Scan(name string) error {
 	}
 	return nil
 }
-
-
 
 // countRelIndexableFiles walks a directory and returns relative paths of indexable files.
 func countRelIndexableFiles(dir string) []string {

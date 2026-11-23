@@ -40,6 +40,68 @@ func TestStore_AddAndGet(t *testing.T) {
 	}
 }
 
+func TestStore_PreservesResponsesOutputItemsMeta(t *testing.T) {
+	s := testStore(t)
+	cid := s.CurrentConversationID()
+	raw := `[{"output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}}]`
+	s.AddChatMessageTo(cid, llm.ChatMessage{
+		Role:        llm.RoleAssistant,
+		Type:        llm.TypeText,
+		Content:     "answer",
+		MsgType:     llm.MsgTypeText,
+		SubmitToLLM: 1,
+		Meta:        map[string]any{llm.ResponsesOutputItemsMetaKey: raw},
+	})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	msgs := s.GetChatMessagesFor(cid, 10)
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d, want 1", len(msgs))
+	}
+	if got, _ := msgs[0].Meta[llm.ResponsesOutputItemsMetaKey].(string); got != raw {
+		t.Fatalf("responses items meta = %q, want %q", got, raw)
+	}
+}
+
+func TestArchiveSiblingsArchivesToolRowsOwnedByReply(t *testing.T) {
+	s := testStore(t)
+	cid := s.CurrentConversationID()
+	s.AddChatMessageTo(cid, llm.ChatMessage{Role: llm.RoleUser, Type: llm.TypeText, Content: "question", MsgType: llm.MsgTypeText, SubmitToLLM: 1})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	userID := s.GetLastUserMessageID(cid)
+	groupID := fmt.Sprintf("%d", userID)
+	replyID, err := s.AddChatMessageWithMetaToRegenNow(cid, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeText, Content: "checking", MsgType: llm.MsgTypeText, SubmitToLLM: 1}, nil, groupID, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.AddChatMessageTo(cid, llm.ChatMessage{Role: llm.RoleAssistant, Type: llm.TypeToolCall, ToolID: "call_old", ToolName: "read_file", ToolInput: `{}`, MsgType: llm.MsgTypeTool, SubmitToLLM: 1})
+	s.AddChatMessageTo(cid, llm.ChatMessage{Role: llm.RoleTool, Type: llm.TypeToolResult, ToolID: "call_old", ToolName: "read_file", Content: "old result", MsgType: llm.MsgTypeTool, SubmitToLLM: 1})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ArchiveSiblings(cid, groupID, 0); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range s.GetChatMessagesFor(cid, 20) {
+		if msg.ToolID == "call_old" {
+			t.Fatalf("archived reply left old tool branch active: %+v", msg)
+		}
+	}
+	if err := s.ActivateSibling(cid, groupID, replyID); err != nil {
+		t.Fatal(err)
+	}
+	foundTool := false
+	for _, msg := range s.GetChatMessagesFor(cid, 20) {
+		foundTool = foundTool || msg.ToolID == "call_old"
+	}
+	if !foundTool {
+		t.Fatal("activating a sibling did not restore its tool branch")
+	}
+}
+
 func TestStore_MaxHistory(t *testing.T) {
 	s := testStore(t)
 	_ = s.Flush()
@@ -139,6 +201,19 @@ func TestStore_SearchMessagesByProject(t *testing.T) {
 	}
 	if got := s.SearchMessages("needle", 10); len(got) != 3 {
 		t.Fatalf("legacy search count = %d, want 3 (%+v)", len(got), got)
+	}
+
+	// Literal % / _ must not act as wildcards (LIKE escape / FTS literal).
+	s.AddChatMessageTo(globalID, llm.ChatMessage{Role: llm.RoleUser, Content: "progress 100% done"})
+	s.AddChatMessageTo(globalID, llm.ChatMessage{Role: llm.RoleUser, Content: "snake_case_token"})
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.SearchMessages("100%", 10); len(got) != 1 || !strings.Contains(got[0].Snippet, "100%") {
+		t.Fatalf("literal percent search = %+v", got)
+	}
+	if got := s.SearchMessages("snake_case", 10); len(got) < 1 {
+		t.Fatalf("literal underscore search empty: %+v", got)
 	}
 }
 
@@ -273,6 +348,41 @@ func TestStore_ListConversations_Order(t *testing.T) {
 		if convs[i].UpdatedAt.Before(convs[i+1].UpdatedAt) {
 			t.Errorf("not sorted desc: %v > %v", convs[i].UpdatedAt, convs[i+1].UpdatedAt)
 		}
+	}
+}
+
+func TestStore_ListConversationsByProjectPathLimit_FiltersBeforeLimit(t *testing.T) {
+	s := testStore(t)
+	targetPath := filepath.Join(t.TempDir(), "target-project")
+	targetID := s.CurrentConversationID()
+	if err := s.UpdateConversationMeta(targetID, projectMetaJSON(t, targetPath)); err != nil {
+		t.Fatal(err)
+	}
+	globalID, err := s.NewConversation()
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(t.TempDir(), "other-project")
+
+	for i := 0; i < 200; i++ {
+		id, err := s.NewConversation()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.UpdateConversationMeta(id, projectMetaJSON(t, otherPath)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := s.ListConversationsByProjectPathLimit(targetPath, 200)
+	if len(got) != 1 || got[0].ID != targetID {
+		t.Fatalf("project sessions = %+v, want only %q beyond the first global 200", got, targetID)
+	}
+	if got := s.ListConversationsByProjectPathLimit("", 200); len(got) != 1 || got[0].ID != globalID {
+		t.Fatalf("global sessions = %+v, want only %q", got, globalID)
+	}
+	if got := s.ListConversationsLimit(200); len(got) != 200 {
+		t.Fatalf("unfiltered sessions = %d, want 200", len(got))
 	}
 }
 

@@ -14,11 +14,13 @@ package server
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -65,6 +67,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("too many attachments: %d (max 16)", len(req.Attachments))})
 		return
 	}
+	attachmentSignature := agent.AttachmentSignature(req.Attachments)
 	if req.ClientMsgID < 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "client_msg_id must be a positive integer"})
 		return
@@ -98,7 +101,8 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			return
 		}
 		if found {
-			if identity.ConversationID == id && identity.Role == llm.RoleUser && identity.Content == req.Message {
+			storedSignature := attachmentSignatureFromMetadata(identity.Metadata)
+			if identity.ConversationID == id && identity.Role == llm.RoleUser && identity.Content == req.Message && storedSignature == attachmentSignature {
 				c.JSON(http.StatusConflict, gin.H{
 					"error": "this client message has already been accepted; recover the existing reply instead of resending it",
 					"code":  "duplicate_client_message",
@@ -111,6 +115,16 @@ func (h *Handler) SendMessage(c *gin.Context) {
 			})
 			return
 		}
+	}
+	// Do not create inline upload files until after idempotency is resolved. An
+	// exact retry must not leave a second orphaned materialization on disk.
+	if err := h.materializeInlineFileAttachments(id, req.Attachments); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_attachment"})
+		return
+	}
+	if err := h.validateAttachmentOwnership(id, req.Attachments); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_attachment"})
+		return
 	}
 
 	// Resolve style: body override → per-session override →
@@ -232,6 +246,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		Messages:                msgs,
 		HistoryMessageCount:     historyMessageCount,
 		Attachments:             req.Attachments,
+		AttachmentSignature:     attachmentSignature,
 		UseImageRecognition:     useImageRecognition,
 		RecognitionCapabilities: h.sessionRecognitionCapabilities(id),
 		GenerationOperations:    h.sessionGenerationOperations(id),
@@ -249,6 +264,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		ProjectRoot:       meta.ProjectPath,
 		SkillContext:      req.SkillContext,
 		ActiveSkills:      append([]string(nil), req.ActiveSkills...),
+		ToolCallsEnabled:  req.ToolsEnabled,
 		PlanMode:          turnModePolicy == agent.TurnModePlan,
 		TurnModePolicy:    turnModePolicy,
 		PermissionLevel:   meta.PermissionLevel,
@@ -351,6 +367,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		// the first attempt already expanded + persisted them; TodoMode
 		// is forced to resume so an active task chain is preserved.
 		histMsgs, compSummary := h.loadHistoryForSend(baseCtx, id, provider, model)
+		resumeDocumentAttachments := latestUserDocumentAttachments(histMsgs)
 		resumeMsgs := buildLLMMessages(histMsgs)
 		// The nudge names the reason dynamically: when todos are still
 		// unfinished (the common auto-continue case — the LLM ended without
@@ -376,6 +393,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		chatReq.HistoryMessageCount = len(resumeMsgs) - 1
 		chatReq.ClientMsgID = 0
 		chatReq.Attachments = nil
+		chatReq.DocumentContextAttachments = resumeDocumentAttachments
 		chatReq.CompressedSummary = compSummary
 		chatReq.TodoMode = agent.TodoModeResume
 	}
@@ -390,6 +408,49 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	if h.agent != nil {
 		h.agent.ClearBreakerState(id)
 	}
+}
+
+func latestUserDocumentAttachments(messages []llm.ChatMessage) []agent.Attachment {
+	var reversed []agent.Attachment
+	for i := len(messages) - 1; i >= 0; i-- {
+		message := messages[i]
+		if message.Role != llm.RoleUser {
+			continue
+		}
+		if message.Type == llm.TypeText {
+			if origin, _ := message.Meta["origin"].(string); origin == "auto_resume" {
+				continue
+			}
+			break
+		}
+		if message.Type != llm.TypeFile {
+			continue
+		}
+		id := strings.TrimSpace(message.UploadID)
+		if id == "" {
+			id, _ = strings.CutPrefix(message.Content, "upl://")
+		}
+		if id != "" {
+			reversed = append(reversed, agent.Attachment{ID: id, UploadID: id, Name: message.Name, Kind: "file", MIME: message.MimeType})
+		}
+	}
+	result := make([]agent.Attachment, len(reversed))
+	for i := range reversed {
+		result[len(reversed)-1-i] = reversed[i]
+	}
+	return result
+}
+
+func attachmentSignatureFromMetadata(raw string) string {
+	if strings.TrimSpace(raw) == "" {
+		return ""
+	}
+	var meta map[string]any
+	if json.Unmarshal([]byte(raw), &meta) != nil {
+		return ""
+	}
+	value, _ := meta["attachment_signature"].(string)
+	return value
 }
 
 // turnCancelRegistration is the cleanup handle returned by
@@ -619,6 +680,9 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 	// the turn via turnCtx so the agent loop exits and the session
 	// lock releases instead of blocking until MaxTurnSeconds.
 	const sseWriteTimeout = 10 * time.Second
+	// PERF-01: hold a non-mergeable lookahead chunk between Stream
+	// callback invocations so content/thinking coalescing can peek.
+	var coalesceHold *agent.ChatStreamChunk
 	// cancelTurn aborts the in-flight turn. Resolved from
 	// c.Request.Context()'s cancel — SendMessage registered it in
 	// h.turnCancels; we look it up here so Regenerate (which also
@@ -643,7 +707,7 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 				log.Printf("[sse] panic in stream writer: %v", r)
 			}
 		}()
-		chunk, ok := <-stream
+		chunk, ok := readCoalescedChunk(stream, &coalesceHold)
 		if !ok {
 			// 流关闭但没有 done：回合超时，或仍有追踪任务时被取消，都应进入自动续跑。
 			// Stream closed without a done event. If the turn was interrupted
@@ -809,10 +873,11 @@ func (h *Handler) respondSSE(c *gin.Context, stream <-chan agent.ChatStreamChunk
 //  5. ToolName 非空          → type:"tool"        (工具调用结果)
 //  6. Thinking 非空          → type:"thinking"    (思考增量)
 //  7. Content 非空           → type:"content"     (文本增量)
-//  8. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
-//  9. ThinkingRewrite 非空   → type:"thinking_rewrite"
-//  10. Phase 非空             → type:"phase"       (子代理开始/结束 + 系统状态)
-//  11. 其他                   → type:"phase"       (心跳)
+//  8. StreamReset == true    → type:"stream_reset"  (LLM 重试，丢弃部分输出)
+//  9. ContentRewrite 非空    → type:"content_rewrite" (后处理文本重写)
+//  10. ThinkingRewrite 非空   → type:"thinking_rewrite"
+//  11. Phase 非空             → type:"phase"       (子代理开始/结束 + 系统状态)
+//  12. 其他                   → type:"phase"       (心跳)
 //
 // Sub_agent 字段在所有分支中无条件拷贝，确保子代理的 content/thinking/tool/phase
 // 事件全部带有 sub_agent=true 标记，前端能正确路由到嵌套 SubAgentCard。

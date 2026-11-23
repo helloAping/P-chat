@@ -13,7 +13,6 @@ import (
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/generation"
-	"github.com/p-chat/pchat/internal/im"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -31,8 +30,13 @@ import (
 // agent and the persistent memory store so that messages and
 // sessions survive across requests.
 type Handler struct {
-	agent      *agent.Agent
-	cfg        atomic.Pointer[config.Config]
+	agent *agent.Agent
+	cfg   atomic.Pointer[config.Config]
+	// configPath 是启动服务器时使用的可选 --config overlay 路径。
+	// configPath is the optional --config overlay used to load this server.
+	// 修改配置的端点必须用它完成持久化和热重载。
+	// Config-mutating endpoints must use it for both persistence and reloads.
+	configPath string
 	store      *memory.Store
 	styleMgr   *style.Manager
 	summarizer *memory.Summarizer
@@ -48,8 +52,6 @@ type Handler struct {
 	subagentRunner    *subagent.Default
 	mcpMgr            *mcp.Manager
 	browserMgr        *browser.Manager
-	imGateway         *im.Gateway
-	wechatQR          *im.WeChatQRManager
 	// attachResolver reads upload files by id. Used to re-hydrate
 	// "upl://<id>" media rows from disk when building the LLM
 	// context (the agent holds the same resolver for the current
@@ -62,6 +64,9 @@ type Handler struct {
 	// GET /api/v1/tools endpoint reads from here. May be
 	// nil in tests that don't need tool listing.
 	toolReg *tool.Registry
+	// fileJournal tracks before-snapshots for AE-07 undo of the
+	// latest turn's write_file / edit_file / apply_patch calls.
+	fileJournal *tool.FileJournal
 
 	// memMon powers the /api/v1/diagnostics/* endpoints (live memory,
 	// config, heap/goroutine snapshot downloads). May be nil in tests
@@ -126,6 +131,9 @@ type sessionMeta struct {
 	AutoContinue *bool
 	// TodoLongRunMode is nil when the session inherits the global policy.
 	TodoLongRunMode *config.TodoLongRunMode
+	// Tags are user-facing session labels. They ride in the existing
+	// metadata blob so adding them does not need a schema migration.
+	Tags []string
 }
 
 // sessionMetaBlob is the on-disk shape written to
@@ -155,17 +163,26 @@ type sessionMetaBlob struct {
 	// round-tripping "false" as if the user had disabled it.
 	AutoContinue    *bool                   `json:"auto_continue,omitempty"`
 	TodoLongRunMode *config.TodoLongRunMode `json:"todo_long_run_mode,omitempty"`
+	Tags            []string                `json:"tags,omitempty"`
 }
 
 func NewHandler(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager) *Handler {
+	return NewHandlerWithConfigPath(a, cfg, store, styleMgr, toolReg, mcpMgr, "")
+}
+
+// NewHandlerWithConfigPath 构造从 configPath 持久化并重载配置的处理器；空路径沿用全局配置。
+// NewHandlerWithConfigPath constructs a handler whose configuration changes
+// are persisted to and reloaded from configPath; an empty path keeps the
+// established global-config behavior.
+func NewHandlerWithConfigPath(a *agent.Agent, cfg *config.Config, store *memory.Store, styleMgr *style.Manager, toolReg *tool.Registry, mcpMgr *mcp.Manager, configPath string) *Handler {
 	h := &Handler{
-		agent:    a,
-		store:    store,
-		styleMgr: styleMgr,
-		toolReg:  toolReg,
-		mcpMgr:   mcpMgr,
-		wechatQR: im.NewWeChatQRManager(im.WeChatQRClient{}),
-		meta:     make(map[string]sessionMeta),
+		agent:      a,
+		configPath: configPath,
+		store:      store,
+		styleMgr:   styleMgr,
+		toolReg:    toolReg,
+		mcpMgr:     mcpMgr,
+		meta:       make(map[string]sessionMeta),
 	}
 	h.cfg.Store(cfg)
 	h.SetAttachmentResolver(&agent.DiskAttachmentResolver{BaseDir: UploadDir()})
@@ -192,6 +209,12 @@ func (h *Handler) SetGeneratedAssetStore(store *generation.LocalAssetStore) {
 	}
 }
 
+// SetFileJournal installs the AE-07 file-change journal used by
+// GET/POST /sessions/:id/file-changes.
+func (h *Handler) SetFileJournal(j *tool.FileJournal) {
+	h.fileJournal = j
+}
+
 func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 	return sessionMetaBlob{
 		Style:                    m.Style,
@@ -214,6 +237,7 @@ func sessionMetaToBlob(m sessionMeta) sessionMetaBlob {
 		SubAgentModel:            m.SubAgentModel,
 		AutoContinue:             m.AutoContinue,
 		TodoLongRunMode:          m.TodoLongRunMode,
+		Tags:                     append([]string(nil), m.Tags...),
 	}
 }
 
@@ -310,6 +334,7 @@ func (h *Handler) ensureMetaLoaded(id string) sessionMeta {
 				m.SubAgentModel = blob.SubAgentModel
 				m.AutoContinue = blob.AutoContinue
 				m.TodoLongRunMode = blob.TodoLongRunMode
+				m.Tags = append([]string(nil), blob.Tags...)
 			}
 		}
 	}
@@ -550,6 +575,9 @@ type SendMessageRequest struct {
 	// SkillContext 仅为旧客户端兼容保留，新客户端不应提交指令正文。
 	// SkillContext remains for legacy clients only; new clients must not submit instruction bodies.
 	ActiveSkills []string `json:"active_skills,omitempty"`
+	// ToolsEnabled 仅覆盖当前消息的工具可用性。
+	// ToolsEnabled overrides tool availability for this message only.
+	ToolsEnabled *bool `json:"tools_enabled,omitempty"`
 }
 
 // CreateSessionRequest is the body of POST /sessions.
@@ -635,6 +663,9 @@ type UpdateSessionMetaRequest struct {
 	SubAgentModelEnabled   *bool   `json:"sub_agent_model_enabled,omitempty"`
 	SubAgentProvider       *string `json:"sub_agent_provider,omitempty"`
 	SubAgentModel          *string `json:"sub_agent_model,omitempty"`
+	// Tags replaces the session label list. Nil leaves tags unchanged;
+	// an empty slice clears them.
+	Tags *[]string `json:"tags,omitempty"`
 }
 
 // SessionResponse is the JSON form of a memory.Conversation.
@@ -673,12 +704,18 @@ type SessionResponse struct {
 	SubAgentModelEnabled           bool                         `json:"sub_agent_model_enabled"`
 	SubAgentProvider               string                       `json:"sub_agent_provider,omitempty"`
 	SubAgentModel                  string                       `json:"sub_agent_model,omitempty"`
+	Tags                           []string                     `json:"tags,omitempty"`
 }
 
 // MessageResponse is the JSON form of a single message in a
 // conversation history.
 type MessageResponse struct {
 	ID int64 `json:"id"`
+	// SourceMessageIDs 记录当前可见气泡合并前的数据库行 ID。
+	// SourceMessageIDs lists the database row IDs folded into this visible
+	// bubble, allowing search hits to resolve to the DOM anchor after ReAct
+	// assistant rows or user attachment rows are merged.
+	SourceMessageIDs []int64 `json:"source_message_ids,omitempty"`
 	// Seq is the per-conversation logical position. Unlike
 	// `id` (a global AUTOINCREMENT that's never reused), seq
 	// survives rollback+undo and is the new stable cursor
@@ -710,6 +747,9 @@ type MessageResponse struct {
 	// blocks for files). The frontend renders them as part of the
 	// message bubble so the user can see what was actually sent.
 	Attachments []AttachmentPart `json:"attachments,omitempty"`
+	// AttachmentParentUserID links a storage-only attachment row to the
+	// user message it belongs to. It is not serialized to the frontend.
+	AttachmentParentUserID int64 `json:"-"`
 	// Parts is the assistant message's structured rendering:
 	// text + thinking + tool calls + sub-agent cards in stream
 	// order. Mirrors src/api/client.ts:MessagePart on the client.
@@ -741,6 +781,24 @@ type MessageResponse struct {
 	// surface archived rows (e.g. the /replies endpoint)
 	// can do so without a separate schema.
 	IsArchived bool `json:"is_archived"`
+	// AE-03: turn token + cache usage restored from message metadata.
+	TokensIn        int    `json:"tokens_in,omitempty"`
+	TokensOut       int    `json:"tokens_out,omitempty"`
+	CacheHitTokens  *int   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens *int   `json:"cache_miss_tokens,omitempty"`
+	// Elapsed is the turn duration ("3.6s"), restored so every
+	// reloaded assistant bubble shows the same footer time as the
+	// live done event.
+	Elapsed string `json:"elapsed,omitempty"`
+	// TurnTodos is the plan snapshot for the user message that started the turn.
+	TurnTodos []TurnTodo `json:"turn_todos,omitempty"`
+}
+
+// TurnTodo is one item of a plan kept on the user message.
+type TurnTodo struct {
+	ID      string `json:"id"`
+	Content string `json:"content"`
+	Status  string `json:"status"`
 }
 
 // MessagePart is one block of a structured assistant message.
@@ -1060,9 +1118,12 @@ type StreamEvent struct {
 	// Done fields
 	TokensIn  int    `json:"tokens_in,omitempty"`
 	TokensOut int    `json:"tokens_out,omitempty"`
-	Elapsed   string `json:"elapsed,omitempty"`
-	Provider  string `json:"provider,omitempty"`
-	Model     string `json:"model,omitempty"`
+	// AE-03: pointer so 0-hit is distinct from "provider did not report".
+	CacheHitTokens  *int   `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens *int   `json:"cache_miss_tokens,omitempty"`
+	Elapsed         string `json:"elapsed,omitempty"`
+	Provider        string `json:"provider,omitempty"`
+	Model           string `json:"model,omitempty"`
 	// UserMessageID is the SQLite row id of the user message
 	// that started this turn. Set only on the "done" event so
 	// the frontend can stamp it on the local Message for fork.
@@ -1276,12 +1337,6 @@ func (h *Handler) SetBrowserManager(bm *browser.Manager) {
 	h.browserMgr = bm
 }
 
-// SetIMGateway 挂载 IM Gateway，供 IM REST/SSE 端点使用。
-// SetIMGateway wires the IM Gateway for REST/SSE endpoints.
-func (h *Handler) SetIMGateway(gateway *im.Gateway) {
-	h.imGateway = gateway
-}
-
 // SetSubagentRunner wires the production sub-agent runner so runtime config
 // reloads can update the task tool closure without restarting the server.
 func (h *Handler) SetSubagentRunner(runner *subagent.Default) {
@@ -1335,7 +1390,7 @@ func (h *Handler) reloadAfterConfigChange() {
 	if h.cfg.Load() == nil {
 		return
 	}
-	cfg, err := config.Load("")
+	cfg, err := config.Load(h.configPath)
 	if err != nil {
 		return
 	}
@@ -1344,6 +1399,9 @@ func (h *Handler) reloadAfterConfigChange() {
 	// (enable, key, provider) take effect on the very next
 	// tool call without a server restart.
 	search.SetGlobal(search.BuildProvider(cfg.Search))
+	search.SetQuotaLimit(cfg.Search.DailyQuota)
+	search.SetGlobalFetcher(search.BuildFetcher(cfg.Fetch))
+	search.SetFetchQuotaLimit(cfg.Fetch.DailyQuota)
 	SyncConfigDrivenTools(h.toolReg, cfg)
 	if h.agent == nil {
 		return

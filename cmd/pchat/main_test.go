@@ -4,7 +4,27 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/httpcli"
+	"github.com/p-chat/pchat/internal/style"
 )
+
+func TestResolveSessionSettings_RestoresSavedSelection(t *testing.T) {
+	sess := httpcli.Session{Style: "cute", WorkMode: "daily", Provider: "cs", Model: "doubao"}
+	s, mode, provider, model := resolveSessionSettings(sess, style.Tech, config.WorkModeCoding, "openai", false, false)
+	if s != style.Cute || mode != config.WorkModeDaily || provider != "cs" || model != "doubao" {
+		t.Fatalf("restored %q/%q/%q/%q", s, mode, provider, model)
+	}
+}
+
+func TestResolveSessionSettings_ExplicitFlagsTakePrecedence(t *testing.T) {
+	sess := httpcli.Session{Style: "cute", WorkMode: "daily", Provider: "cs", Model: "doubao"}
+	s, mode, provider, model := resolveSessionSettings(sess, style.Tech, config.WorkModeCoding, "openai", true, true)
+	if s != style.Tech || mode != config.WorkModeDaily || provider != "openai" || model != "" {
+		t.Fatalf("resolved %q/%q/%q/%q", s, mode, provider, model)
+	}
+}
 
 func TestResolveServerBinary_ExplicitFlag(t *testing.T) {
 	dir := t.TempDir()

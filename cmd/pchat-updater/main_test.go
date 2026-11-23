@@ -43,10 +43,12 @@ func TestRunAppliesZipAndBacksUpExistingFiles(t *testing.T) {
 		"web/index.html": "<html></html>",
 	})
 
+	sum := sha256File(t, zipPath)
 	if err := run(options{
-		installDir:  installDir,
-		packagePath: zipPath,
-		waitTimeout: timeZero(),
+		installDir:     installDir,
+		packagePath:    zipPath,
+		expectedSHA256: sum,
+		waitTimeout:    timeZero(),
 	}, log.New(io.Discard, "", 0)); err != nil {
 		t.Fatal(err)
 	}
@@ -156,6 +158,55 @@ func writeZip(t *testing.T, filePath string, files map[string]string) {
 func sha256Hex(data []byte) string {
 	sum := sha256.Sum256(data)
 	return hex.EncodeToString(sum[:])
+}
+
+func sha256File(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		t.Fatal(err)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func TestRunRejectsMissingExpectedHash(t *testing.T) {
+	root := t.TempDir()
+	installDir := filepath.Join(root, "P-Chat")
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(root, "pchat-update-windows-amd64-v1.0.13.zip")
+	writeZip(t, zipPath, map[string]string{"pchat.exe": "new"})
+	if err := run(options{
+		installDir:  installDir,
+		packagePath: zipPath,
+		waitTimeout: timeZero(),
+	}, log.New(io.Discard, "", 0)); err == nil {
+		t.Fatal("expected missing sha256 error")
+	}
+}
+
+func TestRunAllowInsecureSkipsHash(t *testing.T) {
+	root := t.TempDir()
+	installDir := filepath.Join(root, "P-Chat")
+	if err := os.MkdirAll(installDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	zipPath := filepath.Join(root, "pchat-update-windows-amd64-v1.0.13.zip")
+	writeZip(t, zipPath, map[string]string{"pchat.exe": "new"})
+	if err := run(options{
+		installDir:    installDir,
+		packagePath:   zipPath,
+		allowInsecure: true,
+		waitTimeout:   timeZero(),
+	}, log.New(io.Discard, "", 0)); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func timeZero() time.Duration { return 0 }

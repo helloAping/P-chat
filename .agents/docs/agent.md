@@ -164,7 +164,7 @@ Agent 在 `ChatWithTools()` 中用 `HistoryMessageCount` 区分“已入库历�
 - 浏览器截图：`browser_screenshot` 在当前模型支持视觉或会话启用专门识图配置时可见。截图字节只保留在当前 ReAct 轮次，Agent 同时将其实体化为会话归属的 `asset_id` 并在工具 part 中持久化引用；启用专门识图配置时先转为事实观察文本，未启用时按多模态图片 payload 注入当前轮次。后续轮次只通过 `media_recognize(input_ref)` 按需读取资产，不重复保存 base64 图片行。
 - 当前轮音频/视频：当前模型明确声明对应输入能力时原生提交；否则仅在会话选择了可用媒体路由时保留显示行并给出 `media_recognize(upload_id)` 引用。两边都不可用时只告知模型存在附件，不允许假装识别。
 - 历史媒体：`replaceAttachmentReferences()` 将历史图片、视频、音频统一替换为不含二进制的 system 引用，根据可用能力指向 `media_recognize`；历史请求不重复携带大媒体 payload。
-- 文档与普通文件：可确定提取的文本、源码、PDF、Word、Excel、PowerPoint 统一保存为 `TypeFile + upload_id` 显示行，并给模型 `read_attachment(upload_id)` 引用；工具执行前再次校验上传属于当前会话。未知二进制只生成“不支持解析”的说明，不复制到项目目录，也不作为原始字节提交给模型。
+- 文档与普通文件：可确定提取的文本、源码、PDF、Word、Excel、PowerPoint 统一保存为不含二进制的 `TypeFile + upload_id` 显示行。当前轮会为每个可读文档预提取公平、有界且标明不可信数据的正文预览，确保首次模型请求能理解多文档内容；重答会从当前轮持久化的 `TypeFile` 行重建该预览，普通历史轮仍只给 `read_attachment` 引用。解析失败会进入明确的上下文错误，不得静默丢弃；扫描/图片型 PDF 当前没有 OCR，必须明确告知“无可提取文本”。工具执行前再次校验上传属于当前会话。未知二进制只生成“不支持解析”的说明，不复制到项目目录，也不作为原始字节提交给模型。
 
 这保证围绕历史媒体或文档连续追问时可以按需调用工具，同时避免每一轮都把附件二进制塞进 LLM 上下文。
 

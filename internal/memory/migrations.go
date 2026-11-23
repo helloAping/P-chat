@@ -473,6 +473,120 @@ CREATE INDEX IF NOT EXISTS idx_turn_queue_session_status ON turn_queue(session_i
 	DROP INDEX IF EXISTS idx_media_contexts_session_created;
 	DROP TABLE IF EXISTS media_contexts;`,
 	},
+	{
+		// Migration 14: PERF-02 — FTS5 index for message search.
+		//
+		// messages_fts is an external-content FTS5 table over messages.content.
+		// Triggers keep the index in sync; rebuild backfills existing rows.
+		// SearchMessages uses MATCH + SQL project filters instead of LIKE scans.
+		Version: 14,
+		Name:    "messages_fts",
+		Up: `
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content,
+    content='messages',
+    content_rowid='id',
+    tokenize='unicode61'
+);
+DROP TRIGGER IF EXISTS messages_fts_ai;
+DROP TRIGGER IF EXISTS messages_fts_ad;
+DROP TRIGGER IF EXISTS messages_fts_au;
+CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+  INSERT INTO messages_fts(rowid, content) VALUES (NEW.id, NEW.content);
+END;
+CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content)
+  VALUES ('delete', OLD.id, OLD.content);
+END;
+CREATE TRIGGER messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+  INSERT INTO messages_fts(messages_fts, rowid, content)
+  VALUES ('delete', OLD.id, OLD.content);
+  INSERT INTO messages_fts(rowid, content) VALUES (NEW.id, NEW.content);
+END;
+INSERT INTO messages_fts(messages_fts) VALUES('rebuild');`,
+		Down: `
+DROP TRIGGER IF EXISTS messages_fts_ai;
+DROP TRIGGER IF EXISTS messages_fts_ad;
+DROP TRIGGER IF EXISTS messages_fts_au;
+DROP TABLE IF EXISTS messages_fts;`,
+	},
+	{
+		// Migration 15: message bookmarks for jump-back and range context.
+		Version: 15,
+		Name:    "message_bookmarks",
+		Up: `
+CREATE TABLE IF NOT EXISTS message_bookmarks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    UNIQUE(conversation_id, message_id)
+);`,
+		Down: `DROP TABLE IF EXISTS message_bookmarks;`,
+	},
+	{
+		// Migration 16: global user memory cards, separate from style memory.
+		Version: 16,
+		Name:    "user_memories",
+		Up: `
+CREATE TABLE IF NOT EXISTS user_memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);`,
+		Down: `DROP TABLE IF EXISTS user_memories;`,
+	},
+	{
+		// Migration 17: per-project morning digest schedule.
+		Version: 17,
+		Name:    "morning_digests",
+		Up: `
+CREATE TABLE IF NOT EXISTS morning_digests (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_path TEXT NOT NULL UNIQUE,
+    weekdays TEXT NOT NULL DEFAULT '1,2,3,4,5',
+    time_of_day TEXT NOT NULL DEFAULT '09:00',
+    style TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 0,
+    last_fired TEXT NOT NULL DEFAULT '',
+    last_missed TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);`,
+		Down: `DROP TABLE IF EXISTS morning_digests;`,
+	},
+	{
+		// Migration 18: persisted turn-change summaries. Byte snapshots stay in memory.
+		Version: 18,
+		Name:    "turn_changes",
+		Up: `
+CREATE TABLE IF NOT EXISTS turn_changes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    message_id INTEGER NOT NULL,
+    tool TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    preview TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_turn_changes_conv ON turn_changes(conversation_id, message_id);`,
+		Down: `
+DROP INDEX IF EXISTS idx_turn_changes_conv;
+DROP TABLE IF EXISTS turn_changes;`,
+	},
+	{
+		// Migration 19: global memory cards and morning digests were retired.
+		// Facts belong on a speaking style. Drop both tables if a dev build created them.
+		Version: 19,
+		Name:    "drop_retired_delight_tables",
+		Up: `
+DROP TABLE IF EXISTS user_memories;
+DROP TABLE IF EXISTS morning_digests;`,
+		Down: `SELECT 1;`,
+	},
 }
 
 const versionTableSchema = `CREATE TABLE IF NOT EXISTS schema_migrations (

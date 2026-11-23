@@ -33,6 +33,7 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/SkillCallCard.vue` | Skill 调用生命周期卡片，明确显示实际 Skill 名称 | |
 | `components/SubAgentCard.vue` | 子代理嵌套卡片（header + inner parts） | |
 | `components/SessionSidebar.vue` | 会话列表 + 项目选择器 + 设置 | |
+| `api/update.ts` | 更新检查/下载、按渠道缓存、下载版本冲突提示 | `checkUpdate()`, `downloadUpdate()` |
 | `components/CommandPalette.vue` | `/` 斜杠命令内联自动补全 | |
 | `components/TodoPanel.vue` | 待办事项面板（交互式） | |
 | `components/QuestionModal.vue` | 多选问题对话框 | |
@@ -42,6 +43,8 @@ P-Chat 的浏览器端 GUI，提供会话列表、聊天窗口、子代理卡片
 | `components/AppSettingsModal.vue` | Provider/Model/Style/知识库管理 | 左右分栏 + provider/model 测试 + KB 三层树视图 + NCollapse |
 
 ## 核心概念
+
+「关于 P-Chat」中的“接收预览版本（Beta）”默认关闭，选择保存在当前 WebView/浏览器的 `localStorage`。切换后清空旧检查和下载状态；检查与下载使用同一渠道，下载带 `expected_version`，版本变化时重新检查并让用户确认。界面只展示服务端允许的版本；发布站渠道筛选契约见 [server.md](server.md)。
 
 ### 1. Parts 模型（MessagePart）
 
@@ -80,6 +83,7 @@ GUI 的动态 `/<skill-name> [请求]` 只把名称写入 `active_skills`。服�
 ```typescript
 switch (ev.type) {
     case 'content':        // 追加文本增量 (含 sub_agent 路由)
+    case 'stream_reset':   // LLM 重试：仅回滚当前 round/attempt 的尾部文本与思考
     case 'content_rewrite': // 服务端后处理重写（phantom error 清洗）
     case 'thinking':        // 追加思考增量
     case 'thinking_rewrite': // 思考块重写
@@ -198,12 +202,22 @@ OpenAI Chat、OpenAI Responses、Anthropic Messages。
 
 ### 8.3 附件预览与发送时序
 
-`addAttachment()` 在选择文件时立即插入本地预览占位，并用同一个 `_ready`
-任务完成文件读取和 `/uploads` 上传。普通消息发送时，`InputArea.send()` 先用独立的
-本地 blob URL 插入用户气泡，再等待 `_ready`，随后复用已有 `upload_id` 组装请求；
-发送阶段不得再次调用上传接口。图片、视频、音频、PDF 和 Office 文档都携带同一
-`upload_id` 引用；只有上传失败时才回退到内联数据。非媒体附件不再把 data URL
-误放进 `text` 字段，服务端会把引用持久化并按需交给 `read_attachment`。
+`addAttachments()` 在选择或粘贴文件时同步插入全部本地预览占位，按选择顺序保留，
+并以最多 4 个并发任务完成读取和 `/uploads` 上传。每次上传必须附带当前 `session_id`；
+待选附件上限为 16 个。普通消息发送时，`InputArea.send()` 先等待各附件的 `_ready`，
+再创建用户气泡并复用已有 `upload_id` 组装请求；发送阶段不得再次调用上传接口。
+附件下载/历史预览 URL 必须带当前 `session_id`；服务端会拒绝无会话或跨会话的 upload 读取。
+
+PDF、Office 文档及其他 `file` 附件必须取得持久化 `upload_id`：上传失败且没有输入文字时会中止
+本次发送；已有文字时明确询问用户是否排除失败文档，仅在确认后发送文字及成功附件。
+取消时保留输入文字和附件；绝不将文档字节伪装为成功的内联附件或留下
+乐观用户气泡。图片、视频、音频和纯文本才允许在上传失败时使用内联回退。文件选择与
+剪贴板粘贴必须共用 `addAttachments()`，避免两条路径出现不同的并发或失败语义。
+服务端返回 `invalid_attachment` 时，上传错误会显示具体文件原因，并保留在失败附件的悬浮提示及再次发送时的阻断提示中。
+对于旧版已上传但在发送时才被校验出损坏的文档，初始 HTTP 400 属于“消息未被接受”，不是 SSE 断流：
+前端不重试、不触发快照恢复，并移除本回合的乐观用户气泡和空 assistant 占位；输入文字与原附件 `upload_id`
+回到编辑区，损坏附件标为失败，用户需移除并重新上传。队列回合遇到同类拒绝时保留 failed 队列项供编辑/重试，
+但移除未入库的本地气泡。
 
 所有 data URL 预览统一通过 `utils/mediaPreview.ts` 转换；Blob MIME 只取 data URL
 元数据中第一个分号前的媒体类型，不能把 `;base64` 当作 MIME 的一部分。会话换页、
@@ -212,7 +226,8 @@ OpenAI Chat、OpenAI Responses、Anthropic Messages。
 撤回用户消息时，GUI 以被点击的用户消息作为草稿来源，同时从撤回响应中合并该回合
 拆开的附件行，将文字和附件原子回填到 `InputArea`。历史 `/uploads/:id` 地址转换为
 已有上传引用，不重新上传；回填附件带撤回来源标记。点击“撤销”时只移除仍属于该
-来源的附件，并且仅当输入文字未被用户修改时清空文字。关闭撤回提示只放弃撤销能力，
+来源的附件，并且仅当输入文字未被用户修改时清空文字。新写入的附件行通过
+`attachment_parent_user_id` 绑定源用户消息，历史旧行才回退到相邻合并。关闭撤回提示只放弃撤销能力，
 不清空已经回填的草稿。撤销后消息列表使用撤回前已归一化的 GUI 消息恢复，避免附件
 行重新拆成多个气泡。
 
@@ -260,6 +275,21 @@ header 的 📋 复制按钮可点（stopPropagation 防 toggle）。
 `regenerateMessage` action：弹掉本地 trailing bubble → 调
 `api.streamRegenerate` → 走正常 stream 路径。auto-continue
 从 0 重新计数（算新 stream）。
+
+#### REL-01 LLM 重试流重置
+
+- 每轮 `phase=llm` 且 `step=round-N` 的事件记录当前 parts 长度，作为本轮 attempt 边界。
+- `stream_reset` 只删除该边界之后的 `text` / `thinking`，不得删除同一气泡内前面已成功的 ReAct 轮次。
+- round 边界保存在前端 `WeakMap` 运行态中，不扩展、不持久化 `MessagePart` 数据结构。
+- 兼容没有 round phase 的旧流时，仅回滚连续的尾部 text/thinking，遇到 tool/skill/question/sub-agent 等结构 part 立即停止。
+
+#### SM-01 搜索结果精确定位
+
+- 历史响应为每个可见气泡返回 `source_message_ids[]`；多轮 assistant 行或用户附件行合并后，搜索命中的原始行 ID 仍能映射到真正的 `[data-msg-id]` DOM 锚点。
+- `jumpToSearchResult()` 先刷新最新历史游标，再按 `oldest_seq` / `oldest_id` 持续加载，直到命中或服务端明确表示无更早数据；不使用固定页数上限。
+- 分页游标停滞、网络错误、行已删除/归档、DOM 锚点缺失都会显式失败；侧边栏保留搜索结果并显示错误，不静默清空。
+- 定位 Promise 在会话切换、ChatWindow 卸载或 5 秒 DOM 回执故障边界到期时主动 reject，避免悬挂。5 秒仅是异常兜底，不是动画时长。
+- 高亮用 `--brand-500` + `--dur-highlight`，并由 `animationend` 移除 class。
 
 ### 10. Round 3 增强 (2026-07-15)
 
@@ -382,7 +412,7 @@ compositor-only 原则：`transform` 平移超宽渐变条 + `background-size`
 `GET /api/v1/provider-presets` 和 provider 策略。模型可手工添加，也可通过“获取模型”
 调用策略化模型发现；选择上游模型只会预填普通模型编辑弹窗，用户确认能力、上下文与端点
 后才持久化。它同时支持 `llm/media_generation` 模型类型；LLM 保存可编辑
-`api_endpoint`，媒体模型勾选 operation 能力并保存一份共享端点后缀配置，同时可在
+`api_endpoint`，并可在端点后选择模型级请求协议，留空时继承 Provider；媒体模型勾选 operation 能力并保存一份共享端点后缀配置，同时可在
 `operations[operation]` 中保存单能力覆盖。默认值按供应商、协议与能力带入；运行时再与
 Provider Base URL 拼接。系统页“媒体生成”按能力选择应用默认模型。
 

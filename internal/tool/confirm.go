@@ -2,6 +2,8 @@ package tool
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -9,9 +11,12 @@ import (
 )
 
 type ConfirmRequest struct {
-	ToolName string `json:"tool_name"`
-	Args     string `json:"args"`
-	Reason   string `json:"reason"`
+	// ConfirmID binds the user's response to this exact pending request. It is
+	// generated server-side from crypto/rand before the request is emitted.
+	ConfirmID string `json:"confirm_id"`
+	ToolName  string `json:"tool_name"`
+	Args      string `json:"args"`
+	Reason    string `json:"reason"`
 	// ResolvedPath is the absolute path the LLM will actually
 	// touch (post resolveToProjectRoot, post `..` cleanup).
 	// Surfaced in the modal so the user can SEE the real target
@@ -32,8 +37,21 @@ type ConfirmRequest struct {
 }
 
 type ConfirmResponse struct {
-	Approved bool   `json:"approved"`
-	Action   string `json:"action,omitempty"`
+	ConfirmID string `json:"confirm_id,omitempty"`
+	Approved  bool   `json:"approved"`
+	Action    string `json:"action,omitempty"`
+	// StyleID and NewStyleLabel are set when the user confirms remember.
+	// Exactly one is used: an existing persona, or the name of a new one.
+	StyleID       string `json:"style_id,omitempty"`
+	NewStyleLabel string `json:"new_style_label,omitempty"`
+}
+
+// ConfirmSubmission describes the pending confirmation that accepted a
+// response. Callers use Explicit to preserve one-time approval semantics.
+type ConfirmSubmission struct {
+	ConfirmID string
+	Explicit  bool
+	Action    string
 }
 
 const (
@@ -43,8 +61,9 @@ const (
 )
 
 type pendingConfirm struct {
-	req ConfirmRequest
-	ch  chan ConfirmResponse
+	req      ConfirmRequest
+	ch       chan ConfirmResponse
+	explicit bool
 }
 
 var (
@@ -55,10 +74,17 @@ var (
 )
 
 func WaitForConfirmResponse(ctx context.Context, sessionID string, req ConfirmRequest) (ConfirmResponse, error) {
+	return waitForConfirmResponse(ctx, sessionID, req, false)
+}
+
+func waitForConfirmResponse(ctx context.Context, sessionID string, req ConfirmRequest, explicit bool) (ConfirmResponse, error) {
+	if err := PrepareConfirmRequest(&req); err != nil {
+		return ConfirmResponse{Approved: false, Action: ConfirmActionReject}, err
+	}
 	ch := make(chan ConfirmResponse, 1)
 
 	confirmMu.Lock()
-	confirmChs[sessionID] = append(confirmChs[sessionID], pendingConfirm{req: req, ch: ch})
+	confirmChs[sessionID] = append(confirmChs[sessionID], pendingConfirm{req: req, ch: ch, explicit: explicit})
 	confirmMu.Unlock()
 
 	defer func() {
@@ -102,24 +128,50 @@ func WaitForConfirm(ctx context.Context, sessionID string, req ConfirmRequest) (
 	return resp.Approved, nil
 }
 
-func SubmitConfirmResponse(sessionID string, resp ConfirmResponse) bool {
+// SubmitConfirmResponseDetailed delivers a response to the exact pending
+// confirmation. Requests without ConfirmID are accepted only when the session
+// has exactly one pending confirmation, preserving old-client compatibility
+// without allowing FIFO cross-approval.
+func SubmitConfirmResponseDetailed(sessionID string, resp ConfirmResponse) (ConfirmSubmission, bool) {
 	resp = normalizeConfirmResponse(resp)
 	confirmMu.Lock()
 	list := confirmChs[sessionID]
 	if len(list) == 0 {
 		confirmMu.Unlock()
-		return false
+		return ConfirmSubmission{}, false
 	}
-	item := list[0]
-	// Copy the tail into a fresh slice so a concurrent
-	// WaitForConfirm append cannot write into the slot we
-	// just released via list[1:] (slice aliasing bug).
-	rest := make([]pendingConfirm, len(list)-1)
-	copy(rest, list[1:])
+	index := -1
+	if resp.ConfirmID == "" {
+		if len(list) == 1 {
+			index = 0
+		}
+	} else {
+		for i, candidate := range list {
+			if candidate.req.ConfirmID == resp.ConfirmID {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		confirmMu.Unlock()
+		return ConfirmSubmission{}, false
+	}
+	item := list[index]
+	// Copy around the selected entry so concurrent appends cannot reuse a
+	// removed backing-array slot.
+	rest := make([]pendingConfirm, 0, len(list)-1)
+	rest = append(rest, list[:index]...)
+	rest = append(rest, list[index+1:]...)
 	confirmChs[sessionID] = rest
 	if len(confirmChs[sessionID]) == 0 {
 		delete(confirmChs, sessionID)
 	}
+	if item.explicit && resp.Action == ConfirmActionAlways {
+		resp.Action = ConfirmActionOnce
+		resp.Approved = true
+	}
+	resp.ConfirmID = item.req.ConfirmID
 	if resp.Action == ConfirmActionAlways && resp.Approved {
 		rememberAllowedConfirmLocked(sessionID, item.req)
 	}
@@ -127,10 +179,17 @@ func SubmitConfirmResponse(sessionID string, resp ConfirmResponse) bool {
 
 	select {
 	case item.ch <- resp:
-		return true
+		return ConfirmSubmission{ConfirmID: item.req.ConfirmID, Explicit: item.explicit, Action: resp.Action}, true
 	default:
-		return false
+		return ConfirmSubmission{}, false
 	}
+}
+
+// SubmitConfirmResponse retains the original boolean API for existing
+// in-process callers. New transport code should use SubmitConfirmResponseDetailed.
+func SubmitConfirmResponse(sessionID string, resp ConfirmResponse) bool {
+	_, ok := SubmitConfirmResponseDetailed(sessionID, resp)
+	return ok
 }
 
 func SubmitConfirm(sessionID string, approved bool) bool {
@@ -186,8 +245,19 @@ func SetSessionPermissionLevel(sessionID, level string) {
 	level = NormalizePermissionLevel(level)
 	sessionPermissions[sessionID] = level
 	if level == PermissionAuto || level == PermissionFull {
-		approvePending = append(approvePending, confirmChs[sessionID]...)
-		delete(confirmChs, sessionID)
+		remaining := make([]pendingConfirm, 0, len(confirmChs[sessionID]))
+		for _, item := range confirmChs[sessionID] {
+			if item.explicit {
+				remaining = append(remaining, item)
+				continue
+			}
+			approvePending = append(approvePending, item)
+		}
+		if len(remaining) == 0 {
+			delete(confirmChs, sessionID)
+		} else {
+			confirmChs[sessionID] = remaining
+		}
 	}
 	confirmMu.Unlock()
 
@@ -272,6 +342,24 @@ func compactSpaces(s string) string {
 func MarshalConfirm(req ConfirmRequest) string {
 	data, _ := json.Marshal(req)
 	return string(data)
+}
+
+// PrepareConfirmRequest assigns a cryptographically unpredictable ID to a
+// confirmation request. Failure is returned to the caller so it can fail
+// closed instead of emitting an unmatchable prompt.
+func PrepareConfirmRequest(req *ConfirmRequest) error {
+	if req == nil {
+		return fmt.Errorf("confirm request is nil")
+	}
+	if req.ConfirmID != "" {
+		return nil
+	}
+	bytes := make([]byte, 18)
+	if _, err := rand.Read(bytes); err != nil {
+		return fmt.Errorf("generate confirm id: %w", err)
+	}
+	req.ConfirmID = base64.RawURLEncoding.EncodeToString(bytes)
+	return nil
 }
 
 // confirmEmitterKey stores a function that pushes a ConfirmRequest
@@ -382,6 +470,55 @@ func RequireConfirm(ctx context.Context, req ConfirmRequest) (bool, error) {
 		return true, nil
 	}
 
+	if err := PrepareConfirmRequest(&req); err != nil {
+		return false, err
+	}
 	emit(req)
 	return WaitForConfirm(ctx, sid, req)
+}
+
+// RequireExplicitConfirm 强制一次真实用户确认，不受 full/auto 会话权限或“始终允许”缓存影响。
+// RequireExplicitConfirm requires one real user approval, ignoring full/auto session permissions and allow caches.
+func RequireExplicitConfirm(ctx context.Context, req ConfirmRequest) (bool, error) {
+	if ctx == nil {
+		return false, fmt.Errorf("explicit confirm unavailable (nil context)")
+	}
+	if ParentAuthorityOnlyFromCtx(ctx) {
+		return false, fmt.Errorf("explicit confirm requires parent conversation approval")
+	}
+	sid, _ := ctx.Value(SessionIDKey{}).(string)
+	emit := confirmEmitterFromCtx(ctx)
+	if emit == nil || sid == "" {
+		return false, fmt.Errorf("explicit confirm unavailable (session or emitter missing)")
+	}
+	if err := PrepareConfirmRequest(&req); err != nil {
+		return false, err
+	}
+	emit(req)
+	resp, err := waitForConfirmResponse(ctx, sid, req, true)
+	if err != nil {
+		return false, err
+	}
+	return resp.Approved, nil
+}
+
+// WaitExplicitConfirm is RequireExplicitConfirm with the full response,
+// so callers can read a style choice the user attached to the approval.
+func WaitExplicitConfirm(ctx context.Context, req ConfirmRequest) (ConfirmResponse, error) {
+	if ctx == nil {
+		return ConfirmResponse{}, fmt.Errorf("explicit confirm unavailable (nil context)")
+	}
+	if ParentAuthorityOnlyFromCtx(ctx) {
+		return ConfirmResponse{}, fmt.Errorf("explicit confirm requires parent conversation approval")
+	}
+	sid, _ := ctx.Value(SessionIDKey{}).(string)
+	emit := confirmEmitterFromCtx(ctx)
+	if emit == nil || sid == "" {
+		return ConfirmResponse{}, fmt.Errorf("explicit confirm unavailable (session or emitter missing)")
+	}
+	if err := PrepareConfirmRequest(&req); err != nil {
+		return ConfirmResponse{}, err
+	}
+	emit(req)
+	return waitForConfirmResponse(ctx, sid, req, true)
 }

@@ -195,21 +195,39 @@ func (h *Handler) QuestionResponse(c *gin.Context) {
 func (h *Handler) ConfirmResponse(c *gin.Context) {
 	id := c.Param("id")
 	var body struct {
-		Approved bool   `json:"approved"`
-		Action   string `json:"action,omitempty"`
+		ConfirmID     string `json:"confirm_id,omitempty"`
+		Approved      bool   `json:"approved"`
+		Action        string `json:"action,omitempty"`
+		StyleID       string `json:"style_id,omitempty"`
+		NewStyleLabel string `json:"new_style_label,omitempty"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if !tool.SubmitConfirmResponse(id, tool.ConfirmResponse{Approved: body.Approved, Action: body.Action}) {
+	matched, ok := tool.SubmitConfirmResponseDetailed(id, tool.ConfirmResponse{
+		ConfirmID:     body.ConfirmID,
+		Approved:      body.Approved,
+		Action:        body.Action,
+		StyleID:       body.StyleID,
+		NewStyleLabel: body.NewStyleLabel,
+	})
+	if !ok {
 		c.JSON(http.StatusNotFound, gin.H{"error": "no pending confirm for this session"})
 		return
 	}
-	if body.Action == tool.ConfirmActionAlways {
+	// Explicit confirmations are one-time by contract. The matching and
+	// normalization happen under confirmMu before this handler observes the
+	// result, so an "always" response cannot race into a full session grant.
+	if matched.Action == tool.ConfirmActionAlways && !matched.Explicit {
 		h.setSessionPermissionLevel(id, tool.PermissionFull)
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{
+		"ok":         true,
+		"confirm_id": matched.ConfirmID,
+		"action":     matched.Action,
+		"explicit":   matched.Explicit,
+	})
 }
 
 // ExecutePlan clears plan mode after the user has reviewed a plan.

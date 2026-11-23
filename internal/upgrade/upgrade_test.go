@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"os"
@@ -10,8 +11,270 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+func TestRun_V19ToV20CreatesMessagesFTS(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	// External-content FTS5 requires the content table to exist.
+	if _, err := db.Exec(`CREATE TABLE messages (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		content TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO messages (content) VALUES ('needle in haystack')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUserVersion(V19); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V19: %v", err)
+	}
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want current", got)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE name='messages_fts'`).Scan(&name); err != nil {
+		t.Fatalf("messages_fts missing: %v", err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM messages_fts WHERE messages_fts MATCH 'needle'`).Scan(&n); err != nil {
+		t.Fatalf("fts match: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("fts hits = %d, want 1", n)
+	}
+	if err := stepV19toV20(db); err != nil {
+		t.Fatalf("repeat V20 step: %v", err)
+	}
+}
+
+func TestRun_V20ToV21CreatesBookmarks(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V20); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V20: %v", err)
+	}
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want current", got)
+	}
+	var name string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='message_bookmarks'`).Scan(&name); err != nil {
+		t.Fatalf("message_bookmarks missing: %v", err)
+	}
+	if err := stepV20toV21(db); err != nil {
+		t.Fatalf("repeat V21 step: %v", err)
+	}
+}
+
+func TestRun_V21ToV24CreatesDelightTables(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db")+
+		"?_pragma=journal_mode(WAL)&_pragma=foreign_keys(ON)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V21); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V21: %v", err)
+	}
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want current", got)
+	}
+	var turnChanges string
+	if err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name='turn_changes'`).Scan(&turnChanges); err != nil {
+		t.Fatalf("turn_changes missing: %v", err)
+	}
+	for _, name := range []string{"user_memories", "morning_digests"} {
+		var got string
+		err := db.QueryRow(`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, name).Scan(&got)
+		if err == nil {
+			t.Fatalf("%s should have been dropped, still present", name)
+		}
+	}
+	if err := stepV23toV24(db); err != nil {
+		t.Fatalf("repeat V24 step: %v", err)
+	}
+}
+
+func TestRun_V18ToV19MergesWindowsSandboxBaselines(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{
+  "sandbox": {
+    "enabled": true,
+    "require_confirm": "dangerous",
+    "exec_dangerous_patterns": ["\\brm\\s+-rf\\s+/"],
+    "write_protected_paths": [".ssh/"]
+  },
+  "llm": {"default": "local"}
+}`)
+	if err := os.WriteFile(configPath, input, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUserVersion(V18); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(nil); err != nil {
+		t.Fatalf("Run from V18: %v", err)
+	}
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want Current=%d", got, Current)
+	}
+	output, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]any
+	if err := json.Unmarshal(output, &root); err != nil {
+		t.Fatal(err)
+	}
+	sandbox, _ := root["sandbox"].(map[string]any)
+	patterns, _ := sandbox["exec_dangerous_patterns"].([]any)
+	paths, _ := sandbox["write_protected_paths"].([]any)
+	foundPattern, foundPath := false, false
+	for _, p := range patterns {
+		if s, ok := p.(string); ok && s == `(?i)\bdiskpart\b` {
+			foundPattern = true
+		}
+		if s, ok := p.(string); ok && s == `\brm\s+-rf\s+/` {
+			// keep user pattern
+		}
+	}
+	for _, p := range paths {
+		if s, ok := p.(string); ok && s == `C:\Windows\` {
+			foundPath = true
+		}
+	}
+	if !foundPattern {
+		t.Fatalf("windows exec pattern not merged: %s", output)
+	}
+	if !foundPath {
+		t.Fatalf("windows write path not merged: %s", output)
+	}
+	if err := stepV18toV19(nil); err != nil {
+		t.Fatalf("repeat V19 step: %v", err)
+	}
+	repeated, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output, repeated) {
+		t.Fatal("repeat V19 step rewrote unchanged config")
+	}
+}
+
+func TestRun_V17ToV18RemovesIMConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{"im":{"platforms":[{"token":"secret"}]},"llm":{"default":"local"},"future":{"enabled":true}}`)
+	if err := os.WriteFile(configPath, input, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeUserVersion(V17); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(nil); err != nil {
+		t.Fatalf("Run from V17: %v", err)
+	}
+	if got := readUserVersion(); got != Current {
+		t.Fatalf("version = %d, want Current=%d", got, Current)
+	}
+	output, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(output, &root); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := root["im"]; exists {
+		t.Fatal("retired IM configuration remains")
+	}
+	var llm map[string]any
+	var future map[string]any
+	if err := json.Unmarshal(root["llm"], &llm); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(root["future"], &future); err != nil {
+		t.Fatal(err)
+	}
+	if llm["default"] != "local" || future["enabled"] != true {
+		t.Fatalf("unrelated config changed: %s", output)
+	}
+	if err := stepV17toV18(nil); err != nil {
+		t.Fatalf("repeat V18 step: %v", err)
+	}
+	repeated, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(output, repeated) {
+		t.Fatal("repeat V18 step rewrote unchanged config")
+	}
+}
+
+func TestV18MigrationLeavesMalformedConfigUntouched(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	configPath := filepath.Join(dir, ".p-chat", "config.json")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	input := []byte(`{"im":`)
+	if err := os.WriteFile(configPath, input, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := stepV17toV18(nil); err == nil {
+		t.Fatal("expected malformed config error")
+	}
+	output, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(input, output) {
+		t.Fatal("malformed config was modified")
+	}
+}
+
 func TestRun_CurrentVersion(t *testing.T) {
-	// Simulate a fresh install at Current version: V0→V3 all at once.
+	// Simulate a fresh install upgraded from V0 to Current.
 	orig := versionFilePath()
 
 	dir := t.TempDir()
@@ -80,6 +343,34 @@ func TestRun_Idempotent(t *testing.T) {
 	// Third run.
 	if err := Run(db); err != nil {
 		t.Fatalf("third Run: %v", err)
+	}
+}
+
+func TestRun_V16ToV17CreatesUploadOwnerDirectory(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	if err := os.MkdirAll(filepath.Join(dir, ".p-chat"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", filepath.Join(dir, ".p-chat", "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := writeUserVersion(V16); err != nil {
+		t.Fatal(err)
+	}
+	if err := Run(db); err != nil {
+		t.Fatalf("Run from V16: %v", err)
+	}
+	if v := readUserVersion(); v != Current {
+		t.Fatalf("version = %d, want Current", v)
+	}
+	if info, err := os.Stat(filepath.Join(dir, ".p-chat", "uploads")); err != nil || !info.IsDir() {
+		t.Fatalf("uploads dir missing: info=%v err=%v", info, err)
+	}
+	if err := stepV16toV17(db); err != nil {
+		t.Fatalf("V17 step should be idempotent: %v", err)
 	}
 }
 

@@ -10,7 +10,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +44,11 @@ type StreamChunk struct {
 	// Native tool calls (from OpenAI tool_calls field).
 	// Each chunk may contain a partial tool call. Collect them via index.
 	ToolCallDelta *ToolCallDelta
+
+	// ResponsesOutputItem 保留一个完整的 Responses API 输出项，供后续工具轮精确回放。
+	// ResponsesOutputItem preserves one complete Responses API output item for exact replay in a later tool round.
+	// 其他协议适配器保持 nil。Other protocol adapters leave it nil.
+	ResponsesOutputItem *ResponsesOutputItem
 }
 
 // ToolCallDelta is a single delta for one tool call.
@@ -52,9 +56,23 @@ type StreamChunk struct {
 type ToolCallDelta struct {
 	Index    int    // 0-based index of the tool call in the response
 	ID       string // empty in subsequent chunks (same as first)
+	ItemID   string // Responses 输出项 ID（fc_*），不同于 call_id。Responses output item id, distinct from call_id.
 	Name     string // empty in subsequent chunks (same as first)
 	ArgsJSON string // accumulated JSON arguments
 }
+
+// ResponsesOutputItem 是 response.output_item.done 输出项的无损表示。
+// ResponsesOutputItem is the lossless representation of an item emitted by response.output_item.done.
+// Item 故意保留原始 JSON，以便未来字段和 encrypted_content 能被原样回放。
+// Item intentionally remains raw JSON so future fields and encrypted_content survive replay.
+type ResponsesOutputItem struct {
+	OutputIndex int             `json:"output_index"`
+	Item        json.RawMessage `json:"item"`
+}
+
+// ResponsesOutputItemsMetaKey 在助手消息上保存 JSON 编码的原生输出项。
+// ResponsesOutputItemsMetaKey stores JSON-encoded native output items on an assistant message.
+const ResponsesOutputItemsMetaKey = "responses_output_items"
 
 // ChatOptions carries per-request sampling parameters. Zero values
 // mean "use the underlying API default". When OpenAI receives
@@ -85,13 +103,14 @@ type ProviderInfo struct {
 }
 
 type providerEntry struct {
-	name          string // provider name (for error messages)
-	protocol      string // openai/openai_chat/openai_responses/anthropic/anthropic_messages
-	model         string
-	apiKey        string
-	baseURL       string
-	modelAPIURLs  map[string]string
-	customHeaders map[string]string
+	name           string // provider name (for error messages)
+	protocol       string // openai/openai_chat/openai_responses/anthropic/anthropic_messages
+	model          string
+	apiKey         string
+	baseURL        string
+	modelAPIURLs   map[string]string
+	modelProtocols map[string]string
+	customHeaders  map[string]string
 
 	// ResponseHeaderTimeout bounds a stalled request before the server
 	// responds. StreamIdleTimeout only applies after a response is open,
@@ -104,15 +123,23 @@ func (p *providerEntry) endpointForModel(model string) string {
 	if endpoint := strings.TrimSpace(p.modelAPIURLs[model]); endpoint != "" {
 		return endpoint
 	}
-	return config.JoinAPIURL(p.baseURL, config.DefaultLLMAPIEndpoint(p.protocol))
+	return config.JoinAPIURL(p.baseURL, config.DefaultLLMAPIEndpoint(p.protocolForModel(model)))
+}
+
+func (p *providerEntry) protocolForModel(model string) string {
+	if protocol := strings.TrimSpace(p.modelProtocols[model]); protocol != "" {
+		return config.NormalizeProtocol(protocol)
+	}
+	return config.NormalizeProtocol(p.protocol)
 }
 
 func (p *providerEntry) adapterForModel(model string) ProtocolAdapter {
 	endpoint := p.endpointForModel(model)
-	if config.ProtocolIsAnthropic(p.protocol) {
+	protocol := p.protocolForModel(model)
+	if config.ProtocolIsAnthropic(protocol) {
 		return NewAnthropicAdapter(endpoint, p.apiKey, p.name)
 	}
-	if config.ProtocolIsOpenAIResponses(p.protocol) {
+	if config.ProtocolIsOpenAIResponses(protocol) {
 		return NewOpenAIResponsesAdapter(endpoint, p.apiKey, p.name)
 	}
 	return NewOpenAIAdapter(endpoint, p.apiKey, p.name)
@@ -313,6 +340,7 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 			apiKey:                p.APIKey,
 			baseURL:               p.EffectiveBaseURL(),
 			modelAPIURLs:          make(map[string]string),
+			modelProtocols:        make(map[string]string),
 			customHeaders:         requestheader.CloneTemplates(p.CustomHeaders),
 			responseHeaderTimeout: defaultResponseHeaderTimeout,
 			streamIdleTimeout:     defaultStreamIdleTimeout,
@@ -323,6 +351,7 @@ func (c *Client) init(cfg *config.LLMConfig) error {
 		for _, model := range p.AllModels() {
 			if model.EffectiveType() == config.ModelTypeLLM {
 				entry.modelAPIURLs[model.Name] = p.ModelAPIURL(model.Name)
+				entry.modelProtocols[model.Name] = model.EffectiveProtocol(p.GetProtocol())
 			}
 		}
 
@@ -417,7 +446,7 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 	// Inject reasoning_effort (OpenAI) or thinking (Anthropic)
 	// into the request body when the caller sets a reasoning level.
 	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
-		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
+		req.Body = injectReasoning(req.Body, p.protocolForModel(model), opts.ReasoningEffort)
 	}
 	// T2 diagnostics: log the message vs tool breakdown so an over-window
 	// request can be attributed to the right side. The my-blog dead-loop
@@ -438,6 +467,11 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		normalizedContextWindow(c.ContextWindow(p.name, model)),
 		len(req.Body),
 	)
+	if config.ProtocolIsOpenAIResponses(p.protocolForModel(model)) {
+		if shape, ok := responsesRequestShapeSummary(req.Body); ok {
+			log.Printf("%s[llm/responses/shape] %s", trace.LogPrefix(ctx), shape)
+		}
+	}
 
 	// Give this round its own cancellation path. The idle watchdog cancels the
 	// transport while the caller's context stays available to receive the
@@ -478,7 +512,7 @@ func (c *Client) ChatStreamCM(ctx context.Context, providerName, modelName strin
 		resp.Body.Close()
 		cancelStream()
 		ch := make(chan StreamChunk, 1)
-		ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(errBody)))}
+		ch <- StreamChunk{Err: ClassifyAPIError(p.name, upstreamHTTPError("llm", resp.StatusCode, errBody))}
 		close(ch)
 		return ch
 	}
@@ -514,7 +548,7 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 		return "", err
 	}
 	if opts.ReasoningEffort != "" && opts.ReasoningEffort != "off" {
-		req.Body = injectReasoning(req.Body, p.protocol, opts.ReasoningEffort)
+		req.Body = injectReasoning(req.Body, p.protocolForModel(model), opts.ReasoningEffort)
 	}
 	req.Body = forceNonStreamingBody(req.Body)
 
@@ -556,9 +590,9 @@ func (c *Client) ChatCM(ctx context.Context, providerName, modelName string, mes
 		return "", ClassifyAPIError(p.name, readErr)
 	}
 	if resp.StatusCode >= 400 {
-		return "", ClassifyAPIError(p.name, fmt.Errorf("llm http %d: %s", resp.StatusCode, string(body)))
+		return "", ClassifyAPIError(p.name, upstreamHTTPError("llm", resp.StatusCode, body))
 	}
-	text, err := parseNonStreamContent(p.protocol, body)
+	text, err := parseNonStreamContent(p.protocolForModel(model), body)
 	if err != nil {
 		return "", ClassifyAPIError(p.name, err)
 	}
@@ -580,6 +614,9 @@ func forceNonStreamingBody(body []byte) []byte {
 }
 
 func parseNonStreamContent(protocol string, body []byte) (string, error) {
+	if config.ProtocolIsOpenAIResponses(protocol) {
+		return parseResponsesNonStreamContent(body)
+	}
 	if proxyErr := extractProxyError(body); proxyErr != "" {
 		return "", errors.New(proxyErr)
 	}
@@ -599,10 +636,6 @@ func parseNonStreamContent(protocol string, body []byte) (string, error) {
 		}
 		return "", fmt.Errorf("empty response from anthropic")
 	}
-	if config.ProtocolIsOpenAIResponses(protocol) {
-		return parseResponsesNonStreamContent(body)
-	}
-
 	var resp struct {
 		Choices []struct {
 			Message struct {
@@ -738,11 +771,12 @@ func (c *Client) ChatStreamWithOptions(ctx context.Context, providerName, modelN
 		model = p.model
 	}
 
-	if config.ProtocolIsOpenAIResponses(p.protocol) {
+	protocol := p.protocolForModel(model)
+	if config.ProtocolIsOpenAIResponses(protocol) {
 		return c.ChatStreamCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), toolDefsFromOpenAITools(tools), opts)
 	}
 
-	if config.ProtocolIsAnthropic(p.protocol) {
+	if config.ProtocolIsAnthropic(protocol) {
 		// Anthropic support for tools is not implemented in this branch.
 		// Resolve max_tokens the same way the OpenAI branch does
 		// (per-model MaxTokensOutput > global opts.MaxTokens > 0)
@@ -852,7 +886,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		if resp.StatusCode >= 400 {
 			// Read up to 4 KB of body for the error message.
 			errBody, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(errBody)))}
+			ch <- StreamChunk{Err: ClassifyAPIError(p.name, upstreamHTTPError("openai", resp.StatusCode, errBody))}
 			return
 		}
 
@@ -861,16 +895,12 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 		// "data: " followed by the JSON payload, and a final
 		// "data: [DONE]" sentinel.
 		//
-		// We log the first 3 raw chunks and a final summary
-		// (chunk count / content chars / thinking chars /
-		// parse failures) at the end of the stream. This
-		// is invaluable when debugging proxy gateways (like
-		// api-convert.08ms.cn) that occasionally rename the
-		// standard fields — e.g. an upstream that uses
-		// `delta.text` instead of `delta.content` will
-		// surface a "0 chars received" line at the end of
-		// the stream and the user can copy the raw chunk
-		// dump into the issue tracker.
+		// PC_LLM_DEBUG=1 时记录前三个事件的有界、脱敏预览及最终统计；
+		// 默认只在解析失败时记录无正文元数据。这样既能诊断代理字段漂移，
+		// 也不会把用户消息或凭据默认写入磁盘。
+		// With PC_LLM_DEBUG=1, log bounded, redacted previews of the first
+		// three events plus final counters. Default mode records body-free
+		// metadata only for parse failures, keeping messages and credentials off disk.
 		reader := bufio.NewReaderSize(streamBody, 1<<20)
 		var (
 			rawChunks     int
@@ -896,7 +926,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 					// the per-stream summary on a debug knob
 					// so a normal session doesn't fill the
 					// log.
-					if parseFailures > 0 || os.Getenv("PC_LLM_DEBUG") == "1" {
+					if parseFailures > 0 || llmDebugEnabled() {
 						log.Printf("%s[llm/%s/%s] stream ended: chunks=%d parsed=%d content=%d thinking=%d parse_errs=%d",
 							trace.LogPrefix(ctx), p.name, model, rawChunks, rawChunks-parseFailures, contentChars, thinkingChars, parseFailures)
 					}
@@ -917,26 +947,27 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			payload := bytes.TrimPrefix(line, []byte("data: "))
 			if bytes.Equal(payload, []byte("[DONE]")) {
 				ch <- StreamChunk{Done: true}
-				log.Printf("%s[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
-					trace.LogPrefix(ctx), p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
+				// Same gating as the EOF path: the summary is
+				// useful when parsing broke, but a healthy
+				// stream shouldn't fill the log by default.
+				if parseFailures > 0 || llmDebugEnabled() {
+					log.Printf("%s[llm/%s/%s] stream ended at [DONE]: chunks=%d content=%d thinking=%d parse_errs=%d",
+						trace.LogPrefix(ctx), p.name, model, rawChunks, contentChars, thinkingChars, parseFailures)
+				}
 				return
 			}
 			rawChunks++
 			if rawChunks <= 3 {
-				// Dump the first few raw chunks verbatim so
-				// the field names are visible in the server
-				// log when debugging a misbehaving proxy.
-				log.Printf("%s[llm/%s/%s] raw chunk #%d: %s", trace.LogPrefix(ctx), p.name, model, rawChunks, string(payload))
+				// 调试模式只写有界、脱敏预览；默认模式不写消息正文。
+				// Debug mode logs only bounded, redacted previews; default mode logs no message text.
+				logLLMDebugPayload(fmt.Sprintf("%s[llm/%s/%s]", trace.LogPrefix(ctx), p.name, model), rawChunks, payload)
 			}
 			var r openaiStreamResponse
 			if err := json.Unmarshal(payload, &r); err != nil {
-				// Skip malformed lines (some providers send
-				// keepalive pings or partial JSON during
-				// reconnects).
+				// 跳过异常行；默认日志只写长度和摘要，调试模式写脱敏预览。
+				// Skip malformed lines; default logs keep metadata, while debug logs a redacted preview.
 				parseFailures++
-				if parseFailures <= 3 {
-					log.Printf("%s[llm/%s/%s] parse error on chunk #%d: %v payload=%s", trace.LogPrefix(ctx), p.name, model, rawChunks, err, string(payload))
-				}
+				logMalformedSSE(fmt.Sprintf("%s[llm/%s/%s]", trace.LogPrefix(ctx), p.name, model), rawChunks, parseFailures, payload, err)
 				continue
 			}
 			// If the proxy returned an error envelope
@@ -950,7 +981,7 @@ func (c *Client) openaiStream(ctx context.Context, p *providerEntry, model strin
 			// assistant reply that is actually a
 			// provider rate-limit / auth error.
 			if proxyErr := extractProxyError(payload); proxyErr != "" {
-				log.Printf("%s[llm/%s/%s] proxy error chunk: %s", trace.LogPrefix(ctx), p.name, model, proxyErr)
+				logProxySSE(fmt.Sprintf("%s[llm/%s/%s]", trace.LogPrefix(ctx), p.name, model), rawChunks, payload)
 				ch <- StreamChunk{Err: ClassifyAPIError(p.name, fmt.Errorf("openai proxy error: %s", proxyErr))}
 				return
 			}
@@ -1125,11 +1156,12 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		model = p.model
 	}
 
-	if config.ProtocolIsOpenAIResponses(p.protocol) {
+	protocol := p.protocolForModel(model)
+	if config.ProtocolIsOpenAIResponses(protocol) {
 		return c.ChatCM(ctx, providerName, model, chatMessagesFromOpenAI(messages), ChatOptions{})
 	}
 
-	if config.ProtocolIsAnthropic(p.protocol) {
+	if config.ProtocolIsAnthropic(protocol) {
 		// Resolve max_tokens: per-model MaxTokensOutput > 0
 		// (Anthropic's API requires a positive value; we don't
 		// consult a global default here — the non-streaming Chat
@@ -1185,9 +1217,9 @@ func (c *Client) Chat(ctx context.Context, providerName, modelName string, messa
 		return "", ClassifyAPIError(p.name, readErr)
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return "", ClassifyAPIError(p.name, fmt.Errorf("openai http %d: %s", resp.StatusCode, string(encoded)))
+		return "", ClassifyAPIError(p.name, upstreamHTTPError("openai", resp.StatusCode, encoded))
 	}
-	return parseNonStreamContent(p.protocol, encoded)
+	return parseNonStreamContent(protocol, encoded)
 }
 
 func (c *Client) ProviderNames() []string {
@@ -1225,6 +1257,18 @@ func (c *Client) GetModel(providerName string) string {
 func (c *Client) GetProtocol(providerName string) string {
 	if p, ok := c.providers[providerName]; ok {
 		return p.protocol
+	}
+	return ""
+}
+
+// GetModelProtocol 返回模型实际请求协议；未配置覆盖时继承供应商协议。
+// GetModelProtocol returns the model's effective request protocol.
+func (c *Client) GetModelProtocol(providerName, modelName string) string {
+	if p, ok := c.providers[providerName]; ok {
+		if modelName == "" {
+			modelName = p.model
+		}
+		return p.protocolForModel(modelName)
 	}
 	return ""
 }
@@ -1389,16 +1433,16 @@ func extractProxyError(payload []byte) string {
 	}
 	if err := json.Unmarshal(raw, &obj); err == nil && obj.Message != "" {
 		if obj.Code != "" {
-			return fmt.Sprintf("[%s] %s", obj.Code, obj.Message)
+			return sanitizeProviderDetail(fmt.Sprintf("[%s] %s", obj.Code, obj.Message), 1024)
 		}
 		if obj.Type != "" {
-			return fmt.Sprintf("[%s] %s", obj.Type, obj.Message)
+			return sanitizeProviderDetail(fmt.Sprintf("[%s] %s", obj.Type, obj.Message), 1024)
 		}
-		return obj.Message
+		return sanitizeProviderDetail(obj.Message, 1024)
 	}
 	var s string
 	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
+		return sanitizeProviderDetail(s, 1024)
 	}
 	return ""
 }
@@ -1469,8 +1513,11 @@ func extractContent(payload []byte) (string, string) {
 	}
 	// Walker failed — log the payload shape so a misbehaving
 	// proxy can be debugged. Truncate to 512 bytes to avoid
-	// log spam.
-	log.Printf("[llm] extractContent: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	// log spam, and gate on the debug knob because the payload
+	// may carry user-visible content (same as extractThinking).
+	if llmDebugEnabled() {
+		log.Printf("[llm] extractContent: walker found no match: bytes=%d sha256=%s preview=%s", len(payload), payloadFingerprint(payload), redactedPayloadPreview(payload, 512))
+	}
 	return "", ""
 }
 
@@ -1486,17 +1533,10 @@ func extractThinking(payload []byte) (string, string) {
 	// field is found, log the payload shape. The vast majority
 	// of streams don't carry thinking at all, so the log is
 	// gated on a debug knob.
-	if os.Getenv("PC_LLM_DEBUG") == "1" {
-		log.Printf("[llm] extractThinking: walker found no match in payload (first 512 bytes): %s", truncateForLog(payload, 512))
+	if llmDebugEnabled() {
+		log.Printf("[llm] extractThinking: walker found no match: bytes=%d sha256=%s preview=%s", len(payload), payloadFingerprint(payload), redactedPayloadPreview(payload, 512))
 	}
 	return "", ""
-}
-
-func truncateForLog(b []byte, max int) string {
-	if len(b) <= max {
-		return string(b)
-	}
-	return string(b[:max]) + "...(truncated)"
 }
 
 func walkForField(v any, names []string, path string, depth, maxDepth, maxResults int) (string, string) {
@@ -1565,6 +1605,11 @@ func injectReasoning(body []byte, protocol, level string) []byte {
 	}
 	if config.ProtocolIsOpenAIResponses(protocol) {
 		m["reasoning"] = map[string]any{"effort": level}
+		// 当前推理模型会拒绝 reasoning 与采样参数并用，因此在 Build 后移除。
+		// Current reasoning models reject sampling controls while reasoning is enabled, so remove them after Build.
+		delete(m, "temperature")
+		delete(m, "top_p")
+		delete(m, "top_logprobs")
 	} else if config.ProtocolIsOpenAICompatible(protocol) {
 		m["reasoning_effort"] = level
 	} else if config.ProtocolIsAnthropic(protocol) {

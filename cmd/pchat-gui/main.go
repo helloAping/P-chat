@@ -311,9 +311,7 @@ func (a *App) InstallUpdate(packagePath string, expectedSHA256 string) error {
 		"--parent-pid", strconv.Itoa(os.Getpid()),
 		"--log", logPath,
 	}
-	if strings.TrimSpace(expectedSHA256) != "" {
-		args = append(args, "--expected-sha256", strings.ToLower(strings.TrimSpace(expectedSHA256)))
-	}
+	args = append(args, "--expected-sha256", strings.ToLower(strings.TrimSpace(expectedSHA256)))
 	cmd := exec.Command(updaterRunner, args...)
 	cmd.Dir = installDir
 	hideChildConsole(cmd)
@@ -735,7 +733,7 @@ func validateUpdatePackage(packagePath string, expectedSHA256 string) (string, e
 	}
 	expectedSHA256 = strings.ToLower(strings.TrimSpace(expectedSHA256))
 	if expectedSHA256 == "" {
-		return abs, nil
+		return "", fmt.Errorf("refusing to apply update without sha256")
 	}
 	f, err := os.Open(abs)
 	if err != nil {

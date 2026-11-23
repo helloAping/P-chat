@@ -84,6 +84,7 @@ func handleEditFile(ctx context.Context, args json.RawMessage) (*CallResult, err
 		return &CallResult{Content: "edit cancelled", IsError: true}, ctx.Err()
 	default:
 	}
+	RecordBeforeMutationFromCtx(ctx, "edit_file", a.Path)
 	if err := writeFile(a.Path, []byte(updated)); err != nil {
 		return &CallResult{Content: err.Error(), IsError: true}, nil
 	}

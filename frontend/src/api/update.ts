@@ -1,6 +1,6 @@
 const BASE = ''
 
-export const SOFTWARE_RELEASE_PAGE = 'http://www.08ms.cn/software/p-chat/'
+export const SOFTWARE_RELEASE_PAGE = 'https://github.com/helloAping/P-chat/releases'
 
 export interface UpdateArtifact {
   artifact_id?: number
@@ -18,6 +18,7 @@ export interface UpdateArtifact {
 export interface UpdateInfo {
   current: string
   latest: string
+  channel: string
   hasUpdate: boolean
   installable: boolean
   url: string
@@ -38,6 +39,7 @@ export interface UpdateDownloadResult extends UpdateInfo {
 interface RawUpdateInfo {
   current?: string
   latest?: string
+  channel?: string
   has_update?: boolean
   installable?: boolean
   url?: string
@@ -55,8 +57,8 @@ interface RawDownloadResult extends RawUpdateInfo {
   sha256?: string
 }
 
-let cached: UpdateInfo | null = null
-let checking = false
+const cached = new Map<boolean, UpdateInfo>()
+const checking = new Map<boolean, Promise<UpdateInfo | null>>()
 
 function directBackendURL(): string {
   if (typeof window === 'undefined') return BASE
@@ -92,6 +94,7 @@ function normalizeUpdateInfo(raw: RawUpdateInfo): UpdateInfo {
   return {
     current: raw.current || __APP_VERSION__,
     latest: raw.latest || __APP_VERSION__,
+    channel: raw.channel || 'stable',
     hasUpdate: !!raw.has_update,
     installable: !!raw.installable,
     url: artifact?.url || raw.patch?.url || raw.full?.url || raw.url || '',
@@ -131,38 +134,50 @@ async function readError(res: Response): Promise<string> {
 }
 
 export function clearUpdateCache() {
-  cached = null
+  cached.clear()
 }
 
-export async function checkUpdate(force = false): Promise<UpdateInfo | null> {
-  if (cached && !force) return cached
-  if (checking) return null
-  checking = true
-  try {
-    const base = await waitForDirectBackend()
-    const res = await fetch(`${base}/api/v1/updates/check`, { headers: { Accept: 'application/json' } })
-    if (!res.ok) return null
-    cached = normalizeUpdateInfo(await res.json())
-    return cached
-  } catch {
-    return null
-  } finally {
-    checking = false
-  }
+export async function checkUpdate(force = false, includePrerelease = false): Promise<UpdateInfo | null> {
+  if (!force && cached.has(includePrerelease)) return cached.get(includePrerelease) || null
+  const pending = checking.get(includePrerelease)
+  if (pending) return pending
+
+  const request = (async () => {
+    try {
+      const base = await waitForDirectBackend()
+      const query = includePrerelease ? '?include_prerelease=1' : ''
+      const res = await fetch(`${base}/api/v1/updates/check${query}`, { headers: { Accept: 'application/json' } })
+      if (!res.ok) return null
+      const info = normalizeUpdateInfo(await res.json())
+      cached.set(includePrerelease, info)
+      return info
+    } catch {
+      return null
+    } finally {
+      checking.delete(includePrerelease)
+    }
+  })()
+  checking.set(includePrerelease, request)
+  return request
 }
 
-export async function downloadUpdate(): Promise<UpdateDownloadResult> {
+export async function downloadUpdate(includePrerelease: boolean, expectedVersion: string): Promise<UpdateDownloadResult> {
+  if (!expectedVersion) throw new Error('请先检查更新版本')
   const base = await waitForDirectBackend()
   const res = await fetch(`${base}/api/v1/updates/download`, {
     method: 'POST',
-    headers: { Accept: 'application/json' },
+    headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+    body: JSON.stringify({ include_prerelease: includePrerelease, expected_version: expectedVersion }),
   })
+  if (res.status === 409) throw new UpdateVersionChangedError(await readError(res))
   if (!res.ok) throw new Error(await readError(res))
 
   const result = normalizeDownloadResult(await res.json())
-  cached = result
+  cached.set(includePrerelease, result)
   return result
 }
+
+export class UpdateVersionChangedError extends Error {}
 
 export async function installDownloadedUpdate(update: Pick<UpdateDownloadResult, 'downloadPath' | 'sha256'>): Promise<void> {
   if (!update.downloadPath) throw new Error('更新包路径为空')

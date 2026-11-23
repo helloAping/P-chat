@@ -1,0 +1,65 @@
+name: Update index
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: update-index
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PowerShell
+        shell: bash
+        run: bash scripts/ci-install-powershell.sh
+
+      - name: Download release manifests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release-json
+          gh release download "${{ github.event.release.tag_name }}" --pattern 'pchat-latest-*.json' --dir release-json
+
+      - name: Fetch the current index
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p existing/updates
+          base="https://helloaping.github.io/P-chat/updates"
+          for name in \
+            windows-amd64.json windows-amd64.beta.json \
+            linux-amd64.json linux-amd64.beta.json \
+            macos-arm64.json macos-arm64.beta.json
+          do
+            curl -fsSL -o "existing/updates/$name" "$base/$name" || rm -f "existing/updates/$name"
+          done
+
+      - name: Merge index files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path site/updates | Out-Null
+          ./scripts/publish-update-index.ps1 -ReleaseDir release-json -ExistingDir existing/updates -OutDir site/updates
+          $count = @(Get-ChildItem site/updates -Filter *.json -File).Count
+          if ($count -eq 0) { throw "refusing to deploy an empty update index" }
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deployment
+        uses: actions/deploy-pages@v4

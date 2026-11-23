@@ -14,21 +14,29 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 
 `GET /api/v1/health` 成功响应包含 `status`、`profile_id`、`profile_name`、`instance_id`、`pid`。新增启动器或客户端不得只检查 `status=ok` 就认领一个动态端口。
 
+若以 `pchat-server --config <path>` 启动，构造器将该 path 保存在 `Server` 与 `Handler`。
+Provider/Model、系统配置、Web Search、Browser、MCP 与知识库的写入及热重载都使用这条
+活动路径，避免错误写回 `~/.p-chat/config.json`。custom 文件通过 raw JSON overlay 编辑器只写
+显式修改字段；数组型集合在增删时写入完整有效数组，集合外未修改及未知字段继续继承。
+完整替换的集合按当前 schema 重写。
+
 ## 文件结构
 
 | 文件 | 职责 | 关键函数/类型 |
 |---|---|---|
 | `server.go` | Gin 引擎构建、路由注册、CORS 中间件 + trace id middleware | `New()`, `NewWithStaticFS()`, `corsMiddleware()`, `traceIDMiddleware()` |
-| `handler.go` | 所有 API handler 实现（~2130行） | `SendMessage()`, `ListMessages()`, `chunkToEvent()` 等 |
+| `handler.go` | Handler 结构及通用 API 处理 | `Handler` 等 |
+| `stream_adapter.go` | Agent chunk 到 SSE 事件的映射 | `chunkToEvent()` |
 | `messages.go` | 消息发送 / 重答 / SSE 写循环 / 自动续跑控制 | `SendMessage()`, `respondSSE()` |
 | `message_helpers.go` | 历史消息响应整形、parts 解码、内部行过滤、附件合并 | `ListMessages()`, `buildMessageResponse()` |
 | `handler_test.go` | Handler 单元测试 | |
 | `knowledge_api.go` | 知识库 CRUD + 扫描管道 + 三层索引 | `ListSections`, `ListNodes`, `GetNodeContent`, `ClearKnowledgeBase`, `indexScan` |
-| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe / 连接测试 | `FetchUpstreamModels`, `ProbeUpstreamModels`, `TestProvider` |
+| `provider_api.go` | Provider/Model CRUD + 上游模型查询 / probe / 连接测试；读侧 Secret 脱敏（`has_api_key`，headers 值清空） | `FetchUpstreamModels`, `ProbeUpstreamModels`, `TestProvider`, `providerFullFrom` |
 | `config_api.go` | 全局配置接口 | |
 | `skill_api.go` | Skill 安装/卸载/搜索 REST | |
-| `command_api.go` | 斜杠命令执行 | |
+| `command_api.go` | Web 斜杠命令与会话规则/AGENTS.md 诊断接口 | `RunCommand()`, `ListSessionRules()`, `GetSessionAgents()` |
 | `tool_api.go` | P3-2 工具列表端点 | `ListTools()` |
+| `update_api.go` | 更新检查与下载；稳定版/Beta 渠道和预期版本校验 | `CheckUpdate()`, `DownloadUpdate()` |
 | `upload.go` | 文件上传/下载 | |
 | `dialog.go` | 本地文件选择对话框 | |
 | `helpers.go` | 辅助函数 | |
@@ -36,6 +44,14 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 ## 核心 API 路由
 
 详见 `server.go:86-167`，所有路由以 `/api/v1` 为前缀。
+
+### 稳定版与 Beta 更新
+
+`GET /updates/check` 默认只接受稳定版；传 `include_prerelease=1` 时允许稳定版和 `.beta`。`POST /updates/download` 的 JSON body 可传 `include_prerelease` 与 `expected_version`，后端在同一渠道重查；若最新版本与界面展示的不一致，返回 409。`internal/update` 同时校验清单的版本后缀和 `channel`，拒绝不一致的元数据。
+
+默认更新目录是 `https://helloaping.github.io/P-chat/updates/`。稳定版读取 `{platform}-{arch}.json`，勾选 Beta 时读取 `{platform}-{arch}.beta.json`。Beta 文件由发布流水线写成稳定版和 Beta 中版本更高的那一份。`PCHAT_UPDATE_URL` 若指向具体 `*.json` 文件，仍附带 `platform`、`arch`、`current_version`、`include_prerelease` 查询参数。清单里的 `platform` / `arch` 与本机不一致时检查直接失败，不会下载。
+
+SEC-05：非 loopback 的 `http://` 元数据/产物 URL 一律拒绝。下载前校验 artifact `sha256` 与 ed25519 `signature`（载荷 `pchat-update-v1\n{sha256}\n{version}\n{kind}\n`，公钥见 `internal/update.DefaultUpdatePublicKeyBase64`）。打包时设置 `PCHAT_UPDATE_SIGNING_KEY` 并由 `cmd/pchat-updatesign` / `scripts/package-update-zip.ps1` 写入签名；`pchat-updater` 无 `--expected-sha256` 时拒绝安装（仅 `--allow-insecure` 可跳过）。本地排障可设 `PCHAT_UPDATE_REQUIRE_SIGNATURE=0`。GitHub Actions 在 tag `v*` 上构建 Windows amd64、Linux amd64 和 macOS arm64 包，创建 Draft Release；Release 发布后才更新上面的索引。
 
 ### Provider / Model 连接测试
 
@@ -77,7 +93,7 @@ Server 模块是 P-Chat 的 HTTP API 层，基于 Gin 框架。负责：REST API
 
 ### 2. chunkToEvent — 事件映射
 
-`chunkToEvent()` (handler.go:1495-1613) 是服务端到前端的翻译器：
+`chunkToEvent()` (`stream_adapter.go`) 是服务端到前端的翻译器：
 
 ```
 Chunk 字段检查顺序（优先级从高到低）:
@@ -88,13 +104,17 @@ Chunk 字段检查顺序（优先级从高到低）:
   5. ToolName 非空 → type: "tool" (status 由 Step 字符串推导)
   6. Thinking 非空 → type: "thinking"
   7. Content 非空 → type: "content"
-  8. ContentRewrite 非空 → type: "content_rewrite"
-  9. ThinkingRewrite 非空 → type: "thinking_rewrite"
-  10. Phase 非空 → type: "phase"
-  11. 其他 → type: "phase" (心跳)
+  8. StreamReset == true → type: "stream_reset"
+  9. ContentRewrite 非空 → type: "content_rewrite"
+  10. ThinkingRewrite 非空 → type: "thinking_rewrite"
+  11. Phase 非空 → type: "phase"
+  12. 其他 → type: "phase" (心跳)
 ```
 
 **关键设计**：sub_agent 字段（SubAgent/SubAgentTask/SubAgentStatus 等）在所有分支中***无条件拷贝***，使子代理的 content/thinking/tool/phase 事件都能正确路由到嵌套卡片。
+
+`stream_reset` 是重试边界，不是普通 `phase`：收到它的客户端必须丢弃当前 LLM attempt
+已追加的 text/thinking parts，再接收新 attempt 的输出，避免两次不完整输出被拼成一条回复。
 
 ### 3. 会话管理
 
@@ -110,7 +130,7 @@ Chunk 字段检查顺序（优先级从高到低）:
 
 ### 4. 消息管理
 
-- `ListMessages` (GET) — 分页返回历史消息，含 `parts` 解码
+- `ListMessages` (GET) — 分页返回历史消息，含 `parts` 解码和 `source_message_ids`
 - `SendMessage` (POST) — 发送 + SSE 流
 - `SnapshotRecovery` (GET) — **P0-1**：断线恢复用的增量快照
 - `Regenerate` (POST) — **P1-3**：物理截断 user 消息之后的行后重跑
@@ -118,6 +138,35 @@ Chunk 字段检查顺序（优先级从高到低）:
 - `SetReasoningEffort` — 设置 DeepSeek/OpenAI 思考深度
 - `SaveSystemMessage` — 保存自定义系统提示词
 - `GetTodos` — 获取待办列表
+
+#### 上传附件归属
+
+`POST /uploads` 的 multipart body 必须携带已有会话的 `session_id`。上传完成时，服务端把
+上传字节与仅 owner 可读的 sidecar 一起落在 `~/.p-chat/uploads/`；发送消息会在进入 Agent 前
+一次性验证所有 `upload_id` 都属于 URL 中的会话。错误的、缺失的或跨会话的引用返回
+`400 invalid_attachment`，不会静默丢弃。V17 前的历史无 owner 上传仅在该会话已持久化了相同
+`upl://` 引用时兼容读取。
+
+`GET /uploads/:id` 同样必须携带 `session_id`，并复用 owner/历史引用校验；历史响应和前端本地
+气泡生成的下载地址都带上该参数，已知 upload id 不能跨会话直接读取。上传请求的 body 上限在
+multipart 解析前安装，文件字节再单独按 25 MiB 截断校验。
+PDF 与 DOCX/DOCM 在写入归属记录前由实际解析器校验结构；不完整文件返回
+`400 invalid_attachment` 并删除刚写入的上传文件。发送既有 `upload_id` 时也会复核文档，
+避免旧版已存损坏文件进入 LLM。旧客户端的 inline 文档实体化沿用同一校验并在失败时回滚批次。
+对 PDF，在文件尾部 64 KiB 内能找到完整 `%%EOF` 且交叉引用结构仍可解析时，解析器允许
+其后附加的非 PDF 内容（例如下载站点追加的 HTML）；仅调整读取时的逻辑长度，不改上传原文件。
+真正缺失结束标记或结构损坏的文件仍返回 `invalid_attachment`。
+发送阶段先核对全部引用的会话归属和文件存在性，再汇总同会话内所有损坏文档的名称与原因；
+归属失败优先返回，不暴露其他附件的格式校验结果。
+
+遗留客户端若把 `kind=file` 文档以内联 `data:` URL（或把 `kind=text` 作为纯文本）提交，服务端会先将其
+实体化为当前会话的受归属 upload；不符合该可读编码的 inline file 会明确拒绝，不能再生成一个
+LLM 无法用 `upload_id` 读取的伪附件。
+
+`client_msg_id` 幂等身份同时包含正文和原始附件签名。完全相同的重试返回
+`duplicate_client_message`；同 ID 但附件不同返回 `client_message_id_conflict`。该检查早于 inline
+实体化，重试不会额外落下孤儿文件。孤儿清理也会把 queued/running/failed turn queue payload 中的
+upload 引用视为存活引用。
 
 `POST /sessions/:id/messages` 和 turn queue payload 支持 `active_skills: string[]`。
 服务端只接收名称，由当前会话的项目根解析有效 Skill；旧 `skill_context` 字段暂时保留兼容，
@@ -155,6 +204,7 @@ Skill API：
 - Assistant 消息的 parts 以 JSON 存储在 metadata 列
 - `decodePartsFromMeta()` (handler.go:1280) 在 GET /messages 时还原 parts
 - `buildMessageResponse()` 会过滤不应渲染的内部行：tool_call/tool_result、媒体附件独立行、`metadata.ui_hidden=true` 的消息，以及旧库中以 `⏱ 上一回合因` / `⚠ 系统检测：你刚才的回复没有调用任何工具` 开头的自动续跑 user-style nudge。内部续跑提示只能影响下一次 LLM 输入，不应在 GUI 里表现成用户重复发送消息。
+- `source_message_ids` 是一个可见气泡合并前的数据库行 ID 列表。搜索 API 只返回上述可渲染消息；前端用该列表把任一命中的原始行定位到合并后的消息 DOM 锚点。
 - `type=skill` SSE 携带 `skill_name`、`skill_status=start|ready|error`、`skill_scope`、
   `skill_source`、`skill_dependencies`、`skill_error`，并作为 `kind=skill` part 持久化。
 
@@ -179,6 +229,9 @@ blob (持久化 parts[])。响应 `{ messages, next_seq }`。
 - 不放 undo buffer（regen 是正常流，不是破坏性操作）
 - 不接受 style/model 覆盖（保持与上轮一致，避免意外切换）
 - 共享 `sessionLocks` 防并发 regen
+- 重答会保留当前用户回合的 image、audio、video 与 file 附件；文档始终保留 `upl://` 引用，
+  不在历史加载时整文件 base64 化；进入首个重答模型请求前，会从目标回合的 `TypeFile` 行重建
+  同样公平、有界的文档正文预览。
 
 #### respondSSE helper
 
@@ -249,6 +302,16 @@ compressed_summary, messages:[{role, tokens, preview, is_tool_result}]}`。
 `clear` 端点执行后自动调用 `agent.Reload()` 刷新 L1 overview 缓存。
 
 `nodes` 端点返回扁平 `NodeTreeItem[]`（含 `parent_id` / `child_count` / `content_count`），前端据此构建三层树视图。
+
+### 7.1 会话范围的指令诊断
+
+`GET /sessions/:id/rules` 返回当前 session 项目根下的全局与项目 Rule，带 `name`、`path` 和
+`scope`。`GET /sessions/:id/agents` 返回三个 AGENTS.md 候选（项目根、项目 `.p-chat`、全局）
+及实际注入 agent 的 `prompt`；候选采用 OR 优先级，首个非空可读文件胜出。两个接口都要求
+已存在的 session ID，避免诊断接口接收任意本地路径。
+
+Web 输入框的 `POST /commands/rules` 和 `POST /commands/agents` 请求体携带
+`session_id`，按相同的会话项目根解析；未传会话 ID 返回 400，找不到会话返回 404。
 
 ### 8. 端到端 trace id (P3-3, 2026-07-16)
 
@@ -351,6 +414,8 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 - 高风险动作（type / file_upload / evaluate）与敏感域触发 `tool_confirm` SSE
 - 确认复用 `tool.RequireConfirm` + `ToolConfirmModal`（`path_class=browser`，`resolved_path`=页面 URL）
 - 会话权限 `full` / `/unsafe once` 跳过确认；`blocked_hosts` 仍硬拦截
+- `browser_evaluate` 另有独立三态闸门：明确副作用硬拒绝；明确只读走上述策略；未知 JS 调 `tool.RequireExplicitConfirm` 逐次确认。未知表达式不会被 allowlist、`require_confirm=never`、`full/auto` 或“始终允许”缓存跳过。
+- `allow_eval_write=true` 是可信自动化的显式逃生口，只关闭 evaluate 只读闸门，不覆盖 `blocked_hosts` 或正常高风险确认。
 
 ### 12. 浏览器 E2E（BR-05）
 
@@ -364,8 +429,9 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
   参数已停用，API 收到这两个旧字段时返回 `400`；历史 metadata 字段不会参与运行。
 - `GET /api/v1/generated/:id` 提供已实体化的图片、视频或音频；文件与归属 metadata 位于
   `~/.p-chat/generated/`，URL 在聊天历史中保持稳定。
-- Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含 `api_endpoint`、
-  `type`、`generation`；Provider 的 `custom_headers` 是完整替换的字符串 map，提交 `{}` 可清空。
+- Provider CRUD 包含 `protocol`、公共 `base_url`，Model CRUD 包含可选 `protocol`、
+  `api_endpoint`、`type`、`generation`；模型协议缺省时继承 Provider，更新时显式提交空字符串可清除覆盖。
+  Provider 的 `custom_headers` 是完整替换的字符串 map，提交 `{}` 可清空。
   LLM/媒体端点均保存相对后缀，并在执行时与 Base URL 拼接。
   `GET /api/v1/providers/:name/upstream-models` 使用 `internal/provider` 策略解析模型列表
   endpoint、默认 Base URL、静态 fallback 与手动兜底，并携带该 Provider 的自定义请求头。
@@ -376,6 +442,17 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 首版异步任务在一次工具调用中轮询完成，尚无重启续查/取消端点。详见
 [媒体生成首版实现说明](../../docs/plans/media-generation-implementation.md)。
 
+### 14. Diagnostics 安全边界（SEC-01）
+
+`/api/v1/diagnostics/*` 与 `/debug/pprof/*` 属于 D（管理级诊断）能力；heap/goroutine profile 可能暴露栈参数、路径和运行时元数据。在 SEC-01 的管理级 capability 路由完全接线前，1.0.14.beta 使用额外安全默认值：
+
+- `/debug/pprof/*` 默认不注册，只有启动前设置 `PC_PPROF=1` 才开启；开启后仍只接受 TCP `RemoteAddr` 为 loopback 的客户端，不读取可伪造的 `X-Forwarded-For`。
+- heap/goroutine 下载默认返回 `403 diagnostics_snapshot_disabled`；启动前设置 `PC_DIAGNOSTICS_SNAPSHOTS=1` 后也只接受 loopback 客户端，非本机返回 `403 diagnostics_snapshot_local_only`。
+- 写入磁盘的 `.prof` / `.txt` 使用 owner-only `0600` 权限。`PC_HEAP_DUMP_MB` 控制本地自动 heap profile（默认 1024 MB，`0` 关闭），不会自动开放下载端点。
+- 环境变量闸门是 SEC-01 完整鉴权前的纵深防御，不把 loopback 等同于身份。后续 D 类路由接入管理级 capability 后仍保留 opt-in，除非另有安全评审。
+
+这些开关不改变配置格式、数据目录结构或 SQLite schema，因此不新增 upgrade step。
+
 ## 修改指南
 
 ### 要添加新的 API 端点
@@ -385,7 +462,7 @@ preferred tab 元数据；返回 `preferred_tab_id` 与 `tabs[]`
 
 ### 要修改 SSE 流式推送
 - `SendMessage()` 中的 `c.Stream()` 回调 (handler.go 约 1450 行)
-- `chunkToEvent()` 映射逻辑 (handler.go:1495)
+- `chunkToEvent()` 映射逻辑 (`stream_adapter.go`)
 - 前端 `chat.ts` `appendStreamEvent()` 处理
 
 ### 要修改消息持久化格式

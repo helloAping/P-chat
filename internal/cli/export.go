@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/p-chat/pchat/internal/export"
+	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/memory"
 )
 
@@ -20,6 +22,8 @@ type Format = export.Format
 
 const (
 	FormatMarkdown = export.FormatMarkdown
+	FormatHTML     = export.FormatHTML
+	FormatPDF      = export.FormatPDF
 	FormatJSON     = export.FormatJSON
 )
 
@@ -55,6 +59,10 @@ func parseExportArgs(s string) exportOpts {
 			}
 		case lower == "markdown" || lower == "md":
 			opts.format = FormatMarkdown
+		case lower == "html":
+			opts.format = FormatHTML
+		case lower == "pdf":
+			opts.format = FormatPDF
 		case lower == "json":
 			opts.format = FormatJSON
 		default:
@@ -105,9 +113,9 @@ func resolveSession(store *memory.Store, id string) (*memory.Conversation, error
 //
 //	pchat-<short-id>-<YYYYMMDD-HHMMSS>.md
 func defaultExportFilename(conv *memory.Conversation, format export.Format) string {
-	ext := "md"
-	if format == FormatJSON {
-		ext = "json"
+	ext := string(format)
+	if format == FormatMarkdown {
+		ext = "md"
 	}
 	shortID := conv.ID
 	if len(shortID) > 12 {
@@ -152,15 +160,21 @@ func doExport(store *memory.Store, args string) (string, error) {
 		color.HiBlack("    (会话没有消息, 仍然导出空文件)")
 	}
 
-	var body string
+	var body []byte
 	switch opts.format {
 	case FormatMarkdown:
-		body = export.ToMarkdown(conv, msgs)
+		body = []byte(export.ToMarkdown(conv, msgs))
+	case FormatHTML:
+		body = []byte(export.ToHTML(conv, msgs))
+	case FormatPDF:
+		body = export.ToPDF(conv, msgs)
 	case FormatJSON:
-		body, err = export.ToJSON(conv, msgs)
+		text, jsonErr := export.ToJSON(conv, msgs)
+		err = jsonErr
 		if err != nil {
 			return "", err
 		}
+		body = []byte(text)
 	default:
 		return "", fmt.Errorf("未知格式: %s", opts.format)
 	}
@@ -175,8 +189,80 @@ func doExport(store *memory.Store, args string) (string, error) {
 		outPath = filepath.Join(cwd, outPath)
 	}
 
-	if err := os.WriteFile(outPath, []byte(body), 0o644); err != nil {
+	if err := os.WriteFile(outPath, body, 0o644); err != nil {
 		return "", fmt.Errorf("写文件失败: %w", err)
 	}
 	return outPath, nil
+}
+
+func doHTTPExport(ctx context.Context, client *httpcli.Client, currentSessionID, projectPath, args string) (string, error) {
+	opts := parseExportArgs(args)
+	sessionID, err := resolveHTTPExportSession(ctx, client, currentSessionID, projectPath, opts.sessionID)
+	if err != nil {
+		return "", err
+	}
+	file, err := client.ExportSession(ctx, sessionID, string(opts.format))
+	if err != nil {
+		return "", err
+	}
+	outPath := opts.outFile
+	if outPath == "" {
+		outPath = file.Filename
+		if outPath == "" {
+			outPath = defaultHTTPExportFilename(sessionID, opts.format)
+		}
+	}
+	if !filepath.IsAbs(outPath) {
+		cwd, getwdErr := os.Getwd()
+		if getwdErr != nil {
+			return "", fmt.Errorf("读取当前目录失败: %w", getwdErr)
+		}
+		outPath = filepath.Join(cwd, outPath)
+	}
+	if err := os.WriteFile(outPath, file.Body, 0o644); err != nil {
+		return "", fmt.Errorf("写文件失败: %w", err)
+	}
+	return outPath, nil
+}
+
+func resolveHTTPExportSession(ctx context.Context, client *httpcli.Client, currentSessionID, projectPath, requestedID string) (string, error) {
+	if requestedID == "" {
+		if currentSessionID == "" {
+			return "", fmt.Errorf("当前没有活跃会话")
+		}
+		return currentSessionID, nil
+	}
+	if requestedID == "last" {
+		sessions, err := client.ListSessionsForProject(ctx, &projectPath)
+		if err != nil {
+			return "", err
+		}
+		if len(sessions) == 0 {
+			return "", fmt.Errorf("当前项目范围没有会话可导出")
+		}
+		return sessions[0].ID, nil
+	}
+	session, err := client.GetSession(ctx, requestedID)
+	if err != nil {
+		return "", fmt.Errorf("读取会话失败: %w", err)
+	}
+	if session.ProjectPath != projectPath {
+		return "", fmt.Errorf("会话 %s 不属于当前项目范围", requestedID)
+	}
+	return session.ID, nil
+}
+
+func defaultHTTPExportFilename(sessionID string, format export.Format) string {
+	shortID := sessionID
+	if len(shortID) > 12 {
+		shortID = shortID[:12]
+	}
+	return fmt.Sprintf("pchat-%s.%s", shortID, exportExtension(format))
+}
+
+func exportExtension(format export.Format) string {
+	if format == FormatMarkdown {
+		return "md"
+	}
+	return string(format)
 }

@@ -170,7 +170,7 @@ func buildWorkModeBlock(wm config.WorkMode) string {
 		return "\n\n---\n\n## Working Mode: 编码 (coding)\n\n" +
 			"你当前是「编码」模式。该模式下，你的主要职责是帮助用户完成编程类任务。\n\n" +
 			"- **核心场景**：阅读和理解代码、定位 bug、实现新功能、重构、写测试、运行命令验证、git 操作、code review。\n" +
-			"- **首选工具**：`read_file` / `write_file` / `edit_file` 读写源码；`exec_command` 运行测试、构建、git、grep、ls 等 shell 命令；`list_files` 探索目录；`grep` / `recall` 在代码库中精确定位；需要理解既有架构约定时使用 `wiki_lookup`。\n" +
+			"- **首选工具**：`read_file` / `write_file` / `edit_file` / `apply_patch` 读写源码；`exec_command` 运行测试、构建、git、grep、ls 等 shell 命令；`list_files` 探索目录；`grep` / `recall` 在代码库中精确定位；需要理解既有架构约定时使用 `wiki_lookup`。\n" +
 			"- **慎用工具**：`web_search` 仅在用户明确要求联网或本地查不到时使用。\n" +
 			"- **回复习惯**：先给结论或方案，再给解释；修改前先读上下文；改完说明验证结果；涉及破坏性操作时必须二次确认。\n"
 	default:
@@ -303,6 +303,7 @@ func buildAvailableToolsSection(availableTools []tool.Tool) string {
 	sb.WriteString("\nOperation → correct tool mapping:\n")
 	sb.WriteString("- Read a file → `read_file` (NOT `cat` / `type` / `head` / `tail`; for large files see Code Exploration)\n")
 	sb.WriteString("- Write a file → `write_file` (NOT `echo >` / `cat >`)\n")
+	sb.WriteString("- Edit one spot → `edit_file`; multi-file / multi-hunk edits → `apply_patch`\n")
 	sb.WriteString("- List directory → `list_files` (NOT `ls` / `dir`)\n")
 	sb.WriteString("- System commands → `exec_command` (NOT `bash` / `sh` / `powershell`)\n")
 	sb.WriteString("- Search code in the working directory → `grep` tool or `exec_command` with `findstr` (Windows) / `grep -rn` (Unix)\n")
@@ -423,21 +424,17 @@ func buildConversationContinuitySection() string {
 	return sb.String()
 }
 
-// buildAttachmentsSection reminds the LLM that uploaded images
-// arrive as vision input in the user message (image_url content
-// parts), NOT as files on disk. The phrasing is deliberately
-// positive and language-neutral — earlier versions literally
-// primed the LLM with "ERROR: ... Inform the user" by name and
-// the model echoed that exact phrasing back to users.
+// buildAttachmentsSection 区分图片输入和文档引用，避免模型误认为已收到全文。
+// buildAttachmentsSection distinguishes image input from document references and bounded previews.
 func buildAttachmentsSection() string {
 	return "\n\n---\n\n## Uploaded Attachments\n\n" +
-		"User-uploaded images and files are sent directly inside the user message — " +
-		"images as image_url content parts (data URLs), text files as inline blocks. " +
-		"You can see them. Just answer based on their content.\n\n" +
-		"Do not call read_file on an uploaded image: it lives on disk as a temporary " +
-		"file, and read_file only handles text. If read_file returns a binary error, " +
-		"that is read_file's limitation, not a problem with the attachment — the image " +
-		"was already delivered to you through the user message. " +
+		"Uploaded images may arrive as image_url input or as recognition text, depending on the active model and session settings. " +
+		"Do not call read_file on an uploaded image.\n\n" +
+		"Uploaded text files, PDFs, and Office documents are identified by upload_id. " +
+		"The current turn includes a bounded preview of each readable document, not necessarily its full contents. " +
+		"Use read_attachment with the shown upload_id to read more; send at most 8 upload_ids per call and split larger sets into batches. " +
+		"When asked to remember or summarize multiple documents, account for every attachment separately and read beyond the preview as needed before claiming completion. " +
+		"If extraction failed or no text is available, say which document could not be read; do not claim to have memorized its contents or that no attachment was provided. " +
 		"Respond in the same language as the conversation.\n"
 }
 

@@ -111,6 +111,27 @@ func TestLoadAll_BothPresent_ProjectWins(t *testing.T) {
 	}
 }
 
+func TestInspectWithRoot_ReportsCandidatesAndActualWinner(t *testing.T) {
+	tmp := t.TempDir()
+	root := filepath.Join(tmp, "project")
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("HOME", tmp)
+	writeFile(t, filepath.Join(tmp, ".p-chat", "AGENTS.md"), "Global instructions")
+	writeFile(t, filepath.Join(root, ".p-chat", "AGENTS.md"), "Project fallback")
+	writeFile(t, filepath.Join(root, "AGENTS.md"), "Project root instructions")
+
+	inspection := InspectWithRoot(root)
+	if len(inspection.Candidates) != 3 {
+		t.Fatalf("candidate count = %d, want 3", len(inspection.Candidates))
+	}
+	if !inspection.Candidates[0].Selected || inspection.Candidates[1].Selected || inspection.Candidates[2].Selected {
+		t.Fatalf("selected candidates = %+v, want only project root", inspection.Candidates)
+	}
+	if !contains(inspection.Prompt, "Project root instructions") || contains(inspection.Prompt, "Project fallback") || contains(inspection.Prompt, "Global instructions") {
+		t.Fatalf("prompt = %q, want only project root instructions", inspection.Prompt)
+	}
+}
+
 func TestLoadAll_NeitherPresent(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("USERPROFILE", tmp)

@@ -79,6 +79,14 @@ func TestConfirmTargetFor_Table(t *testing.T) {
 			wantClass: "project", wantRisk: "high", wantHasPath: true,
 		},
 		{
+			desc:     "apply_patch: multi-path → confirm",
+			toolName: "apply_patch",
+			args:     `{"operations":[{"op":"update","path":"src/a.go","hunks":[{"old_text":"a","new_text":"b"}]},{"op":"add","path":"src/b.go","content":"x"}]}`,
+			sb:       &stubSandboxForConfirm{writeDecision: tool.SandboxConfirm},
+			wantOk:   true, wantDecision: tool.SandboxConfirm,
+			wantClass: "project", wantRisk: "high", wantHasPath: true,
+		},
+		{
 			desc:     "read_file: project path → allow",
 			toolName: "read_file",
 			args:     `{"path":"src/foo.go"}`,

@@ -28,7 +28,14 @@ export function dedupMessagesByKey(existing: Message[], incoming: Message[]): Me
       remember(m, merged.length - 1)
       return
     }
-    forget(merged[index])
+    const prev = merged[index]
+    // 历史行没有时长时，保留这条消息在完成事件里已经记下的耗时。
+    // Keep the live done-event duration when a history row has none yet.
+    if (!m.elapsed && prev.elapsed) m = { ...m, elapsed: prev.elapsed }
+    if ((!m.turn_todos || m.turn_todos.length === 0) && prev.turn_todos?.length) {
+      m = { ...m, turn_todos: prev.turn_todos }
+    }
+    forget(prev)
     merged[index] = m
     remember(m, index)
   }
