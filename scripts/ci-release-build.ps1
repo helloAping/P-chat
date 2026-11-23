@@ -24,6 +24,35 @@ if ([string]::IsNullOrWhiteSpace($env:PCHAT_UPDATE_SIGNING_KEY)) {
 
 $proxy = if ($env:GOPROXY) { $env:GOPROXY } else { 'https://proxy.golang.org,direct' }
 
+function Build-UpdateSignTool {
+    $bin = Join-Path $root 'bin'
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    $isWin = $env:OS -eq 'Windows_NT'
+    $out = Join-Path $bin ($(if ($isWin) { 'pchat-updatesign.exe' } else { 'pchat-updatesign' }))
+    $log = Join-Path $bin 'pchat-updatesign-build.log'
+    Write-Host "[ci-release-build] building pchat-updatesign -> $out" -ForegroundColor Cyan
+    # cmd/bash owns the pipes. PowerShell's native-command wrapper can deadlock
+    # when go writes to stderr under ErrorActionPreference=Stop.
+    if ($isWin) {
+        $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d', '/c', "go build -o `"$out`" ./cmd/pchat-updatesign > `"$log`" 2>&1") -WorkingDirectory $root -PassThru -WindowStyle Hidden
+    } else {
+        $proc = Start-Process -FilePath 'bash' -ArgumentList @('-lc', "go build -o '$out' ./cmd/pchat-updatesign > '$log' 2>&1") -WorkingDirectory $root -PassThru
+    }
+    if (-not $proc.WaitForExit(180000)) {
+        if ($isWin) {
+            & taskkill.exe /F /T /PID $proc.Id | Out-Null
+        } else {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+        throw "go build pchat-updatesign timed out after 180s. See $log"
+    }
+    if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $out)) {
+        $tail = if (Test-Path -LiteralPath $log) { (Get-Content -LiteralPath $log -Tail 40) -join [Environment]::NewLine } else { '' }
+        throw "go build pchat-updatesign failed ($($proc.ExitCode)). $tail"
+    }
+    Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+}
+
 function Invoke-CheckedTask {
     param([Parameter(Mandatory = $true)][string[]]$TaskArgs)
     Write-Host "[ci-release-build] task $($TaskArgs -join ' ')" -ForegroundColor Cyan
@@ -77,6 +106,8 @@ function Assert-UnixArch {
         throw "arch mismatch for ${Path}: expected $Expected, file says: $desc"
     }
 }
+
+Build-UpdateSignTool
 
 switch ($Platform) {
     'win' {

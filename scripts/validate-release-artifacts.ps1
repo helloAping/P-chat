@@ -74,24 +74,14 @@ function Assert-ZipContains {
 }
 
 function Get-VerifyTool {
-    $toolDir = Join-Path ([System.IO.Path]::GetTempPath()) ("pchat-updatesign-" + [guid]::NewGuid().ToString('n'))
-    New-Item -ItemType Directory -Path $toolDir | Out-Null
-    $tool = Join-Path $toolDir 'pchat-updatesign'
-    Push-Location $root
-    try {
-        Write-Host "[validate-release-artifacts] building signature verifier" -ForegroundColor Cyan
-        & go build -o $tool ./cmd/pchat-updatesign
-        if ($LASTEXITCODE -ne 0) {
-            throw "go build ./cmd/pchat-updatesign failed: $LASTEXITCODE"
+    foreach ($name in @('pchat-updatesign.exe', 'pchat-updatesign')) {
+        $path = Join-Path $root (Join-Path 'bin' $name)
+        if (Test-Path -LiteralPath $path) {
+            Write-Host "[validate-release-artifacts] using $path" -ForegroundColor Cyan
+            return (Resolve-Path -LiteralPath $path).Path
         }
-    } finally {
-        Pop-Location
     }
-    $built = Get-ChildItem -LiteralPath $toolDir -Filter 'pchat-updatesign*' -File | Select-Object -First 1
-    if (-not $built) {
-        throw "pchat-updatesign was not produced in $toolDir"
-    }
-    return $built.FullName
+    throw "pchat-updatesign is missing from bin/. The release build must compile it before validation."
 }
 
 function Assert-Artifact {

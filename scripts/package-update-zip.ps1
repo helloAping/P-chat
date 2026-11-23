@@ -159,10 +159,13 @@ function Get-UpdateSignature {
     $env:PCHAT_SIGN_VERSION = $version
     $env:PCHAT_SIGN_KIND = $Kind
     $env:PCHAT_SIGN_OUTPUT = $sigFile
-    $signTool = Join-Path $root "bin\pchat-updatesign.exe"
+    $signTool = @(
+        (Join-Path $root "bin\pchat-updatesign.exe"),
+        (Join-Path $root "bin\pchat-updatesign")
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     Push-Location $root
     try {
-        if (Test-Path -LiteralPath $signTool) {
+        if ($signTool) {
             & $signTool
         } else {
             & go run ./cmd/pchat-updatesign
