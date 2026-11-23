@@ -23,7 +23,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
-$platformLabel = & "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format label
+$platformLabel = & (Join-Path $PSScriptRoot 'resolve-platform.ps1') -Name $Platform -Format label
 if (-not $platformLabel) {
     throw "Unknown platform: $Platform"
 }

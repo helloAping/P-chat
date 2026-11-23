@@ -115,9 +115,9 @@ tasks:
     silent: false
 
   build:gui:linux:binary:
-    dir: cmd\pchat-gui
+    dir: '{{.ROOT_DIR}}/cmd/pchat-gui'
     cmds:
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "linux" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "{{.ROOT_DIR}}/scripts/wails-build.ps1" -platform "linux" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto
@@ -139,14 +139,14 @@ tasks:
   build:gui:macos:binary:
     vars:
       WAILS_PLATFORM: '{{default "mac" .WAILS_PLATFORM}}'
-    dir: cmd\pchat-gui
+    dir: '{{.ROOT_DIR}}/cmd/pchat-gui'
     cmds:
       # Wails v2 does not support cross-compile to macOS — Apple's
       # toolchain is required. Skip with a clear message on non-macOS
       # hosts so `build:all` doesn't surface a cryptic linker error
       # when run from Windows/Linux CI.
       - cmd: powershell -NoProfile -Command "if (-not [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { Write-Host '[skip] pchat-gui macOS build requires macOS host. Run this on a Mac or in a macOS CI runner.' -ForegroundColor Yellow; exit 0 }"
-      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "..\..\scripts\wails-build.ps1" -platform "{{.WAILS_PLATFORM}}" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File "{{.ROOT_DIR}}/scripts/wails-build.ps1" -platform "{{.WAILS_PLATFORM}}" -ldflags "-X github.com/p-chat/pchat/internal/version.Version={{.VERSION}} -X github.com/p-chat/pchat/internal/version.GitCommit={{.GIT_COMMIT}}"
         env:
           GOPROXY: '{{.GOPROXY}}'
           GOTOOLCHAIN: auto

@@ -29,7 +29,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Resolve wails: search the standard GOPATH/bin locations.
-$wailsDir = & "$PSScriptRoot\find-wails.ps1"
+$wailsDir = & (Join-Path $PSScriptRoot 'find-wails.ps1')
 if (-not $wailsDir) {
     Write-Error "wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0"
     exit 1
@@ -39,12 +39,12 @@ if (-not $wailsDir) {
 # call below resolves correctly. This mutates the current process PATH.
 $env:PATH = "$wailsDir$([System.IO.Path]::PathSeparator)$env:PATH"
 
-& "$PSScriptRoot\assert-wails-version.ps1"
+& (Join-Path $PSScriptRoot 'assert-wails-version.ps1')
 if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-$wailsPlatform = & "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format wails
+$wailsPlatform = & (Join-Path $PSScriptRoot 'resolve-platform.ps1') -Name $Platform -Format wails
 if (-not $wailsPlatform) {
     exit 1
 }

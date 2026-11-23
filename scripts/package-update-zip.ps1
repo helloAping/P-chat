@@ -18,10 +18,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-. "$PSScriptRoot\version-utils.ps1"
+. (Join-Path $PSScriptRoot 'version-utils.ps1')
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$platformOS = (& "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format os).Trim()
+$platformOS = (& (Join-Path $PSScriptRoot 'resolve-platform.ps1') -Name $Platform -Format os).Trim()
 $packagePlatform = if ($platformOS -eq "darwin") { "macos" } else { $platformOS }
 $version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
 $versionInfo = Get-PChatVersionInfo -Version $version

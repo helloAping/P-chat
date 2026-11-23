@@ -103,8 +103,8 @@ switch ($Platform) {
             )) {
             Assert-UnixArch -Path (Join-Path $root $relative) -Expected 'amd64'
         }
-        & "$PSScriptRoot\package-platform-archive.ps1" -Platform linux
-        & "$PSScriptRoot\package-update-zip.ps1" -Platform linux -Arch amd64 -RequireSetup
+        & (Join-Path $PSScriptRoot 'package-platform-archive.ps1') -Platform linux
+        & (Join-Path $PSScriptRoot 'package-update-zip.ps1') -Platform linux -Arch amd64 -RequireSetup
     }
     'mac' {
         if ($Arch -ne 'arm64') {
@@ -127,10 +127,10 @@ switch ($Platform) {
             throw "macOS GUI binary missing: $gui"
         }
         Assert-UnixArch -Path $gui -Expected $Arch
-        & "$PSScriptRoot\package-platform-archive.ps1" -Platform mac -Arch $Arch
-        & "$PSScriptRoot\package-update-zip.ps1" -Platform mac -Arch $Arch -RequireSetup
+        & (Join-Path $PSScriptRoot 'package-platform-archive.ps1') -Platform mac -Arch $Arch
+        & (Join-Path $PSScriptRoot 'package-update-zip.ps1') -Platform mac -Arch $Arch -RequireSetup
     }
 }
 
-& "$PSScriptRoot\validate-release-artifacts.ps1" -Directory (Join-Path $root 'bin') -RequireSignature
+& (Join-Path $PSScriptRoot 'validate-release-artifacts.ps1') -Directory (Join-Path $root 'bin') -RequireSignature
 Write-Host "[ci-release-build] $Platform/$Arch packages verified" -ForegroundColor Green
