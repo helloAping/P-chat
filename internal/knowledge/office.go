@@ -37,6 +37,41 @@ func ExtractOfficeText(path string) (string, error) {
 	}
 }
 
+// ValidateDOCX 检查 Word 包含可读取且格式正确的正文 XML。
+// ValidateDOCX checks that a Word package contains readable, well-formed document XML.
+func ValidateDOCX(path string) error {
+	r, err := zip.OpenReader(path)
+	if err != nil {
+		return fmt.Errorf("open docx zip: %w", err)
+	}
+	defer r.Close()
+	f, err := r.Open("word/document.xml")
+	if err != nil {
+		return fmt.Errorf("open word/document.xml: %w", err)
+	}
+	defer f.Close()
+	decoder := xml.NewDecoder(f)
+	seenRoot := false
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			if !seenRoot {
+				return fmt.Errorf("word/document.xml is empty")
+			}
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("parse word/document.xml: %w", err)
+		}
+		if start, ok := token.(xml.StartElement); ok && !seenRoot {
+			if start.Name.Local != "document" {
+				return fmt.Errorf("word/document.xml has unexpected root %q", start.Name.Local)
+			}
+			seenRoot = true
+		}
+	}
+}
+
 // extractDocx reads word/document.xml and strips XML tags.
 func extractDocx(r *zip.ReadCloser) string {
 	f, err := r.Open("word/document.xml")

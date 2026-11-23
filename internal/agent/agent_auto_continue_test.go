@@ -428,6 +428,30 @@ func TestNormalizeToolCallIDs(t *testing.T) {
 		}
 	})
 
+	t.Run("an id already shown on a live card is not rewritten", func(t *testing.T) {
+		calls := []nativeToolCall{
+			{ID: "dup", Name: "exec_command", StreamAnnounced: true},
+			{ID: "dup", Name: "list_files", StreamAnnounced: true},
+		}
+		seen := map[string]bool{"dup": true}
+		normalizeToolCallIDs(calls, seen)
+		if calls[0].ID != "dup" || calls[1].ID != "dup" {
+			t.Fatalf("announced ids changed: %+v", calls)
+		}
+	})
+
+	t.Run("claimToolCallID keeps the first card id and uniquifies the next", func(t *testing.T) {
+		announced := map[string]bool{}
+		first := claimToolCallID("call_same", announced)
+		second := claimToolCallID("call_same", announced)
+		if first != "call_same" {
+			t.Fatalf("first = %q", first)
+		}
+		if second == first || !strings.HasPrefix(second, "call_") {
+			t.Fatalf("second = %q", second)
+		}
+	})
+
 	t.Run("ID format is preserved as call_<uuid>", func(t *testing.T) {
 		calls := []nativeToolCall{{ID: ""}}
 		seen := map[string]bool{}

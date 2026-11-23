@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/memory"
 	"github.com/p-chat/pchat/internal/paths"
 )
 
@@ -42,6 +44,212 @@ var steps = map[AppVersion]func(*sql.DB) error{
 	V12: stepV12toV13,
 	V13: stepV13toV14,
 	V14: stepV14toV15,
+	V15: stepV15toV16,
+	V16: stepV16toV17,
+	V17: stepV17toV18,
+	V18: stepV18toV19,
+	V19: stepV19toV20,
+	V20: stepV20toV21,
+	V21: stepV21toV22,
+	V22: stepV22toV23,
+	V23: stepV23toV24,
+	V24: stepV24toV25,
+}
+
+// stepV19toV20 creates the messages_fts FTS5 index used by SearchMessages
+// (PERF-02). Idempotent — covers bootstrap paths that mark memory migration
+// 14 applied without running its Up SQL.
+func stepV19toV20(db *sql.DB) error {
+	log.Print("[upgrade] V19 → V20: ensuring messages_fts FTS5 index (PERF-02)")
+	if db == nil {
+		return nil
+	}
+	if err := memory.EnsureMessagesFTS(db); err != nil {
+		return fmt.Errorf("ensure messages_fts: %w", err)
+	}
+	return nil
+}
+
+// stepV20toV21 creates the message_bookmarks table (SM-06).
+func stepV20toV21(db *sql.DB) error {
+	log.Print("[upgrade] V20 → V21: ensuring message_bookmarks")
+	if err := memory.EnsureMessageBookmarks(db); err != nil {
+		return fmt.Errorf("ensure message_bookmarks: %w", err)
+	}
+	return nil
+}
+
+// stepV21toV22 creates the global user memory card table.
+func stepV21toV22(db *sql.DB) error {
+	log.Print("[upgrade] V21 → V22: ensuring user_memories")
+	if err := memory.EnsureUserMemories(db); err != nil {
+		return fmt.Errorf("ensure user_memories: %w", err)
+	}
+	return nil
+}
+
+// stepV22toV23 creates the morning digest schedule table.
+func stepV22toV23(db *sql.DB) error {
+	log.Print("[upgrade] V22 → V23: ensuring morning_digests")
+	if err := memory.EnsureMorningDigests(db); err != nil {
+		return fmt.Errorf("ensure morning_digests: %w", err)
+	}
+	return nil
+}
+
+// stepV23toV24 creates the persisted turn-change summary table.
+func stepV23toV24(db *sql.DB) error {
+	log.Print("[upgrade] V23 → V24: ensuring turn_changes")
+	if err := memory.EnsureTurnChanges(db); err != nil {
+		return fmt.Errorf("ensure turn_changes: %w", err)
+	}
+	return nil
+}
+
+// stepV24toV25 drops the short-lived global memory cards and morning digest table.
+func stepV24toV25(db *sql.DB) error {
+	log.Print("[upgrade] V24 → V25: dropping retired memory cards and morning digests")
+	if err := memory.DropRetiredDelightTables(db); err != nil {
+		return fmt.Errorf("drop retired delight tables: %w", err)
+	}
+	return nil
+}
+
+// stepV18toV19 merges SEC-06 Windows sandbox baselines into the managed
+// global config without removing user customizations.
+func stepV18toV19(_ *sql.DB) error {
+	log.Print("[upgrade] V18 → V19: merging Windows sandbox baselines (SEC-06)")
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read global config: %w", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("decode global config: %w", err)
+	}
+	sandboxRaw, ok := root["sandbox"]
+	if !ok || len(sandboxRaw) == 0 || string(sandboxRaw) == "null" {
+		return nil
+	}
+	var sandbox map[string]json.RawMessage
+	if err := json.Unmarshal(sandboxRaw, &sandbox); err != nil {
+		return fmt.Errorf("decode sandbox config: %w", err)
+	}
+	changed := false
+	if merged, did := mergeStringListJSON(sandbox["exec_dangerous_patterns"], config.WindowsDangerousPatterns()); did {
+		raw, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("encode exec_dangerous_patterns: %w", err)
+		}
+		sandbox["exec_dangerous_patterns"] = raw
+		changed = true
+	}
+	if merged, did := mergeStringListJSON(sandbox["write_protected_paths"], config.WindowsWriteProtectedPaths()); did {
+		raw, err := json.Marshal(merged)
+		if err != nil {
+			return fmt.Errorf("encode write_protected_paths: %w", err)
+		}
+		sandbox["write_protected_paths"] = raw
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	outSandbox, err := json.Marshal(sandbox)
+	if err != nil {
+		return fmt.Errorf("encode sandbox config: %w", err)
+	}
+	root["sandbox"] = outSandbox
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode global config: %w", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return fmt.Errorf("stat global config: %w", err)
+	}
+	if err := writeUpgradeFileAtomic(configPath, append(out, '\n'), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write global config: %w", err)
+	}
+	return nil
+}
+
+// mergeStringListJSON appends missing extras onto an existing JSON string
+// array. When raw is empty/null/missing, extras become the new list.
+func mergeStringListJSON(raw json.RawMessage, extras []string) ([]string, bool) {
+	var existing []string
+	if len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &existing); err != nil {
+			return nil, false
+		}
+	}
+	seen := make(map[string]struct{}, len(existing)+len(extras))
+	for _, s := range existing {
+		seen[s] = struct{}{}
+	}
+	out := append([]string(nil), existing...)
+	changed := false
+	for _, s := range extras {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+		changed = true
+	}
+	return out, changed
+}
+
+// stepV17toV18 从全局配置移除不再使用的 IM 凭据。
+// stepV17toV18 removes retired IM credentials from the managed global config.
+func stepV17toV18(_ *sql.DB) error {
+	log.Print("[upgrade] V17 → V18: removing retired IM configuration")
+	configPath := paths.GlobalConfig()
+	data, err := os.ReadFile(configPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read global config: %w", err)
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return fmt.Errorf("decode global config: %w", err)
+	}
+	if _, exists := root["im"]; !exists {
+		return nil
+	}
+	delete(root, "im")
+	out, err := json.MarshalIndent(root, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode global config: %w", err)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		return fmt.Errorf("stat global config: %w", err)
+	}
+	if err := writeUpgradeFileAtomic(configPath, append(out, '\n'), info.Mode().Perm()); err != nil {
+		return fmt.Errorf("write global config: %w", err)
+	}
+	return nil
+}
+
+// stepV16toV17 establishes the uploads directory used by the V17 owner
+// sidecars. Existing uploads intentionally remain ownerless: their original
+// conversation is not knowable from disk alone, and the server only accepts
+// such a legacy reference when it was already persisted by that session.
+func stepV16toV17(_ *sql.DB) error {
+	if err := os.MkdirAll(filepath.Join(paths.GlobalDir(), "uploads"), 0o755); err != nil {
+		return fmt.Errorf("create uploads directory for owner metadata: %w", err)
+	}
+	return nil
 }
 
 // resolvePromptDir returns the best-guess prompts directory for legacy import.
@@ -518,6 +726,16 @@ func stepV13toV14(db *sql.DB) error {
 func stepV14toV15(_ *sql.DB) error {
 	log.Print("[upgrade] V14 → V15: initializing provider strategy ids")
 	return migrateProviderStrategyIDs()
+}
+
+// ---- V15 → V16 ----
+
+func stepV15toV16(_ *sql.DB) error {
+	// No rewrite is necessary: an absent model.protocol intentionally means
+	// "inherit the provider protocol". Recording the step keeps config format
+	// evolution ordered and makes interrupted upgrades resumable.
+	log.Print("[upgrade] V15 → V16: enabling optional per-model request protocols")
+	return nil
 }
 
 func migrateProviderCustomHeaders() error {

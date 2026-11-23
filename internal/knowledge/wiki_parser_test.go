@@ -9,6 +9,17 @@ import (
 	"testing"
 )
 
+func TestExtractedTextCacheRejectsOversizedEntry(t *testing.T) {
+	extractedTextCache.Lock()
+	extractedTextCache.entries = make(map[string]extractedTextCacheEntry)
+	extractedTextCache.totalBytes = 0
+	extractedTextCache.Unlock()
+	storeExtractedTextCache("oversized", 1, 1, strings.Repeat("x", maxExtractedTextCacheEntrySize+1))
+	if _, ok := lookupExtractedTextCache("oversized", 1, 1); ok {
+		t.Fatal("oversized extracted text was cached")
+	}
+}
+
 // ==============================
 // BuildHeadingTree tests
 // ==============================

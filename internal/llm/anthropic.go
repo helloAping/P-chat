@@ -264,8 +264,8 @@ func (c *AnthropicClient) ChatStream(ctx context.Context, modelName string, mess
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			ch <- StreamChunk{Err: fmt.Errorf("anthropic API error %d: %s", resp.StatusCode, string(bodyBytes))}
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			ch <- StreamChunk{Err: ClassifyAPIError("anthropic", upstreamHTTPError("anthropic", resp.StatusCode, bodyBytes))}
 			return
 		}
 
@@ -380,7 +380,7 @@ func (c *AnthropicClient) handleStreamEvent(eventType, dataJSON string, ch chan<
 			Message string `json:"message"`
 		}
 		if err := json.Unmarshal([]byte(dataJSON), &errResp); err == nil {
-			ch <- StreamChunk{Err: fmt.Errorf("anthropic error: %s", errResp.Message)}
+			ch <- StreamChunk{Err: fmt.Errorf("anthropic error: %s", sanitizeProviderDetail(errResp.Message, 1024))}
 		}
 	}
 }
@@ -451,8 +451,8 @@ func (c *AnthropicClient) Chat(ctx context.Context, modelName string, messages [
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("anthropic API error %d: %s", resp.StatusCode, string(bodyBytes))
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", ClassifyAPIError("anthropic", upstreamHTTPError("anthropic", resp.StatusCode, bodyBytes))
 	}
 
 	var result anthropicResponse

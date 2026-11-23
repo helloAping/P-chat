@@ -1,5 +1,5 @@
 # Find Wails CLI: the user installed it once via
-# `go install github.com/wailsapp/wails/v2/cmd/wails@latest`,
+# `go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0`,
 # which places the binary under $(go env GOPATH)/bin. That
 # dir is not always in $PATH on Windows (PowerShell sessions
 # and Task's shell don't inherit a go-injected PATH update).

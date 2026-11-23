@@ -29,6 +29,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/p-chat/pchat/internal/agent"
@@ -45,22 +46,18 @@ func (h *Handler) ListSessions(c *gin.Context) {
 	}
 	projectPath := c.Query("project_path")
 	hasProjectParam := c.Request.URL.Query().Has("project_path")
-	// Cap the list at 200 to bound the response size for users
-	// with thousands of sessions. The SPA can paginate via
-	// future ?before_id/limit params if it needs more.
-	convs := h.store.ListConversationsLimit(200)
+	// Cap the list at 200 to bound the response size for users with thousands
+	// of sessions. A project filter is applied before this cap so sessions from
+	// other projects cannot hide older sessions in the requested project.
+	var convs []memory.Conversation
+	if hasProjectParam {
+		convs = h.store.ListConversationsByProjectPathLimit(projectPath, 200)
+	} else {
+		convs = h.store.ListConversationsLimit(200)
+	}
 	out := make([]SessionResponse, 0, len(convs))
 	for _, conv := range convs {
 		resp := h.sessionToResponse(conv)
-		if projectPath != "" {
-			if resp.ProjectPath != projectPath {
-				continue
-			}
-		} else if hasProjectParam {
-			if resp.ProjectPath != "" {
-				continue
-			}
-		}
 		out = append(out, resp)
 	}
 	c.JSON(http.StatusOK, gin.H{"sessions": out})
@@ -457,7 +454,7 @@ func (h *Handler) RollbackMessages(c *gin.Context) {
 		// what we want here (one DB row should produce
 		// one MessageResponse, not several).
 		cm := memoryMessageToChatMessage(m)
-		if resp := buildMessageResponse(cm, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i]); resp != nil {
+		if resp := buildMessageResponseForSession(id, cm, metas, createds, i, rowIDs[i], seqs[i], regenGroupIDs[i], isArchiveds[i]); resp != nil {
 			deletedResp = append(deletedResp, *resp)
 		}
 	}
@@ -923,6 +920,40 @@ func truncateRunes(s string, limit int) string {
 	return string(rs[:limit])
 }
 
+const (
+	maxSessionTags     = 8
+	maxSessionTagRunes = 16
+)
+
+// normalizeSessionTags trims, drops blanks, and rejects duplicates,
+// overlong labels, and lists past the cap. Order of first appearance
+// is kept.
+func normalizeSessionTags(in []string) ([]string, error) {
+	seen := make(map[string]struct{}, len(in))
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		tag := strings.TrimSpace(raw)
+		if tag == "" {
+			continue
+		}
+		if strings.ContainsAny(tag, "\r\n\t") {
+			return nil, fmt.Errorf("tag %q contains whitespace", tag)
+		}
+		if utf8.RuneCountInString(tag) > maxSessionTagRunes {
+			return nil, fmt.Errorf("tag %q is longer than %d characters", tag, maxSessionTagRunes)
+		}
+		if _, ok := seen[tag]; ok {
+			continue
+		}
+		seen[tag] = struct{}{}
+		out = append(out, tag)
+	}
+	if len(out) > maxSessionTags {
+		return nil, fmt.Errorf("at most %d tags", maxSessionTags)
+	}
+	return out, nil
+}
+
 // UpdateSessionMeta is the "change provider / model / style without
 // sending a message" endpoint. Bound to PATCH /sessions/:id. The
 // request body uses pointer fields so callers can send partial
@@ -1111,6 +1142,21 @@ func (h *Handler) UpdateSessionMeta(c *gin.Context) {
 		h.metaMu.Lock()
 		m := h.meta[id]
 		m.KnowledgeBase = *req.KnowledgeBase
+		h.meta[id] = m
+		h.metaMu.Unlock()
+		h.persistSessionMeta(id, m)
+	}
+
+	if req.Tags != nil {
+		tags, err := normalizeSessionTags(*req.Tags)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		h.ensureMetaLoaded(id)
+		h.metaMu.Lock()
+		m := h.meta[id]
+		m.Tags = tags
 		h.meta[id] = m
 		h.metaMu.Unlock()
 		h.persistSessionMeta(id, m)

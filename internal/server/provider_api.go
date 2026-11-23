@@ -21,6 +21,10 @@ import (
 // context/output, capabilities) plus the legacy single-model
 // fallback field, so a UI can render every model in one place.
 //
+// Secret Redaction Contract: api_key plaintext is never returned.
+// Callers see has_api_key only. custom_headers keeps header names
+// but always redacts values (empty string). Storage is unchanged.
+//
 // For the v0.9 "list all providers" view, see Handler.Providers —
 // it returns a slimmer shape (name/model/protocol only) suitable
 // for the model picker in the chat input.
@@ -30,13 +34,44 @@ type ProviderFull struct {
 	StrategyVariant string               `json:"strategy_variant"`
 	Protocol        string               `json:"protocol"`
 	BaseURL         string               `json:"base_url"`
-	APIKey          string               `json:"api_key"`
+	HasAPIKey       bool                 `json:"has_api_key"`
 	CustomHeaders   map[string]string    `json:"custom_headers,omitempty"`
 	IsDefault       bool                 `json:"is_default"`
 	Models          []config.ModelConfig `json:"models"`
 	// Legacy single-model form (kept for backward compat; equals
 	// the first entry of Models when populated).
 	Model string `json:"model,omitempty"`
+}
+
+// providerFullFrom builds the redacted ProviderFull response shape.
+// providerFullFrom builds the redacted rich provider response.
+func providerFullFrom(p config.ProviderConfig, isDefault bool) ProviderFull {
+	return ProviderFull{
+		Name:            p.Name,
+		ProviderID:      p.GetProviderID(),
+		StrategyVariant: p.GetStrategyVariant(),
+		Protocol:        p.GetProtocol(),
+		BaseURL:         p.EffectiveBaseURL(),
+		HasAPIKey:       strings.TrimSpace(p.APIKey) != "",
+		CustomHeaders:   redactCustomHeaderValues(p.CustomHeaders),
+		IsDefault:       isDefault,
+		Models:          p.AllModels(),
+		Model:           p.EffectiveModel(),
+	}
+}
+
+// redactCustomHeaderValues keeps header names and strips values so
+// secrets / tokens in custom headers never leave the server.
+// redactCustomHeaderValues preserves names and clears values.
+func redactCustomHeaderValues(headers map[string]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(headers))
+	for name := range headers {
+		out[name] = ""
+	}
+	return out
 }
 
 const providerTestTimeout = 30 * time.Second
@@ -172,19 +207,7 @@ func (h *Handler) GetProvider(c *gin.Context) {
 		if p.Name != name {
 			continue
 		}
-		models := p.AllModels()
-		c.JSON(http.StatusOK, ProviderFull{
-			Name:            p.Name,
-			ProviderID:      p.GetProviderID(),
-			StrategyVariant: p.GetStrategyVariant(),
-			Protocol:        p.GetProtocol(),
-			BaseURL:         p.EffectiveBaseURL(),
-			APIKey:          p.APIKey,
-			CustomHeaders:   p.CustomHeaders,
-			IsDefault:       p.Name == h.getCfg().LLM.Default,
-			Models:          models,
-			Model:           p.EffectiveModel(),
-		})
+		c.JSON(http.StatusOK, providerFullFrom(p, p.Name == h.getCfg().LLM.Default))
 		return
 	}
 	c.JSON(http.StatusNotFound, gin.H{"error": "provider not found: " + name})
@@ -193,13 +216,16 @@ func (h *Handler) GetProvider(c *gin.Context) {
 // UpdateModelRequest is the body of PUT /api/v1/providers/:name/models/:model.
 //
 // Per-model fields:
-//   - display_name, description, max_tokens_context, max_tokens_output
+//   - protocol, display_name, description, max_tokens_context, max_tokens_output
 //
 // A zero value for a numeric field means "leave it as is" (the
 // API treats 0 as "not provided"). Pass an explicit negative
 // value (e.g. -1) to clear the field. DisplayName and
 // Description accept empty string to clear.
 type UpdateModelRequest struct {
+	// Protocol is a pointer so omitted means "leave unchanged", while an
+	// explicit empty string clears the override and restores inheritance.
+	Protocol         *string                            `json:"protocol"`
 	APIEndpoint      string                             `json:"api_endpoint,omitempty"`
 	DisplayName      string                             `json:"display_name"`
 	Description      string                             `json:"description"`
@@ -214,8 +240,8 @@ type UpdateModelRequest struct {
 //
 // Replaces the editable fields of a model. The model Name is the
 // URL path segment and cannot be changed (callers should
-// delete-and-recreate to rename). Writes to
-// ~/.p-chat/config.json and reloads the in-memory LLM client.
+// delete-and-recreate to rename). Writes to the active config
+// layer and reloads the in-memory LLM client.
 func (h *Handler) UpdateModel(c *gin.Context) {
 	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
@@ -237,7 +263,7 @@ func (h *Handler) UpdateModel(c *gin.Context) {
 		Type:             req.Type,
 		Generation:       req.Generation,
 	}
-	updated, err := config.UpdateModel(providerName, modelName, patch, req.ClearAll)
+	updated, err := config.UpdateModelProtocolAt(h.configPath, providerName, modelName, patch, req.Protocol, req.ClearAll)
 	if err != nil {
 		if strings.Contains(err.Error(), "used by generation default") {
 			c.JSON(http.StatusConflict, gin.H{"error": "update failed: " + err.Error()})
@@ -270,8 +296,8 @@ type SetCapabilitiesRequest struct {
 
 // SetCapabilities PATCH /api/v1/providers/:name/models/:model/capabilities
 //
-// Replaces the model entry's Capabilities block. Writes to
-// ~/.p-chat/config.json and reloads the in-memory LLM client.
+// Replaces the model entry's Capabilities block. Writes to the
+// active config layer and reloads the in-memory LLM client.
 func (h *Handler) SetCapabilities(c *gin.Context) {
 	if h.getCfg() == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "config not available"})
@@ -300,7 +326,7 @@ func (h *Handler) SetCapabilities(c *gin.Context) {
 		}
 		req.InputModalities = &normalized
 	}
-	if err := config.SetModelCapabilities(name, model, config.Capabilities{
+	if err := config.SetModelCapabilitiesAt(h.configPath, name, model, config.Capabilities{
 		ThinkingEffort:  config.ThinkingEffort(req.ThinkingEffort),
 		ContextWindow:   req.ContextWindow,
 		SupportsVision:  req.SupportsVision,

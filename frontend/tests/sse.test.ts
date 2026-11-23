@@ -10,6 +10,8 @@ import {
   nextStreamIdleTimeoutMs,
   parseSSEFrame,
   shouldRetryStreamError,
+  StreamHTTPError,
+  isRejectedMessageRequest,
   streamErrorStatus,
   STREAM_IDLE_AFTER_LLM_MS,
   STREAM_IDLE_AFTER_TOOL_MS,
@@ -77,6 +79,21 @@ test('HTTP 409 stream conflicts are non-retryable', () => {
   assert.equal(shouldRetryStreamError(badGateway), true)
   assert.equal(streamErrorStatus(network), null)
   assert.equal(shouldRetryStreamError(network), true)
+})
+
+test('an attachment validation 400 is a rejected request, not a dropped stream', () => {
+  const invalidAttachment = new StreamHTTPError('stream', 400, '{"code":"invalid_attachment","error":"broken.pdf PDF 文件不完整"}', 'Bad Request')
+  assert.equal(streamErrorStatus(invalidAttachment), 400)
+  assert.equal(shouldRetryStreamError(invalidAttachment), false)
+  assert.equal(isRejectedMessageRequest(invalidAttachment), true)
+  assert.equal(invalidAttachment.code, 'invalid_attachment')
+  assert.match(invalidAttachment.detail, /broken\.pdf/)
+  assert.doesNotMatch(invalidAttachment.detail, /\{"code"/)
+  assert.equal(shouldRetryStreamError(new Error('stream: HTTP 422: unprocessable')), false)
+  assert.equal(shouldRetryStreamError(new Error('stream: HTTP 429: busy')), true)
+  assert.equal(isRejectedMessageRequest(new StreamHTTPError('stream', 409, '{"code":"session_busy","error":"busy"}', 'Conflict')), true)
+  assert.equal(isRejectedMessageRequest(new StreamHTTPError('stream', 409, '{"code":"duplicate_client_message"}', 'Conflict')), false)
+  assert.equal(isRejectedMessageRequest(new StreamHTTPError('stream', 500, '{"error":"server error"}', 'Server Error')), false)
 })
 
 test('consumeSSEStream handles split frames and skips DONE', async () => {
@@ -203,6 +220,59 @@ test('nextStreamIdleTimeoutMs stretches while a tool or sub-agent is running', (
     STREAM_IDLE_AFTER_LLM_MS,
   )
   assert.equal(afterToolOk, STREAM_IDLE_AFTER_LLM_MS)
+})
+
+test('nextStreamIdleTimeoutMs waits indefinitely while a question is open', () => {
+  const afterQuestionTool = nextStreamIdleTimeoutMs(
+    { type: 'tool', tool_status: 'start', tool_name: 'question' },
+    STREAM_IDLE_AFTER_LLM_MS,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterQuestionTool, 0)
+
+  const afterQuestionEvent = nextStreamIdleTimeoutMs(
+    { type: 'question' },
+    STREAM_IDLE_AFTER_TOOL_MS,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterQuestionEvent, 0)
+
+  const duringWait = nextStreamIdleTimeoutMs(
+    { type: 'phase', step: 'tool-heartbeat' },
+    0,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(duringWait, 0)
+
+  const afterSubmit = nextStreamIdleTimeoutMs(
+    { type: 'tool', tool_status: 'ok', tool_name: 'question' },
+    0,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterSubmit, STREAM_IDLE_AFTER_LLM_MS)
+})
+
+test('consumeSSEStream lets a buffered burst paint before the rest arrives', async () => {
+  const frames = Array.from({ length: 5 }, (_, i) =>
+    `data: ${JSON.stringify({ type: 'content', content: String(i) })}\nid: ${i + 1}\n\n`,
+  ).join('')
+  const seen: number[] = []
+  const yieldsAt: number[] = []
+
+  await consumeSSEStream({
+    reader: readerFromChunks([frames]),
+    label: 'test',
+    paintEvery: 2,
+    paintYield: async () => {
+      yieldsAt.push(seen.length)
+    },
+    onEvent: (event) => {
+      if (typeof event.seq === 'number') seen.push(event.seq)
+    },
+  })
+
+  assert.deepEqual(seen, [1, 2, 3, 4, 5])
+  assert.deepEqual(yieldsAt, [2, 4])
 })
 
 test('consumeSSEStream drops buffered events after cancellation', async () => {

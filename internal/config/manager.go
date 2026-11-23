@@ -91,9 +91,15 @@ func (m *Manager) WatchGlobal(ctx context.Context, interval time.Duration, onRel
 // the upsert variant explicitly if it wants overwrite
 // behavior.)
 func AddProvider(p ProviderConfig) error {
-	cfg, err := Load("")
+	return AddProviderAt("", p)
+}
+
+// AddProviderAt 按活动配置路径新增 Provider。
+// AddProviderAt adds a provider at the active configuration path.
+func AddProviderAt(configPath string, p ProviderConfig) error {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("load provider config: %w", err)
 	}
 	// Validate name. A blank name would create a provider
 	// that can't be referenced, and a name with whitespace or
@@ -164,16 +170,20 @@ func AddProvider(p ProviderConfig) error {
 	p.Vendor = ""
 	p.Type = ""
 	cfg.LLM.Providers = append(cfg.LLM.Providers, p)
-
-	mgr := NewManager()
-	return mgr.SaveGlobal(cfg)
+	return saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Providers, "llm", "providers"))
 }
 
 // RemoveProvider removes a provider from the global config
 func RemoveProvider(name string) error {
-	cfg, err := Load("")
+	return RemoveProviderAt("", name)
+}
+
+// RemoveProviderAt 按活动配置路径删除 Provider。
+// RemoveProviderAt removes a provider at the active configuration path.
+func RemoveProviderAt(configPath, name string) error {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("load provider config: %w", err)
 	}
 
 	for i, p := range cfg.LLM.Providers {
@@ -182,8 +192,7 @@ func RemoveProvider(name string) error {
 				return fmt.Errorf("provider %q is used by generation default %s", name, operation)
 			}
 			cfg.LLM.Providers = append(cfg.LLM.Providers[:i], cfg.LLM.Providers[i+1:]...)
-			mgr := NewManager()
-			return mgr.SaveGlobal(cfg)
+			return saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Providers, "llm", "providers"))
 		}
 	}
 	return fmt.Errorf("provider %q not found", name)
@@ -191,9 +200,15 @@ func RemoveProvider(name string) error {
 
 // SetDefaultProvider sets the default provider in the global config
 func SetDefaultProvider(name string) error {
-	cfg, err := Load("")
+	return SetDefaultProviderAt("", name)
+}
+
+// SetDefaultProviderAt 按活动配置路径设置默认 Provider。
+// SetDefaultProviderAt sets the default provider at the active configuration path.
+func SetDefaultProviderAt(configPath, name string) error {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("load provider config: %w", err)
 	}
 
 	found := false
@@ -214,8 +229,7 @@ func SetDefaultProvider(name string) error {
 	}
 
 	cfg.LLM.Default = name
-	mgr := NewManager()
-	return mgr.SaveGlobal(cfg)
+	return saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Default, "llm", "default"))
 }
 
 // SetProviderAPIKey updates only the API key for a provider
@@ -269,15 +283,45 @@ type ProviderPatch struct {
 	// ClearAPIKey, if true, forces the key to be emptied
 	// even when the user-supplied APIKey is "".
 	ClearAPIKey bool
-	// CustomHeaders 非 nil 时替换完整的请求头模板；显式空映射会清空配置。
-	// CustomHeaders, when non-nil, replaces the complete header template map;
-	// an explicitly supplied empty map clears all custom headers.
+	// CustomHeaders 非 nil 时替换请求头键集合；显式空映射清空全部。
+	// 值为空字符串时保留该键的旧值（配合读侧脱敏：前端无法回传明文）。
+	// CustomHeaders, when non-nil, replaces the header key set; an empty map
+	// clears all. An empty value keeps the prior value for that name so the
+	// redacted read path can round-trip names without wiping secrets.
 	CustomHeaders *map[string]string
 	// IsDefault, if true, promotes this provider to be the
 	// global default. (False is a no-op so the UI can
 	// always include the field without unintended
 	// demotions.)
 	IsDefault bool
+}
+
+// mergeProviderCustomHeaders applies a custom_headers patch under the
+// Secret Redaction Contract: empty map clears; otherwise the incoming
+// key set wins, and blank values keep the previously stored value.
+// mergeProviderCustomHeaders merges a redaction-aware headers patch.
+func mergeProviderCustomHeaders(existing, incoming map[string]string) (map[string]string, error) {
+	if len(incoming) == 0 {
+		return nil, nil
+	}
+	next := make(map[string]string, len(incoming))
+	for name, value := range incoming {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if strings.TrimSpace(value) == "" {
+			if old, ok := existing[name]; ok {
+				next[name] = old
+			}
+			continue
+		}
+		next[name] = value
+	}
+	if err := requestheader.ValidateTemplates(next); err != nil {
+		return nil, fmt.Errorf("invalid custom_headers: %w", err)
+	}
+	return requestheader.CloneTemplates(next), nil
 }
 
 // UpdateProvider applies a ProviderPatch to an existing
@@ -290,9 +334,15 @@ type ProviderPatch struct {
 // the rename collides with an existing provider, the file is
 // not touched.
 func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error) {
-	cfg, err := Load("")
+	return UpdateProviderAt("", oldName, patch)
+}
+
+// UpdateProviderAt 按活动配置路径更新 Provider。
+// UpdateProviderAt updates a provider at the active configuration path.
+func UpdateProviderAt(configPath, oldName string, patch ProviderPatch) (*ProviderConfig, error) {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load provider config: %w", err)
 	}
 	idx := -1
 	for i, p := range cfg.LLM.Providers {
@@ -305,6 +355,8 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		return nil, fmt.Errorf("provider %q not found", oldName)
 	}
 	p := cfg.LLM.Providers[idx]
+	defaultChanged := false
+	generationDefaultsChanged := false
 
 	// Handle rename first because every subsequent field
 	// check needs to look at the new name.
@@ -320,11 +372,13 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		}
 		if cfg.LLM.Default == oldName {
 			cfg.LLM.Default = patch.Name
+			defaultChanged = true
 		}
 		for operation, target := range cfg.Generation.Defaults {
 			if target.Provider == oldName {
 				target.Provider = patch.Name
 				cfg.Generation.Defaults[operation] = target
+				generationDefaultsChanged = true
 			}
 		}
 		p.Name = patch.Name
@@ -341,7 +395,7 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 			newDefault := DefaultLLMAPIEndpoint(p.GetProtocol())
 			for modelIndex := range p.Models {
 				model := &p.Models[modelIndex]
-				if model.EffectiveType() != ModelTypeLLM {
+				if model.EffectiveType() != ModelTypeLLM || strings.TrimSpace(model.Protocol) != "" {
 					continue
 				}
 				if model.APIEndpoint == "" || NormalizeAPIEndpointSuffix(model.APIEndpoint) == oldDefault {
@@ -389,10 +443,11 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 		p.APIKey = patch.APIKey
 	}
 	if patch.CustomHeaders != nil {
-		if err := requestheader.ValidateTemplates(*patch.CustomHeaders); err != nil {
-			return nil, fmt.Errorf("invalid custom_headers: %w", err)
+		merged, err := mergeProviderCustomHeaders(p.CustomHeaders, *patch.CustomHeaders)
+		if err != nil {
+			return nil, err
 		}
-		p.CustomHeaders = requestheader.CloneTemplates(*patch.CustomHeaders)
+		p.CustomHeaders = merged
 	}
 	if patch.IsDefault {
 		if p.EffectiveModel() == "" {
@@ -402,10 +457,17 @@ func UpdateProvider(oldName string, patch ProviderPatch) (*ProviderConfig, error
 			return nil, fmt.Errorf("provider %q has no base_url for conversational llm requests", p.Name)
 		}
 		cfg.LLM.Default = p.Name
+		defaultChanged = true
 	}
 	cfg.LLM.Providers[idx] = p
-	mgr := NewManager()
-	if err := mgr.SaveGlobal(cfg); err != nil {
+	fields := []configOverlayField{overlayField(cfg.LLM.Providers, "llm", "providers")}
+	if defaultChanged {
+		fields = append(fields, overlayField(cfg.LLM.Default, "llm", "default"))
+	}
+	if generationDefaultsChanged {
+		fields = append(fields, overlayField(cfg.Generation.Defaults, "generation", "defaults"))
+	}
+	if err := saveConfigFieldsAt(configPath, cfg, fields...); err != nil {
 		return nil, err
 	}
 	return &cfg.LLM.Providers[idx], nil
@@ -438,8 +500,14 @@ func validateProviderBaseURL(raw string) error {
 
 func normalizeModelAPIConfig(protocol string, model *ModelConfig) error {
 	if model.EffectiveType() == ModelTypeLLM {
+		if strings.TrimSpace(model.Protocol) != "" {
+			if !IsSupportedProtocol(model.Protocol) {
+				return fmt.Errorf("llm model %q: invalid protocol %q (allowed: openai, openai_chat, openai_responses, anthropic, anthropic_messages)", model.Name, model.Protocol)
+			}
+			model.Protocol = NormalizeProtocol(model.Protocol)
+		}
 		if strings.TrimSpace(model.APIEndpoint) == "" {
-			model.APIEndpoint = DefaultLLMAPIEndpoint(protocol)
+			model.APIEndpoint = DefaultLLMAPIEndpoint(model.EffectiveProtocol(protocol))
 		}
 		if err := validateAPIEndpointSuffix(model.APIEndpoint, "api_endpoint", true); err != nil {
 			return fmt.Errorf("llm model %q: %w", model.Name, err)
@@ -449,6 +517,7 @@ func normalizeModelAPIConfig(protocol string, model *ModelConfig) error {
 		return nil
 	}
 
+	model.Protocol = ""
 	model.APIEndpoint = ""
 	if model.Generation != nil && model.Generation.API != nil {
 		if strings.TrimSpace(model.Generation.API.Endpoint) == "" {
@@ -473,9 +542,15 @@ func normalizeModelAPIConfig(protocol string, model *ModelConfig) error {
 // provider only has the legacy single `model` field, the model is
 // migrated into the Models list. Returns the updated provider.
 func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
-	cfg, err := Load("")
+	return AddModelAt("", providerName, m)
+}
+
+// AddModelAt 按活动配置路径新增模型。
+// AddModelAt adds a model at the active configuration path.
+func AddModelAt(configPath, providerName string, m ModelConfig) (*ProviderConfig, error) {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load model config: %w", err)
 	}
 	if m.Name == "" {
 		return nil, fmt.Errorf("model name is required")
@@ -521,8 +596,7 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 		}
 		p.Models = append(p.Models, m)
 		cfg.LLM.Providers[i] = p
-		mgr := NewManager()
-		if err := mgr.SaveGlobal(cfg); err != nil {
+		if err := saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Providers, "llm", "providers")); err != nil {
 			return nil, err
 		}
 		return &p, nil
@@ -534,9 +608,15 @@ func AddModel(providerName string, m ModelConfig) (*ProviderConfig, error) {
 // default, the next entry in the list becomes the new default (or the
 // first remaining model).
 func RemoveModel(providerName, modelName string) error {
-	cfg, err := Load("")
+	return RemoveModelAt("", providerName, modelName)
+}
+
+// RemoveModelAt 按活动配置路径删除模型。
+// RemoveModelAt removes a model at the active configuration path.
+func RemoveModelAt(configPath, providerName, modelName string) error {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("load model config: %w", err)
 	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
@@ -573,8 +653,7 @@ func RemoveModel(providerName, modelName string) error {
 		// caller explicitly choose. The agent falls back to
 		// the first model on the next send.
 		cfg.LLM.Providers[i] = p
-		mgr := NewManager()
-		return mgr.SaveGlobal(cfg)
+		return saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Providers, "llm", "providers"))
 	}
 	return fmt.Errorf("provider %q not found", providerName)
 }
@@ -582,9 +661,15 @@ func RemoveModel(providerName, modelName string) error {
 // SetDefaultModel marks the given model as the provider's default and
 // clears `default: true` on every other model in the same provider.
 func SetDefaultModel(providerName, modelName string) error {
-	cfg, err := Load("")
+	return SetDefaultModelAt("", providerName, modelName)
+}
+
+// SetDefaultModelAt 按活动配置路径设置默认模型。
+// SetDefaultModelAt sets the default model at the active configuration path.
+func SetDefaultModelAt(configPath, providerName, modelName string) error {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("load model config: %w", err)
 	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
@@ -607,8 +692,7 @@ func SetDefaultModel(providerName, modelName string) error {
 			return fmt.Errorf("model %q not found under provider %q", modelName, providerName)
 		}
 		cfg.LLM.Providers[i] = p
-		mgr := NewManager()
-		return mgr.SaveGlobal(cfg)
+		return saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Providers, "llm", "providers"))
 	}
 	return fmt.Errorf("provider %q not found", providerName)
 }
@@ -636,9 +720,22 @@ func SetDefaultModel(providerName, modelName string) error {
 // promoted into Models[name] and the supplied patch is applied
 // to that entry.
 func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll bool) (*ProviderConfig, error) {
-	cfg, err := Load("")
+	return UpdateModelAt("", providerName, modelName, patch, clearAll)
+}
+
+// UpdateModelAt 按活动配置路径更新模型。
+// UpdateModelAt updates a model at the active configuration path.
+func UpdateModelAt(configPath, providerName, modelName string, patch ModelConfig, clearAll bool) (*ProviderConfig, error) {
+	return UpdateModelProtocolAt(configPath, providerName, modelName, patch, nil, clearAll)
+}
+
+// UpdateModelProtocolAt 按活动配置路径更新模型，并在 protocol 非 nil 时设置或清空模型级协议覆盖。
+// UpdateModelProtocolAt updates a model and sets or clears its protocol override
+// when protocol is non-nil. A pointer to an empty string restores inheritance.
+func UpdateModelProtocolAt(configPath, providerName, modelName string, patch ModelConfig, protocol *string, clearAll bool) (*ProviderConfig, error) {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("load model config: %w", err)
 	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
@@ -658,6 +755,18 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 			return nil, fmt.Errorf("model %q not found under provider %q", modelName, providerName)
 		}
 		m := &p.Models[idx]
+		oldDefaultEndpoint := NormalizeAPIEndpointSuffix(DefaultLLMAPIEndpoint(m.EffectiveProtocol(p.GetProtocol())))
+		if protocol != nil {
+			requestedProtocol := strings.TrimSpace(*protocol)
+			if requestedProtocol != "" && !IsSupportedProtocol(requestedProtocol) {
+				return nil, fmt.Errorf("llm model %q: invalid protocol %q (allowed: openai, openai_chat, openai_responses, anthropic, anthropic_messages)", modelName, requestedProtocol)
+			}
+			if requestedProtocol == "" {
+				m.Protocol = ""
+			} else {
+				m.Protocol = NormalizeProtocol(requestedProtocol)
+			}
+		}
 		if patch.Type != "" {
 			if !patch.Type.IsValid() {
 				return nil, fmt.Errorf("invalid model type %q", patch.Type)
@@ -672,6 +781,8 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 		}
 		if patch.APIEndpoint != "" {
 			m.APIEndpoint = patch.APIEndpoint
+		} else if protocol != nil && (strings.TrimSpace(m.APIEndpoint) == "" || NormalizeAPIEndpointSuffix(m.APIEndpoint) == oldDefaultEndpoint) {
+			m.APIEndpoint = DefaultLLMAPIEndpoint(m.EffectiveProtocol(p.GetProtocol()))
 		}
 		if clearAll {
 			m.DisplayName = ""
@@ -712,8 +823,7 @@ func UpdateModel(providerName, modelName string, patch ModelConfig, clearAll boo
 			}
 		}
 		cfg.LLM.Providers[i] = p
-		mgr := NewManager()
-		if err := mgr.SaveGlobal(cfg); err != nil {
+		if err := saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Providers, "llm", "providers")); err != nil {
 			return nil, err
 		}
 		return &p, nil
@@ -774,9 +884,15 @@ func (c Capabilities) IsZero() bool {
 // model under a provider. If the model doesn't have a Capabilities
 // field yet it is added; otherwise it's overwritten.
 func SetModelCapabilities(providerName, modelName string, caps Capabilities) error {
-	cfg, err := Load("")
+	return SetModelCapabilitiesAt("", providerName, modelName, caps)
+}
+
+// SetModelCapabilitiesAt 按活动配置路径替换模型能力配置。
+// SetModelCapabilitiesAt replaces model capabilities at the active configuration path.
+func SetModelCapabilitiesAt(configPath, providerName, modelName string, caps Capabilities) error {
+	cfg, err := Load(configPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("load model config: %w", err)
 	}
 	for i, p := range cfg.LLM.Providers {
 		if p.Name != providerName {
@@ -788,8 +904,7 @@ func SetModelCapabilities(providerName, modelName string, caps Capabilities) err
 			}
 			p.Models[j].Capabilities = caps
 			cfg.LLM.Providers[i] = p
-			mgr := NewManager()
-			return mgr.SaveGlobal(cfg)
+			return saveConfigFieldsAt(configPath, cfg, overlayField(cfg.LLM.Providers, "llm", "providers"))
 		}
 		return fmt.Errorf("model %q not found under provider %q", modelName, providerName)
 	}

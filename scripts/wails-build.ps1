@@ -29,9 +29,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # Resolve wails: search the standard GOPATH/bin locations.
-$wailsDir = & "$PSScriptRoot\find-wails.ps1"
+$wailsDir = & (Join-Path $PSScriptRoot 'find-wails.ps1')
 if (-not $wailsDir) {
-    Write-Error "wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@latest"
+    Write-Error "wails CLI not found. Install with: go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0"
     exit 1
 }
 
@@ -39,7 +39,12 @@ if (-not $wailsDir) {
 # call below resolves correctly. This mutates the current process PATH.
 $env:PATH = "$wailsDir$([System.IO.Path]::PathSeparator)$env:PATH"
 
-$wailsPlatform = & "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format wails
+& (Join-Path $PSScriptRoot 'assert-wails-version.ps1')
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
+
+$wailsPlatform = & (Join-Path $PSScriptRoot 'resolve-platform.ps1') -Name $Platform -Format wails
 if (-not $wailsPlatform) {
     exit 1
 }
@@ -77,5 +82,22 @@ if ($ldFlagArgs.Count -eq 0) {
     $ldFlagArgs = @($Ldflags)
 }
 
-& wails build -platform $wailsPlatform -ldflags $ldFlagArgs -s
+$wailsArgs = @('build', '-platform', $wailsPlatform, '-ldflags') + @($ldFlagArgs) + @('-s')
+if ($wailsPlatform -like 'linux*') {
+    # Ubuntu 24.04+ only ships webkit2gtk-4.1. Wails v2 uses 4.0 unless this tag is set.
+    $has40 = $false
+    $has41 = $false
+    if (Get-Command pkg-config -ErrorAction SilentlyContinue) {
+        & pkg-config --exists webkit2gtk-4.0
+        if ($LASTEXITCODE -eq 0) { $has40 = $true }
+        & pkg-config --exists webkit2gtk-4.1
+        if ($LASTEXITCODE -eq 0) { $has41 = $true }
+    }
+    if (-not $has40 -and $has41) {
+        $wailsArgs += @('-tags', 'webkit2_41')
+    } elseif (-not $has40 -and -not $has41) {
+        throw 'webkit2gtk development files not found. Install libwebkit2gtk-4.0-dev or libwebkit2gtk-4.1-dev.'
+    }
+}
+& wails @wailsArgs
 exit $LASTEXITCODE

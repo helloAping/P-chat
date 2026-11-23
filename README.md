@@ -8,9 +8,9 @@
 
 支持 OpenAI Chat、OpenAI Responses 和 Anthropic Messages 协议，可接入 OpenAI、Claude、DeepSeek、Ollama、通义千问、智谱、百川等服务。三种内置人格（可爱 / 古风 / 科技），也可创建自定义风格。
 
-![P-Chat 当前主界面：项目与会话、聊天区、输入区和右侧检查器](docs/assets/article-2026-09/01-home.png)
+![P-Chat 1.0.14 主界面：全局会话、空会话引导、输入区和右侧检查器](docs/assets/v1.0.14/01-home.png)
 
-> 截图取自 `1.0.13.beta` 的隔离演示环境。`demo-local`、`demo-chat`、`demo-image`、`demo-video`、`warm_demo` 以及示例路径、媒体结果均为 mock 数据，不包含真实 API Key 或账户信息。完整图文流程见 [《P-Chat 安装与使用指南》](docs/p-chat-article-2026-09.md)。
+> 主界面和操作截图取自当前界面的空数据环境，不含真实 API Key。还没有配置媒体模型时，识别和生成入口会显示不可用。页脚版本号随二进制构建注入。
 
 关于作者：
 
@@ -21,7 +21,7 @@
 
 ## 当前进度快照
 
-> 快照日期：2026-09-22。仓库 `VERSION` 当前为 `1.0.13.beta`；正式分发版本以 `VERSION` 和 release tag 为准。
+> 快照日期：2026-11-23。仓库 `VERSION` 当前为 `1.0.14`；正式分发版本以 `VERSION` 和 release tag 为准。
 
 P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手形成了比较完整的桌面工作台：
 
@@ -31,20 +31,26 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 | 运行环境隔离 | 已落地 | dev/prod 按 data home 隔离身份与数据；动态端口、启动公告和 health 校验避免端口冲突或误连 |
 | 对话流 | 已落地 | text / thinking / tool / sub-agent parts 结构化渲染，支持 SSE 流式、seq、断线恢复 |
 | Agent 执行 | 已落地 | ReAct 工具循环、并发工具派发、auto-continue、Plan/Build、todo 守卫、stuck-loop 保护 |
-| LLM 协议 | 已落地 | OpenAI Chat / Responses + Anthropic Messages；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta |
+| LLM 协议 | 已落地 | OpenAI Chat / Responses + Anthropic Messages；自定义 SSE reader 兼容 reasoning / proxy error / 非标准 delta，默认日志不落消息正文 |
 | 项目系统 | 已落地 | 多项目注册，项目级 `AGENTS.md` / rules / skills / tools 注入 |
 | 知识库 | 已落地 | 本地 Wiki/FTS5、三层索引树、混合检索、查询分解、多库重排、增量扫描 |
 | 工具体系 | 已落地 | 内置文件/命令/搜索/文档/问题/todo 工具；动态 YAML 工具支持全局与项目级加载 |
-| 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略 |
+| 浏览器控制 | 已落地 | Chrome/Edge 扩展连接、真实页面导航/点击/输入/截图、多 tab 目标、域名权限策略、evaluate 三态 fail-closed 闸门 |
 | 媒体能力 | 已落地 / 持续扩展 | 图片/视频/音频独立识别路由；图片、视频、语音、音乐、音效等生成能力按模型和会话启用 |
-| 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断 |
-| IM 桥接 | 实验中 / 部分可用 | Gateway/adapter 抽象、飞书 webhook、微信 QR/长轮询、出站切分、GUI 设置入口和事件流已有；跨平台 adapter、鉴权与运行体验仍需继续收口 |
+| 可观测性 | 已落地 | 端到端 trace id、上下文检查器、工具列表抽屉、动态工具加载诊断；pprof 与快照下载默认关闭 |
 | MCP 集成 | 基础可用 / 待增强 | 已有 MCP 管理模块和设置入口，工具协议、权限和诊断体验仍在 backlog |
 | 沙箱增强 | 基础已落地 / 待增强 | 命令/写文件确认与浏览器域名策略已接入；Docker 隔离、策略可视化仍未完成 |
-| 导出与自动更新 | 已落地一部分 | 会话导出 HTML/PDF/text、更新检查/下载、updater、安装器和 release manifest 脚本已有 |
+| 导出与自动更新 | 已落地一部分 | 会话导出 HTML/PDF/text、稳定版更新检查/下载、可选 Beta 渠道、updater、安装器和 release manifest 脚本已有；Beta 发现依赖发布站按渠道返回元数据 |
 | 发布体验 | 已落地一部分 | Windows 安装器、Linux/macOS 打包脚本、浏览器扩展打包、版本注入已有；跨平台 GUI 构建仍受 Wails/宿主环境限制 |
 
 完整的安装、配置与 GUI 使用流程见 [`docs/p-chat-article-2026-09.md`](docs/p-chat-article-2026-09.md)。项目目录、模块职责和运行流总览见 [`docs/project-structure.md`](docs/project-structure.md)。更细的“已落地能力 + 后续可做事项”维护在 [`docs/feature-opportunities.md`](docs/feature-opportunities.md)。历史设计方案保留在 [`docs/plans/`](docs/plans/)。
+
+### 1.0.14 发布摘要
+
+- LLM 重试前清空上一 attempt 的未完成输出；原始 SSE、malformed payload 与 proxy error 日志改为默认无正文，`PC_LLM_DEBUG=1` 也只输出有界、脱敏预览。
+- `browser_evaluate` 默认三态 fail-closed：明确写入硬拒绝、明确只读按正常策略执行、未知 JS 必须逐次显式确认。
+- pprof 与 diagnostics 快照下载默认关闭；显式开启后均只允许 loopback，落盘 profile 使用 owner-only 权限。
+- 恢复 CLI 本地知识库命令，搜索结果支持精确跳转到目标消息，并完成 1.0.14 版本元数据更新。
 
 ### 下一步优先级
 
@@ -60,7 +66,7 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 
 ### 方式 A — 全平台安装包（推荐新用户）
 
-1. 从 [P-Chat 软件发布页](http://www.08ms.cn/software/p-chat) 下载当前版本对应系统的安装包，Windows / Linux / macOS 均在该页面提供；需要手动更新时，也在该页面下载增量更新包或全量包
+1. 从 [GitHub Releases](https://github.com/helloAping/P-chat/releases) 下载当前版本对应系统的安装包。Windows / Linux 为 amd64，macOS 自动更新包为 arm64；需要手动更新时，也在该页面下载增量 zip 或安装包
 2. Windows 下载 `pchat-setup-v*.exe` 后双击运行；Linux 下载 `pchat-linux-setup-v*.tar.gz` 后解压并执行 `./install.sh`；macOS 下载 `pchat-mac-setup-v*.tar.gz` 后解压并执行 `./install.sh`
 3. 安装程序会解压 GUI / server / CLI / updater 二进制和 `web/` 资源，并按系统创建对应的快捷入口或命令入口
 4. 安装完成后启动 **P-Chat**
@@ -108,7 +114,9 @@ pchat-server.exe
 ### 方式 D — 从源码构建
 
 ```powershell
-# 依赖：Go 1.25.0 / Node 24.11 / Wails v2.12
+# 依赖：Go 1.25.0 / Node 24.11 / Wails v2.12.0
+# Wails CLI 必须与 cmd/pchat-gui/go.mod 中的版本完全一致：
+go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 task build:all      # Windows / Linux / macOS setup 包 + 增量更新 zip
 task build:gui      # 额外：pchat-gui.exe
 task package:gui    # Windows setup 包 + 增量更新 zip
@@ -242,17 +250,17 @@ setup.exe
 
 下列缩略图均可点击查看原图。
 
-| 简单对话（mock） | 当前会话设置 |
+| 空会话 | 当前会话设置 |
 | --- | --- |
-| [![简单对话示例：用户发送 sayHI，助手返回问候](docs/assets/article-2026-09/06-sayhi-chat.png)](docs/assets/article-2026-09/06-sayhi-chat.png) | [![会话设置：工作类型、风格、知识库、思考和媒体能力](docs/assets/article-2026-09/07-session-settings.png)](docs/assets/article-2026-09/07-session-settings.png) |
+| [![空会话：开始新对话、场景卡片和输入区](docs/assets/v1.0.14/06-chat.png)](docs/assets/v1.0.14/06-chat.png) | [![会话设置：类型、知识库、媒体能力和子代理](docs/assets/v1.0.14/07-session-settings.png)](docs/assets/v1.0.14/07-session-settings.png) |
 | **模型选择器** | **项目切换器** |
-| [![输入区模型选择器：按提供商查找和切换模型](docs/assets/article-2026-09/08-model-picker.png)](docs/assets/article-2026-09/08-model-picker.png) | [![项目切换器：全局会话与项目入口](docs/assets/article-2026-09/09-project-switcher.png)](docs/assets/article-2026-09/09-project-switcher.png) |
+| [![输入区模型选择器：按提供商查找和切换模型](docs/assets/v1.0.14/08-model-picker.png)](docs/assets/v1.0.14/08-model-picker.png) | [![项目切换器：搜索项目、新建项目和全局会话](docs/assets/v1.0.14/09-project-switcher.png)](docs/assets/v1.0.14/09-project-switcher.png) |
 | **新建项目** |  |
-| [![新建项目：选择项目根目录并命名](docs/assets/article-2026-09/10-add-project.png)](docs/assets/article-2026-09/10-add-project.png) | 项目只记录本地目录；创建时不会修改目录内容。项目中的 `AGENTS.md` 会作为上下文读取。 |
+| [![新建项目：选择项目根目录并命名](docs/assets/v1.0.14/10-add-project.png)](docs/assets/v1.0.14/10-add-project.png) | 项目只记录本地目录；创建时不会修改目录内容。项目中的 `AGENTS.md` 会作为上下文读取。 |
 
 ### 设置面板
 
-点击最左侧 AppRail 的「设置」打开应用设置。左侧导航共 11 个分类，常用入口如下；完整操作顺序见 [仓库内图文指南](docs/p-chat-article-2026-09.md)，官网版本见 [P-Chat 使用说明](http://www.08ms.cn/article/p-chat)。
+点击最左侧 AppRail 的「设置」打开应用设置。左侧分为对话、能力、数据三组，常用入口如下。完整操作顺序见 [仓库内图文指南](docs/p-chat-article-2026-09.md)。
 
 | Tab | 作用 |
 | --- | --- |
@@ -265,12 +273,11 @@ setup.exe
 | **知识库** | 启用 RAG、添加知识库目录、扫描 Wiki/FTS5 索引；媒体扫描可选配置模型 |
 | **网络搜索** | 切换 web_search 提供商（Tavily / OpenAI 兼容）、配置 API key、每日配额、测试连接 |
 | **浏览器** | 启用 Chrome 扩展控制、查看已连接浏览器、选择控制目标 tab、域名策略 |
-| **IM 桥接** | 配置实验性的飞书、微信等消息入口并查看连接状态 |
-| **诊断** | 查看运行信息与诊断入口，配合 Trace ID 和日志排查问题 |
+| **诊断** | 查看运行内存，并在「存储清理」里回收 base64 图片、历史工具输出和没有消息的空白对话 |
 
 #### LLM 提供商
 
-![LLM 提供商设置：供应商、协议、Base URL 和模型管理入口](docs/assets/article-2026-09/02-provider.png)
+![LLM 提供商设置：供应商、协议、Base URL 和模型管理入口](docs/assets/v1.0.14/02-provider.png)
 
 - **供应商类型 / 策略**：先选择厂商或 Custom；部分厂商可继续选择普通 API、Coding Plan 等策略变体
 - **请求协议**：按服务商与模型选择 OpenAI Chat、OpenAI Responses 或 Anthropic Messages，不是选择 HTTP/HTTPS
@@ -290,13 +297,13 @@ setup.exe
 
 | 风格库 | 编辑自定义风格 |
 | --- | --- |
-| [![风格列表：内置风格与 mock 自定义风格](docs/assets/article-2026-09/11-style-library.png)](docs/assets/article-2026-09/11-style-library.png) | [![编辑 mock 风格：显示名称、Prompt 和记忆](docs/assets/article-2026-09/12-style-editor.png)](docs/assets/article-2026-09/12-style-editor.png) |
+| [![风格列表：内置风格](docs/assets/v1.0.14/11-style-library.png)](docs/assets/v1.0.14/11-style-library.png) | [![编辑风格：显示名称、Prompt 和记忆](docs/assets/v1.0.14/12-style-editor.png)](docs/assets/v1.0.14/12-style-editor.png) |
 | **从当前会话生成风格** |  |
-| [![从当前 mock 会话生成或优化风格](docs/assets/article-2026-09/22-style-generate.png)](docs/assets/article-2026-09/22-style-generate.png) | 生成完成后先审核 Prompt 和记忆，再保存并在当前会话中选择。 |
+| [![从当前会话生成风格：新建或优化，生成前可补充要求](docs/assets/v1.0.14/22-style-generate.png)](docs/assets/v1.0.14/22-style-generate.png) | 生成完成后先审核 Prompt 和记忆，再保存并在当前会话中选择。 |
 
 #### 知识库
 
-![知识库设置：新增本地资料目录并管理索引](docs/assets/article-2026-09/03-knowledge.png)
+![知识库设置：新增本地资料目录并管理索引](docs/assets/v1.0.14/03-knowledge.png)
 
 - 打开「启用知识库」开关
 - 添加知识库目录（指向你要检索的代码 / 文档根），点「扫描」后台索引
@@ -307,7 +314,7 @@ LLM 在需要时调用 `recall` 或 `wiki_lookup` 工具按需检索。详见 [d
 
 #### 网络搜索
 
-![网络搜索设置：服务商、配额和连接测试](docs/assets/article-2026-09/04-web-search.png)
+![网络搜索设置：服务商、配额和连接测试](docs/assets/v1.0.14/04-web-search.png)
 
 - 启用开关
 - 选 provider：Tavily（1000 次/月免费）或 OpenAI 兼容（自配 endpoint，比如 jina.ai / bocha）
@@ -318,15 +325,13 @@ LLM 在需要时调用 `recall` 或 `wiki_lookup` 工具按需检索。详见 [d
 
 #### 媒体识别与生成
 
-媒体识别用于理解上传的图片、视频或音频；媒体生成用于产出新内容，两者需要分别配置。先给模型声明实际能力，再设置应用默认模型，最后在当前会话中启用所需能力。
+媒体识别用于理解上传的图片、视频或音频；媒体生成用于产出新内容，两者需要分别配置。先给模型声明实际能力，再设置应用默认模型，最后在当前会话中启用所需能力。还没有对应模型时，识别路由和会话开关会显示不可用。生成完成后，图片和视频出现在助手消息的「生成附件」里，可以预览和下载。
 
 | 媒体识别路由 | 媒体生成模型 |
 | --- | --- |
-| [![系统设置中的图片、视频和音频识别路由](docs/assets/article-2026-09/18-media-recognition.png)](docs/assets/article-2026-09/18-media-recognition.png) | [![提供商中的 mock 图片与视频生成模型](docs/assets/article-2026-09/13-media-model.png)](docs/assets/article-2026-09/13-media-model.png) |
+| [![系统设置中的图片、视频和音频识别路由](docs/assets/v1.0.14/18-media-recognition.png)](docs/assets/v1.0.14/18-media-recognition.png) | [![添加媒体生成模型：勾选文生图、文生视频等能力](docs/assets/v1.0.14/13-media-model.png)](docs/assets/v1.0.14/13-media-model.png) |
 | **应用默认模型** | **当前会话能力开关** |
-| [![按生成能力选择应用默认模型](docs/assets/article-2026-09/14-media-defaults.png)](docs/assets/article-2026-09/14-media-defaults.png) | [![当前会话按需启用媒体生成能力](docs/assets/article-2026-09/15-media-session.png)](docs/assets/article-2026-09/15-media-session.png) |
-| **mock 文生图结果** | **mock 文生视频结果** |
-| [![mock 文生图结果：预览、附件和下载入口](docs/assets/article-2026-09/16-image-result.png)](docs/assets/article-2026-09/16-image-result.png) | [![mock 文生视频结果：播放器、附件和下载入口](docs/assets/article-2026-09/17-video-result.png)](docs/assets/article-2026-09/17-video-result.png) |
+| [![按生成能力选择应用默认模型](docs/assets/v1.0.14/14-media-defaults.png)](docs/assets/v1.0.14/14-media-defaults.png) | [![当前会话的图片、视频和音频生成入口；未配置默认模型时显示不可用](docs/assets/v1.0.14/15-media-session.png)](docs/assets/v1.0.14/15-media-session.png) |
 
 #### MCP
 
@@ -334,24 +339,30 @@ MCP 当前提供基础的服务器管理入口，可配置本地 Stdio 或远程
 
 | MCP 设置入口 | 添加 MCP 服务器 |
 | --- | --- |
-| [![MCP 设置入口：mock 环境中尚未添加服务器](docs/assets/article-2026-09/20-mcp.png)](docs/assets/article-2026-09/20-mcp.png) | [![MCP 添加表单：本地 mock 参数](docs/assets/article-2026-09/21-mcp-add.png)](docs/assets/article-2026-09/21-mcp-add.png) |
+| [![MCP 设置：全局开关和尚未添加服务器](docs/assets/v1.0.14/20-mcp.png)](docs/assets/v1.0.14/20-mcp.png) | [![添加 MCP 服务器：Stdio 或 SSE](docs/assets/v1.0.14/21-mcp-add.png)](docs/assets/v1.0.14/21-mcp-add.png) |
 
 ### GUI 操作速查
 
 | 想做什么 | 操作入口 |
 | --- | --- |
 | 切编码 / 日常工作模式 | 输入区「会话设置」→「类型」；全局默认在「设置」→「系统」 |
-| 关 / 换说话风格 | 输入区「会话设置」→「风格」；自定义在「设置」→「风格」 |
+| 关 / 换说话风格 | 输入区「会话设置」→「风格」；自定义在「设置」→「风格」。以 `- ` 开头的记忆可以单独删除 |
 | 选本轮知识库 | 输入区「会话设置」→「知识库」（不使用 / 全部 / 指定） |
 | 配置知识库目录 | 「设置」→「知识库」→ 添加 → 扫描 |
 | 配置图片/视频/音频生成 | 「设置」→「LLM 提供商」添加媒体生成模型及能力 →「系统 → 媒体生成」选择默认模型 |
 | 在当前对话启用媒体生成 | 输入区「会话设置」→「媒体生成」勾选文生图、图生视频等能力；关闭后工具调用会直接返回“已关闭”，不会请求厂商 |
 | 新建 / 切换项目 | 左上项目切换器；新建项目也可用 AppRail 左下角 `+` |
 | 切换当前模型 | 输入区左下角模型按钮，支持按提供商和模型名搜索 |
+| 看项目书签 | 展开右侧 Inspector →「项目」→「项目书签」，备注就写在这一行。全部书签在「设置」→「书签」。同一对话可以「从这条到那条」复制或下载 Markdown。永久删除对话时，这本书签一起去掉 |
 | 看可用工具 | 展开右侧 Inspector →「会话」→「工具列表」，查看内置工具、自定义工具和加载诊断 |
 | 启用浏览器控制 | 「设置」→「浏览器」→ 开开关 → 下载扩展 → chrome://extensions 加载；详见 [浏览器控制](#浏览器控制) |
+| 记住一条事实 | 模型调用 `remember` 后，在确认框里选一个已有风格，或填一个新风格名字。事实写进该风格的记忆，说话方式仍由风格提示词决定 |
+| 换种说法 | 输入区「换种说法」。可选 1–2 个风格对照，或把当前草稿改写成其中一个风格。结果在检查器里，点「采用」才进入会话，可顺手改本会话风格 |
+| 看本回合改了什么 | 助手消息底部的「本回合」可以展开文件和命令。最近一轮改过的文件列在对话末尾，撤销也在那里。更早的回合只能看摘要，字节撤销只作用于最近一轮，重启后不可用 |
+| 新建与侧栏 | `Ctrl+N` 新建当前项目对话，`Ctrl+B` 折叠或展开侧栏。`Ctrl+K` 仍是命令面板 |
 | 复制 trace id | 展开右侧 Inspector →「会话」→「复制 Trace」，或点击错误气泡上的 Trace ID |
 | 重新生成 | assistant 消息底部「重答」按钮，旧版会作为历史版本保留 |
+| 检查或下载 Beta 预览版 | 「关于 P-Chat」→ 勾选「接收预览版本（Beta）」→「重新检查」→ 确认版本后下载；默认只检查稳定版 |
 
 更完整的第一次对话、项目工作流、附件、知识库、媒体、Skill、MCP 和 CLI 操作见 [仓库内图文指南](docs/p-chat-article-2026-09.md)；官网同步版见 [P-Chat 使用说明](http://www.08ms.cn/article/p-chat)。
 
@@ -371,7 +382,7 @@ P-Chat 通过 Chrome / Edge 扩展操控真实浏览器。LLM 能像人一样导
 6. 扩展弹窗的「服务器」输入框粘贴 GUI 显示的 HTTP 地址
 7. 回到 P-Chat 的「浏览器」Tab，确认「已连接浏览器」> 0
 
-![浏览器设置：扩展安装、连接状态与目标标签页入口](docs/assets/article-2026-09/05-browser.png)
+![浏览器设置：扩展安装、连接状态与目标标签页入口](docs/assets/v1.0.14/05-browser.png)
 
 成功后 15 个 `browser_*` 工具自动注册到当前会话的工具列表里。LLM 在需要时会自己调用，无需手动配置。
 
@@ -391,7 +402,7 @@ P-Chat 通过 Chrome / Edge 扩展操控真实浏览器。LLM 能像人一样导
 | `browser_select_option` | 操作 `<select>` 下拉框 |
 | `browser_file_upload` | 走 file input 上传本地文件 |
 | `browser_drag` | 拖拽一个 ref 到另一个 ref |
-| `browser_evaluate` | 在页面隔离上下文执行任意 JS，能读 `__INITIAL_STATE__`、调 DOM API、绕过页面 CSP |
+| `browser_evaluate` | 在页面隔离上下文执行 JS；默认只读，明确副作用硬拒绝，未知表达式需逐次显式确认 |
 | `browser_find` | 按文本或 regex 找元素并返回 ref |
 | `browser_extract` | 抓整页渲染后的可见文本（SPA 内容也能拿到） |
 | `browser_tabs` | 列出 / 新开 / 关闭 / 切换标签页；`action=select` 切换「控制目标」 |
@@ -424,6 +435,7 @@ LLM 也可以在工具参数里显式传 `tab_id` 覆盖。`browser_tabs` 的 `a
 {
   "browser": {
     "enabled": true,
+    "allow_eval_write": false,
     "require_confirm": "dangerous",
     "allowed_hosts": ["localhost", "*.internal.example"],
     "blocked_hosts": ["evil.example"],
@@ -436,12 +448,16 @@ LLM 也可以在工具参数里显式传 `tab_id` 覆盖。`browser_tabs` 的 `a
 | --- | --- |
 | 只读操作（snapshot / extract / find / screenshot / scroll） | 自动通过 |
 | 普通导航 / 点击 | 自动通过 |
-| 表单输入 / 上传 / `browser_evaluate` | 弹确认框，显示目标 URL |
+| 表单输入 / 上传 | 弹确认框，显示目标 URL |
+| `browser_evaluate` 明确只读 | 按正常域名 / `require_confirm` 策略决策 |
+| `browser_evaluate` 明确副作用 | `allow_eval_write=false` 时硬拦截，不弹确认 |
+| `browser_evaluate` 无法证明只读 | 强制逐次确认；allowlist、`never`、`full/auto` 和“始终允许”均不静默跳过 |
 | 命中 `sensitive_hosts`（登录页） | 即使只读也确认 |
 | 命中 `blocked_hosts` | 硬拦截，不确认 |
 | 命中 `allowed_hosts` | 自动通过（仍尊重 blocked） |
 
 - `require_confirm`：`never` / `dangerous`（默认） / `always`
+- `allow_eval_write`：默认 `false`；设为 `true` 仅关闭 evaluate 只读闸门，`blocked_hosts` 与正常高风险确认仍生效
 - 域名匹配大小写不敏感；`*.example.com` 同时匹配 `example.com` 和子域
 - 会话权限 `full` 或 `/unsafe once` 会跳过确认（blocked 仍拦截）
 - 确认弹窗复用 `ToolConfirmModal`，标签「浏览器」，「目标页面」展示 URL
@@ -663,9 +679,14 @@ CLI 可用 `/skills` 查看，用 `/skill docs-tool 创建一份周报` 显式�
 | POST | `/uploads` | 上传 |
 | POST | `/mcp/servers` | MCP 服务器 |
 | GET/POST/PATCH | `/browser/*` | 浏览器连接、标签页、扩展下载、域名策略 |
-| GET/PATCH/POST | `/im/*` | IM 健康状态、配置、测试、微信 QR、飞书 webhook、事件流 |
-| GET | `/diagnostics/*` | 内存、配置、heap/goroutine 快照 |
+| GET/PATCH | `/diagnostics/*` | 内存、配置、heap/goroutine 快照；快照下载默认关闭且仅限 loopback |
 | GET/POST | `/updates/*` | 版本检查与更新下载 |
+
+### 诊断快照安全边界
+
+heap/goroutine profile 可能包含栈参数、路径和运行时元数据。`/debug/pprof/*` 仅在启动前设置 `PC_PPROF=1` 时注册；它和 `/api/v1/diagnostics/snapshot/*` 均始终拒绝非 loopback 的 TCP 客户端，且不信任 `X-Forwarded-For`。快照还需启动前设置 `PC_DIAGNOSTICS_SNAPSHOTS=1`。生成的 profile 使用仅当前用户可读的权限。SEC-01 管理级 capability 尚未覆盖全部 D 类路由前，不要在非本机监听环境开启这些开关。
+
+本地自动 heap profile 由 `PC_HEAP_DUMP_MB` 控制（默认 1024 MB，`0` 关闭）；它不会自动开放 HTTP 下载。
 
 ### SSE 发送消息
 
@@ -726,6 +747,15 @@ assistant 消息底部「重答」会保留所有历史版本，消息下方出�
 **10. 多知识库怎么排序？**
 各库分别检索 → 分数归一化 → 合并排序 → 去重 → 标注 `base` 来源。
 
+**11. `PC_LLM_DEBUG=1` 会记录什么？**
+默认日志不记录消息正文或原始 SSE，只记录计数、长度和短 SHA-256 指纹。显式设为 `1` 后会额外记录前三个事件和上游错误体的有界预览，但 API key、Authorization、token、cookie、password、secret 等仍会脱敏。预览仍可能包含普通用户消息，仅在可信本机临时开启，分享日志前请再次检查。
+
+**12. 为什么诊断页的快照按钮不可用？**
+快照下载因敏感性默认关闭。退出 server，在可信本机环境设置 `PC_DIAGNOSTICS_SNAPSHOTS=1` 后重启即可启用；即使开启也只接受 loopback 请求。pprof 使用独立开关 `PC_PPROF=1`。
+
+**13. 怎么下载 Beta 预览版？**
+打开「关于 P-Chat」，勾选「接收预览版本（Beta）」并点击「重新检查」。出现较新的 `.beta` 版本后，确认版本号再下载；下载完成后可在同一窗口重启更新。勾选状态保存在当前浏览器或桌面 WebView；取消勾选会清除当前显示的预览版和已下载状态。自动检查读取 `https://helloaping.github.io/P-chat/updates/{platform}-{arch}.beta.json`，这份文件是当前稳定版和 Beta 中版本更高的一个。若仍未发现更新，到 [GitHub Releases](https://github.com/helloAping/P-chat/releases) 确认对应系统已经发布，并且该 Release 已从 Draft 改为 Publish。
+
 ---
 
 ## 开发
@@ -748,6 +778,8 @@ cd frontend && npx vue-tsc -b
 
 `scripts/` 下都是平台无关工具脚本（`clean-frontend-output.ps1` / `sync-web.ps1` / `package-gui.ps1` / `build-installer.ps1` 等）。
 
+发布时把 `VERSION` 改成目标版本，执行 `task release:run` 推送对应 tag。GitHub Actions 会在 Windows amd64、Linux amd64、macOS arm64 上签名打包，并创建 Draft Release。确认附件后点 Publish，应用内更新索引才会写到 `https://helloaping.github.io/P-chat/updates/`。仓库需要 secret `PCHAT_UPDATE_SIGNING_KEY`，它必须配对客户端里的 `DefaultUpdatePublicKeyBase64`。第一次使用这套索引的安装包需要从 Releases 手动安装一次。
+
 ### 文档维护约定
 
 新增或调整用户可见功能时，同步更新这些文档：
@@ -756,7 +788,7 @@ cd frontend && npx vue-tsc -b
 | --- | --- |
 | `README.md` | 用户入口、GUI 操作步骤、常见问题、当前进度摘要变化 |
 | `docs/p-chat-article-2026-09.md` | 完整安装与使用流程、截图说明、面向新用户的逐步操作发生变化 |
-| [软件下载页](http://www.08ms.cn/software/p-chat) | 下载当前版本 setup 安装包、增量更新包和全量包 |
+| [GitHub Releases](https://github.com/helloAping/P-chat/releases) | 下载当前版本 setup 安装包、增量更新包和 server 二进制 |
 | [网页版说明文档](http://www.08ms.cn/article/p-chat) | 安装、API 厂商接入、CLI/GUI 使用指南（与官网说明同步） |
 | `docs/feature-opportunities.md` | 功能从待办变为已落地、backlog 优先级变化、废弃历史计划 |
 | `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |

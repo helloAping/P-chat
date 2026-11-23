@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -18,8 +17,6 @@ import (
 	"github.com/p-chat/pchat/internal/browser"
 	"github.com/p-chat/pchat/internal/config"
 	"github.com/p-chat/pchat/internal/generation"
-	"github.com/p-chat/pchat/internal/im"
-	"github.com/p-chat/pchat/internal/im/feishu"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/mcp"
 	"github.com/p-chat/pchat/internal/memory"
@@ -46,8 +43,6 @@ var embeddedWebRaw embed.FS
 var embeddedBrowserExtZip []byte
 
 var cfgFile string
-var imEnable bool
-var imPlatforms string
 
 var rootCmd = &cobra.Command{
 	Use:   "pchat-server",
@@ -66,8 +61,6 @@ var versionCmd = &cobra.Command{
 
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "配置文件路径")
-	rootCmd.PersistentFlags().BoolVar(&imEnable, "im.enable", false, "启用 IM 桥接")
-	rootCmd.PersistentFlags().StringVar(&imPlatforms, "im.platforms", "", "启用的 IM 平台列表，例如 feishu:bot,telegram:polling")
 	rootCmd.AddCommand(versionCmd)
 }
 
@@ -119,7 +112,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	applyIMFlagOverrides(cfg)
 
 	llmClient, err := llm.NewClient(&cfg.LLM)
 	if err != nil {
@@ -144,6 +136,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	toolReg := tool.NewRegistry()
 	tool.RegisterBuiltin(toolReg)
+	tool.SetStyleMemory(styleMgr)
 	// Build the search provider and install it as the
 	// process-global. The tool handler reads it via
 	// search.Global() on every call, so we update it here
@@ -152,12 +145,16 @@ func runServer(cmd *cobra.Command, args []string) error {
 	// the refreshed config).
 	search.SetGlobal(search.BuildProvider(cfg.Search))
 	search.SetQuotaLimit(cfg.Search.DailyQuota)
+	search.SetGlobalFetcher(search.BuildFetcher(cfg.Fetch))
+	search.SetFetchQuotaLimit(cfg.Fetch.DailyQuota)
 	if cfg.Search.Enabled {
 		log.Printf("[search] web_search enabled, provider=%s, daily_quota=%d",
 			search.Global().Name(), cfg.Search.DailyQuota)
 	} else {
 		log.Printf("[search] web_search disabled (no provider configured)")
 	}
+	log.Printf("[fetch] web_fetch provider=%s, daily_quota=%d",
+		search.GlobalFetcher().Name(), cfg.Fetch.DailyQuota)
 	tool.RegisterGrep(toolReg, cfg)
 	server.SyncConfigDrivenTools(toolReg, cfg)
 
@@ -241,6 +238,13 @@ func runServer(cmd *cobra.Command, args []string) error {
 		}
 		_ = memStore.SaveTodos(sessionID, memTodos)
 	}
+	tool.SnapshotTurnTodos = func(sessionID string, todos []tool.TodoItem) {
+		memTodos := make([]memory.TodoItem, len(todos))
+		for i, t := range todos {
+			memTodos[i] = memory.TodoItem{ID: t.ID, Content: t.Content, Status: t.Status}
+		}
+		_ = memStore.StampTurnTodos(sessionID, memTodos)
+	}
 
 	agt := agent.New(cfg, llmClient, styleMgr, memStore, toolReg)
 	generatedStore := generation.NewLocalAssetStore(paths.GeneratedDir(), "/api/v1/generated")
@@ -291,7 +295,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	if wd := serverproc.WebDirFromEnv(); wd != "" {
 		staticFS = http.Dir(wd)
 	}
-	srv := server.NewWithStaticFS(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr)
+	srv := server.NewWithStaticFSAndConfigPath(cfg, agt, memStore, styleMgr, toolReg, staticFS, mcpMgr, cfgFile)
 	srv.Handler().SetGeneratedAssetStore(generatedStore)
 	srv.SetSubagentRunner(runner)
 	srv.Handler().SetSubagentJobCanceller(asyncMgr)
@@ -308,23 +312,6 @@ func runServer(cmd *cobra.Command, args []string) error {
 		Model:    "",
 		MaxChars: 40000,
 	}))
-
-	imGateway := im.NewGateway(cfg.IM)
-	registerIMAdapters(imGateway, cfg.IM)
-	srv.SetIMGateway(imGateway)
-	imGateway.SetInboundProcessor(srv.Handler())
-	if cfg.IM.Enabled {
-		if err := imGateway.Start(context.Background()); err != nil {
-			log.Printf("[im] gateway start failed: %v", err)
-		} else {
-			log.Printf("[im] gateway started")
-		}
-	}
-	defer func() {
-		if err := imGateway.Stop(context.Background()); err != nil {
-			log.Printf("[im] gateway stop failed: %v", err)
-		}
-	}()
 
 	// Initialize browser control manager (enabled via config).
 	browserMgr := browser.NewManager(cfg.Browser, toolReg)
@@ -516,76 +503,4 @@ func defaultProviderModel(cfg *config.Config, provider string) string {
 		}
 	}
 	return ""
-}
-
-func applyIMFlagOverrides(cfg *config.Config) {
-	if cfg == nil {
-		return
-	}
-	if imEnable {
-		cfg.IM.Enabled = true
-	}
-	if imPlatforms == "" {
-		cfg.IM.Normalize()
-		return
-	}
-	cfg.IM.Enabled = true
-	for _, raw := range strings.Split(imPlatforms, ",") {
-		raw = strings.TrimSpace(raw)
-		if raw == "" {
-			continue
-		}
-		parts := strings.SplitN(raw, ":", 2)
-		platformType := parts[0]
-		variant := ""
-		if len(parts) == 2 {
-			variant = parts[1]
-		}
-		found := false
-		for i := range cfg.IM.Platforms {
-			if cfg.IM.Platforms[i].Type == platformType && cfg.IM.Platforms[i].Variant == variant {
-				cfg.IM.Platforms[i].Enabled = true
-				found = true
-				break
-			}
-		}
-		if !found {
-			cfg.IM.Platforms = append(cfg.IM.Platforms, config.IMPlatformConfig{
-				Type:    platformType,
-				Variant: variant,
-				Enabled: true,
-			})
-		}
-	}
-	cfg.IM.Normalize()
-}
-
-func registerIMAdapters(gateway *im.Gateway, cfg config.IMConfig) {
-	if gateway == nil {
-		return
-	}
-	gateway.RegisterAdapter(feishu.NewAdapter(config.IMPlatformConfig{Type: "feishu", Variant: "bot"}))
-	gateway.RegisterRendererFactory("feishu", func(platform config.IMPlatformConfig) (im.OutboundRenderer, error) {
-		if !platform.Out.UseOpenAPI {
-			return nil, im.ErrOutboundDisabled{
-				Platform: platform.Type,
-				Variant:  platform.Variant,
-				Reason:   "out.use_openapi is false",
-			}
-		}
-		return feishu.NewRenderer(platform, nil), nil
-	})
-	for _, platform := range cfg.Platforms {
-		if platform.Type != "feishu" {
-			continue
-		}
-		variant := platform.Variant
-		if variant == "" {
-			variant = "bot"
-		}
-		if variant == "bot" {
-			gateway.RegisterAdapter(feishu.NewAdapter(platform))
-		}
-	}
-	im.RegisterConfiguredWeChatAdapters(gateway, cfg)
 }

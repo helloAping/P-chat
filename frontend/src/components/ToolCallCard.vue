@@ -219,6 +219,14 @@ const argsPretty = computed(() => {
   try { return JSON.stringify(JSON.parse(a), null, 2) } catch { return a }
 })
 
+// AE-01: while args are still streaming the JSON is often incomplete —
+// show a light cue so long write_file payloads don't look stuck.
+const argsStreaming = computed(() =>
+  props.part.status === 'start' && !!props.part.args && (() => {
+    try { JSON.parse(props.part.args!); return false } catch { return true }
+  })(),
+)
+
 // P2-4: a dry-run call is signalled by a `dry_run: true`
 // arg. The handler returns a preview string starting
 // with "[dry-run] would …" without actually executing
@@ -446,7 +454,10 @@ async function resultForCopy(): Promise<string> {
         <pre>{{ argsPretty }}</pre>
       </details>
       <div v-else-if="!isQuestionTool && part.args" class="tool-args">
-        <div class="tool-section-label">参数</div>
+        <div class="tool-section-label">
+          参数
+          <span v-if="argsStreaming" class="tool-args-streaming">生成中…</span>
+        </div>
         <pre>{{ argsPretty }}</pre>
       </div>
       <div v-if="!isQuestionTool && part.result" class="tool-result">
@@ -540,9 +551,9 @@ async function resultForCopy(): Promise<string> {
 </template>
 
 <style scoped>
-/* Calm timeline row — flat inside .event-timeline panel.
- * Status via circular icon only (no per-card chrome / nested
- * white boxes). Error = thin red left edge + short summary. */
+/* Underline row inside .event-timeline: small status icon,
+ * label, and a hairline under the block. Error keeps a thin
+ * red left edge. */
 .tool-card {
   background: transparent;
   border: none;
@@ -575,29 +586,29 @@ async function resultForCopy(): Promise<string> {
   width: 100%;
   background: transparent;
   border: 0;
-  padding: var(--space-1) var(--space-2);
-  min-height: calc(var(--space-6) - var(--space-1));
+  padding: 6px 0;
+  min-height: 28px;
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
   font-family: inherit;
   font-size: inherit;
-  border-radius: var(--radius-sm);
-  transition: background var(--dur-fast) var(--ease-out);
+  border-radius: 0;
+  transition: color var(--dur-fast) var(--ease-out);
 }
-.tool-header:hover { background: var(--surface-3); }
+.tool-header:hover { background: transparent; color: var(--text-primary); }
 .tool-icon {
   display: inline-flex;
-  width: 16px; height: 16px;
+  width: 14px; height: 14px;
   margin-top: 2px;
   align-items: center; justify-content: center;
-  border-radius: 50%;
+  background: transparent;
   flex-shrink: 0;
 }
-.tool-icon.start { background: var(--brand-50); color: var(--brand-500); }
-.tool-icon.ok    { background: var(--success-50); color: var(--success-500); }
-.tool-icon.warn  { background: var(--warn-50);    color: var(--warn-500); }
-.tool-icon.error { background: var(--error-50);   color: var(--error-500); }
+.tool-icon.start { color: var(--brand-500); }
+.tool-icon.ok    { color: var(--success-500); }
+.tool-icon.warn  { color: var(--warn-500); }
+.tool-icon.error { color: var(--error-500); }
 .spin {
   display: inline-block;
   animation: tool-spin 1.2s linear infinite;
@@ -716,9 +727,9 @@ async function resultForCopy(): Promise<string> {
 }
 
 .tool-body {
-  border-top: 1px solid var(--border-subtle);
-  margin-left: calc(var(--space-6) + var(--space-1));
-  padding: var(--space-1) var(--space-2) var(--space-2) var(--space-2);
+  border-top: none;
+  margin-left: 22px;
+  padding: 0 0 var(--space-2);
 }
 .tool-section-label {
   font-size: 10.5px;
@@ -726,6 +737,11 @@ async function resultForCopy(): Promise<string> {
   color: var(--text-quaternary);
   margin: 4px 0 2px;
   font-weight: 500;
+}
+.tool-args-streaming {
+  margin-left: 6px;
+  color: var(--accent);
+  font-weight: 400;
 }
 .tool-context-refs {
   display: flex;
@@ -802,10 +818,10 @@ async function resultForCopy(): Promise<string> {
   min-width: 0;
   margin: 0;
   overflow: hidden;
-  background: var(--surface-1);
-  border: 1px solid var(--border-default);
+  background: transparent;
+  border: none;
   border-radius: var(--radius-sm);
-  box-shadow: var(--shadow-sm);
+  box-shadow: none;
 }
 .generated-asset-preview {
   display: flex;
@@ -895,8 +911,8 @@ async function resultForCopy(): Promise<string> {
   flex-wrap: wrap;
   gap: var(--space-2);
   padding: var(--space-2) var(--space-3);
-  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
-  border-top: 1px solid var(--border-subtle);
+  background: transparent;
+  border-top: none;
 }
 .generated-asset-identity {
   display: flex;

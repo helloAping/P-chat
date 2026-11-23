@@ -350,6 +350,7 @@ func TestPartsAccumulator_ToolStatusFromStep(t *testing.T) {
 		{"call-1-ok", "", "ok"},
 		{"call-1-warn", "", "warn"},
 		{"call-1-err", "", "error"},
+		{"call-1-args", "", "args"},
 		{"call-1", "boom", "error"},
 		{"call-1", "", "start"},
 	}
@@ -395,5 +396,24 @@ func TestPartsAccumulator_RoundTripJSON(t *testing.T) {
 	}
 	if roundTripped[2]["kind"] != "tool" || roundTripped[2]["name"] != "read_file" {
 		t.Errorf("third part wrong: %+v", roundTripped[2])
+	}
+}
+
+func TestPartsAccumulator_ParallelStartReusesEarlierCard(t *testing.T) {
+	acc := newPartsAccumulator()
+	acc.update(ChatStreamChunk{ToolName: "exec_command", ToolID: "a", ToolArgs: "partial-a"})
+	acc.update(ChatStreamChunk{ToolName: "exec_command", ToolID: "b", ToolArgs: "partial-b"})
+	acc.update(ChatStreamChunk{ToolName: "exec_command", ToolID: "a", ToolArgs: `{"command":"git blame"}`})
+	parts := acc.snapshot()
+	if len(parts) != 2 {
+		t.Fatalf("parts = %d, want 2 (the second start for a must reuse the first card)", len(parts))
+	}
+	if parts[0].ToolID != "a" || parts[0].Args != `{"command":"git blame"}` || parts[0].Status != "start" {
+		t.Fatalf("first card = %+v", parts[0])
+	}
+	acc.update(ChatStreamChunk{Phase: "tool", Step: "call-1-ok", ToolName: "exec_command", ToolID: "a", ToolResult: "ok", ToolElapsed: "10ms"})
+	parts = acc.snapshot()
+	if parts[0].Status != "ok" || parts[1].Status != "start" {
+		t.Fatalf("after result: %+v", parts)
 	}
 }

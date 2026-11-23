@@ -16,9 +16,6 @@ const (
 	// budget so a 60s write_file call does not expire while the user is
 	// still looking at the dialog.
 	ConfirmWaitTimeout = 5 * time.Minute
-	// QuestionWaitTimeout is how long `question` waits for an answer.
-	// Matches the `question` tool policy (10 min).
-	QuestionWaitTimeout = 10 * time.Minute
 	// WebFetchTimeout is the HTTP budget for `web_fetch` and the
 	// scheduler policy for web_fetch / browser_* tools.
 	WebFetchTimeout = 2 * time.Minute

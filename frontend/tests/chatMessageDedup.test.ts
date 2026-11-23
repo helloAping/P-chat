@@ -26,6 +26,19 @@ test('dedupMessagesByKey merges optimistic user row with later seq-bearing row',
   assert.equal(merged[1].seq, 2)
 })
 
+test('dedupMessagesByKey keeps a live elapsed time when history has none', () => {
+  const existing: Message[] = [
+    { id: 4, seq: 4, role: 'assistant', content: 'done', elapsed: '3.6s' },
+  ]
+  const incoming: Message[] = [
+    { id: 4, seq: 4, role: 'assistant', content: 'done' },
+  ]
+
+  const merged = dedupMessagesByKey(existing, incoming)
+
+  assert.equal(merged[0].elapsed, '3.6s')
+})
+
 test('dedupMessagesByKey keeps seq-less live placeholders after loaded history', () => {
   const existing: Message[] = [
     { id: 1, seq: 1, role: 'assistant', content: 'older' },

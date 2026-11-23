@@ -149,9 +149,14 @@ var PartKindStr = map[string]int{
 // dispatch tool execution and to build the assistant message's
 // persistence metadata.
 type nativeToolCall struct {
-	ID       string
-	Name     string
-	ArgsJSON string
+	ID          string
+	ItemID      string
+	Name        string
+	ArgsJSON    string
+	OutputIndex int
+	// StreamAnnounced is true after a live start card was sent on
+	// the wire during LLM args streaming (AE-01). Not persisted.
+	StreamAnnounced bool
 }
 
 // partsAccumulator mutates a `[]MessagePart` in place as
@@ -509,21 +514,24 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 	if c.ToolName != "" {
 		parts, subIdx := a.activePartsFor(c)
 		status := ToolStatusFromResult(c.ToolCallStatus, c.Step, c.ToolError)
+		// AE-01 args deltas are wire-only for the live ToolCard;
+		// full args land on the real start/ok events at dispatch.
+		if status == "args" {
+			return
+		}
 		if status == "start" {
-			// When a ToolID is present, avoid clobbering an
-			// earlier same-name start part — the ID is the
-			// unique key. For ID-less streams (old clients),
-			// fall back to the legacy name-based check.
+			// When a ToolID is present, update that call wherever it
+			// already sits. Parallel calls append in stream order, so
+			// the matching preview is often not the last part.
 			if c.ToolID != "" {
-				if i := len(parts) - 1; i >= 0 &&
-					parts[i].Kind == "tool" &&
-					parts[i].ToolID == c.ToolID &&
-					parts[i].Status == "start" {
-					if c.ToolArgs != "" {
-						parts[i].Args = c.ToolArgs
+				for i := range parts {
+					if parts[i].Kind == "tool" && parts[i].ToolID == c.ToolID && parts[i].Status == "start" {
+						if c.ToolArgs != "" {
+							parts[i].Args = c.ToolArgs
+						}
+						a.setPartsFor(subIdx, parts)
+						return
 					}
-					a.setPartsFor(subIdx, parts)
-					return
 				}
 			} else if i := len(parts) - 1; i >= 0 &&
 				parts[i].Kind == "tool" &&
@@ -754,6 +762,32 @@ func (a *partsAccumulator) update(c ChatStreamChunk) {
 		return
 	}
 
+	// StreamReset: the LLM attempt that produced the current round's
+	// text/thinking deltas failed mid-stream and is being retried.
+	// Drop text/thinking and any AE-01 provisional tool cards
+	// (status=start) from the failed attempt. Completed tools from
+	// earlier rounds and skill/question cards are kept.
+	if c.StreamReset {
+		parts, subIdx := a.activePartsFor(c)
+		kept := parts[:0]
+		for _, p := range parts {
+			if p.Kind == "text" || p.Kind == "thinking" {
+				continue
+			}
+			if p.Kind == "tool" && p.Status == "start" {
+				continue
+			}
+			kept = append(kept, p)
+		}
+		// Zero the tail so the dropped parts' buffers are
+		// garbage-collectable, then store the compacted list.
+		for i := len(kept); i < len(parts); i++ {
+			parts[i] = MessagePart{}
+		}
+		a.setPartsFor(subIdx, kept)
+		return
+	}
+
 	// ContentRewrite: replace the trailing text part in-place
 	// with the rewritten version. The post-stream redactor
 	// (agent.go) emits this AFTER the stream ends to sanitize
@@ -860,6 +894,12 @@ func ToolStatusFromResult(callStatus, step, errMsg string) string {
 	if callStatus == "blocked" {
 		return "blocked"
 	}
+	// AE-01: args-delta chunks carry ToolCallStatus=args (and/or
+	// step call-N-args). Prefer the structured status so we never
+	// confuse a delta with a terminal tool result.
+	if callStatus == "args" {
+		return "args"
+	}
 	return ToolStatusFromStep(step, errMsg)
 }
 
@@ -875,7 +915,7 @@ func parseStepStatus(step string) string {
 	}
 	candidate := step[idx+1:]
 	switch candidate {
-	case "ok", "warn", "err", "error", "start":
+	case "ok", "warn", "err", "error", "start", "args":
 		return canonicalStatus(candidate)
 	}
 	return ""
@@ -893,6 +933,8 @@ func canonicalStatus(s string) string {
 		return "error"
 	case "start":
 		return "start"
+	case "args":
+		return "args"
 	}
 	return s
 }

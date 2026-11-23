@@ -53,7 +53,6 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents\scripts\install.ps1 
 | **前端样式 / 设计 token / 主界面视觉** | [**`.agents/docs/frontend-design.md`**](docs/frontend-design.md)（**已锁定 Project-Aware Calm Workbench，见 §0.5**） |
 | 沙箱 / Skill / MCP 等 | [`.agents/docs/infrastructure.md`](docs/infrastructure.md) |
 | 版本升级系统 | [`.agents/docs/upgrade.md`](docs/upgrade.md) |
-| **IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [`.agents/docs/im.md`](docs/im.md) + [实现计划 `docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
 | 全模块索引 | [`.agents/docs/INDEX.md`](docs/INDEX.md) |
 | 用户询问 agent 功能 / GUI 操作流程 | [`README.md`](../README.md)「GUI 操作入口速查 / 常见问题」+ 对应模块文档 |
 
@@ -100,7 +99,6 @@ D:\develop\project\P-chat\
 │   │   ├── frontend-design.md  #   设计 token + Calm Workbench 视觉规范（§0.5 已锁定）
 │   │   ├── infrastructure.md   #   基础设施模块
 │   │   ├── knowledge.md        #   知识库 / RAG
-│   │   ├── im.md               #   IM 桥接
 │   │   ├── versioning.md       #   版本与 SQLite schema 迁移
 │   │   └── upgrade.md          #   用户数据目录结构升级
 │   └── scripts/
@@ -126,7 +124,6 @@ D:\develop\project\P-chat\
 │   ├── cli/                    # 终端 REPL + ChatUI
 │   ├── browser/                # 浏览器扩展连接 + browser_* 工具
 │   ├── export/                 # 会话导出 HTML/PDF/text
-│   ├── im/                     # IM Gateway / adapter / renderer
 │   ├── search/                 # web_search provider
 │   ├── recall/                 # 知识库多 query 召回与重排
 │   ├── sandbox/                # 命令/文件安全检查
@@ -191,7 +188,7 @@ type MessagePart =
           → 工具派发: goroutine + per-tool eventCh (cap 64)
               → forwarder → partsAcc.update() → main ch
               → tool handler → subagent           (subagent/*)
-          → chunkToEvent(ev) → type mapping      (server/handler.go)
+          → chunkToEvent(ev) → type mapping      (server/stream_adapter.go)
           → SSE: "data: {...}\n\n"               (server/handler.go)
       → 前端 appendStreamEvent()                  (frontend/stores/chat.ts)
         → 路由到 parts (text/thinking/tool/sub_agent)
@@ -201,7 +198,7 @@ type MessagePart =
 
 ### 1.3 SSE 协议
 
-Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（`internal/server/handler.go:1495-1613` `chunkToEvent()`）：
+Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（`internal/server/stream_adapter.go` `chunkToEvent()`）：
 
 | `type` | 触发 | 关键字段 |
 | --- | --- | --- |
@@ -209,6 +206,7 @@ Server-Sent Events 端点 `POST /api/v1/sessions/:id/messages`。Event 类型（
 | `thinking` | reasoning delta | `thinking` |
 | `skill` | Skill 加载生命周期 | `skill_name`, `skill_status`, `skill_scope`, `skill_dependencies`, `skill_error` |
 | `tool` | 工具调用生命周期 | `tool_name`, `tool_status`, `tool_result`, `tool_args`, `tool_elapsed` |
+| `stream_reset` | LLM attempt 失败后即将重试 | 无正文；客户端必须作废当前 attempt 的 text/thinking，不能和新 attempt 拼接 |
 | `phase` | sub-agent lifecycle / system status | `phase`, `sub_agent_status` |
 | `error` | LLM/transport error | `error`, `error_kind` |
 | `done` | 流结束 | `tokens_in`, `tokens_out`, `elapsed` |
@@ -342,12 +340,11 @@ npm run build                                   # 前端 bundle
 
 ## 4. 已知问题
 
-### 4.1 api-convert.08ms.cn 代理
+### 4.1 api-convert.08ms.cn 代理（2026-07 历史记录）
 
-- `cs` provider 走 `http://api-convert.08ms.cn/v1`
-- **2026-07-12 前**：月度 quota 已用完
-- `doubao-seed-2.0-lite` 路由被屏蔽
-- **这不是 P-Chat 的 bug**
+- 当时的 `cs` provider 配置指向 `http://api-convert.08ms.cn/v1`。
+- 2026-07-12 前曾观察到月度额度耗尽，且 `doubao-seed-2.0-lite` 路由被屏蔽。
+- 排障时须核对当前活动配置和上游响应；这条历史记录不能证明当前额度、路由状态或故障归因。
 
 ### 4.2 LLM 合成错误
 
@@ -373,7 +370,7 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | parts 累加器 | `internal/agent/parts.go` |
 | 流式事件分发 | `frontend/src/stores/chat.ts:828-1103` `appendStreamEvent()` |
 | 共享 markdown 渲染缓存 | `frontend/src/utils/markdownCache.ts` |
-| 后端 SSE 事件映射 | `internal/server/handler.go:1495-1613` `chunkToEvent()` |
+| 后端 SSE 事件映射 | `internal/server/stream_adapter.go` `chunkToEvent()` |
 | 工作模式 `work_mode` 配置 | `internal/config/config.go` `WorkModeConfig` |
 | `work_mode` 提示词段 | `internal/agent/prompt.go` `buildWorkModeBlock()` |
 | `work_mode` per-session 覆盖 | `internal/server/handler.go` `sessionMeta.WorkMode` |
@@ -389,8 +386,6 @@ LLM 在工具失败时会合成 `ERROR: ... Inform the user.` 伪错误消息。
 | 数据库 CRUD | `internal/memory/memory.go` |
 | `web_search` 工具 | `internal/tool/websearch.go` + `internal/search/*` |
 | **Skill 发现/安装/加载** | `internal/skill/manager.go`（唯一 Manager 边界）+ `internal/tool/skill_tools.go`（`skill` / `skill_manage`）+ `internal/agent/skills.go`（显式生命周期） |
-| **IM Gateway 入口** | [`.agents/docs/im.md`](docs/im.md) + [`docs/plans/im-bridge-plan.md`](../docs/plans/im-bridge-plan.md) |
-| **IM 配置文件 schema** | `internal/config/im_config.go`（落地后）`IMConfig` |
 | sendOrDrop 逃生 | `internal/agent/agent.go`（`sendOrDropTimeout`，channel 满 30s 丢非关键事件） |
 | 大 tool 结果截断 + 有界缓存 | `internal/agent/agent.go`（`MaxToolResultFullBytes`）+ `internal/agent/tool_result_cache.go` |
 | cancel-stream / tool-result 端点 | `internal/server/messages.go` + `server.go` |

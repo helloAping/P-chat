@@ -94,6 +94,9 @@ type SandboxChecker interface {
 2. 阻塞等待前端 POST /confirm-response
 3. 返回批准/拒绝
 
+`RequireExplicitConfirm()` 用于不能静默授权的动作（例如无法证明只读的
+`browser_evaluate`）：会话 `full/auto`、域名 allowlist、`require_confirm=never` 与“始终允许”缓存均不能绕过，确认通道缺失时拒绝执行。
+
 ### 5. Question 工具 (暂停-恢复)
 
 `handleQuestion()` (`question.go`) 实现异步提问流程：
@@ -141,9 +144,9 @@ type SandboxChecker interface {
 
 ### 6.7 会话附件读取工具
 
-`read_attachment` 只接受 `upload_id`，不接受文件系统路径。Agent 注入的 resolver 会先确认该上传引用属于当前会话，再从上传目录解析真实文件，因此模型不能借此读取其他会话或任意本地文件。工具支持普通文本/源码、PDF、DOCX/DOCM、XLSX/XLSM、PPTX/PPTM；未知二进制、旧版 Office 二进制格式等没有确定解析器的类型会明确返回不支持，模型不得声称已读。
+`read_attachment` 接受兼容的单个 `upload_id`，或批量 `upload_ids`，但不接受文件系统路径。`offset` 与 `limit` 提供每个文件的提取文本分页；范围始终落在 UTF-8 字符边界，并给出 `next offset`。单次最多读取 8 个不同附件，更多附件需分批；输出也有上限。批量读取按文件隔离失败：有效文档继续返回，失败文档带独立错误；只有全部失败时整个调用才标为失败。Agent 注入的 resolver 会先确认每个上传引用属于当前会话，再从上传目录解析真实文件，因此模型不能借此读取其他会话或任意本地文件。工具支持普通文本/源码、PDF、DOCX/DOCM、XLSX/XLSM、PPTX/PPTM；未知二进制、旧版 Office 二进制格式等没有确定解析器的类型会明确返回不支持，模型不得声称已读。
 
-当前轮和历史轮的文档都以显示行加 system 引用进入上下文，正文只在模型确实调用 `read_attachment` 后提取。这样附件无需复制进项目目录，也不会把整份 Office/PDF 的二进制或 data URL 塞进提示词。该工具不向子代理暴露。
+当前轮文档除显示行和 system 引用外，还会在首个模型请求中注入每份文件公平、有界、标记为不可信数据的正文预览；后续详情和历史轮文档通过 `read_attachment` 分页提取。这样附件无需复制进项目目录，也不会把整份 Office/PDF 的二进制或 data URL 塞进提示词。文本型 PDF 可直接提取；扫描/图片型 PDF 当前没有 OCR，结果会明确提示“无可提取文本”，模型不得声称已读。该工具不向子代理暴露。
 
 ### 6.8 媒体生成工具与硬开关
 
@@ -175,6 +178,16 @@ MiniMax H3 / V2 视频接口会使用 `content` 多模态数组、`ratio` 字段
 旧 MiniMax `/v1/video_generation` 仍保留 `prompt` / `first_frame_image` 形状。
 Kling/可灵媒体接口会使用 `model_name`，图/视频输入写入 `image` / `video` 字段，并将
 data URL 输入剥离为 base64 主体。
+
+### 6.9 `browser_evaluate` 默认只读闸门（SEC-04）
+
+`browser.allow_eval_write` 默认 `false`。此时 `internal/browser/policy.go` 对 expression 做三态判定，且该判定独立于域名策略和会话权限：
+
+1. **明确副作用** → 硬拒绝。覆盖 DOM 属性/树写入、style/class 修改、表单提交、history/location、clipboard/share、storage/indexedDB/cache、fetch/XHR/WebSocket/EventSource/Worker、postMessage、service worker、动态代码与反射写入等常见入口。
+2. **保守确认的只读表达式** → 进入正常 BR-04 策略。`document.title`、`document.querySelector(...).textContent`、`getComputedStyle(...)`、`history.state`、`localStorage.getItem(...)` 等仍可用。
+3. **无法证明只读** → 必须逐次显式确认。这个确认不会被 `allowed_hosts`、`require_confirm=never`、会话 `full/auto` 或“始终允许”缓存静默跳过；确认通道缺失时 fail closed。
+
+词法判定不是 JavaScript 安全沙箱。需要可信页面自动化写入时，用户必须显式设置 `allow_eval_write=true`；这只关闭 expression 的只读闸门，`blocked_hosts` 和正常 BR-04 确认仍生效。
 
 ### 7. dry_run 模式 (P2-4, 2026-07-15)
 

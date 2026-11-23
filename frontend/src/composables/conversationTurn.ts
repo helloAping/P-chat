@@ -1,5 +1,7 @@
 import * as api from '../api/client'
 import { dataURLToBlobURL } from '../utils/mediaPreview'
+import { isRejectedMessageRequest } from '../api/sse'
+import { removeUnacceptedLocalTurn } from '../utils/rejectedTurn'
 import {
   appendLocalUserMessage,
   appendStreamEvent,
@@ -212,7 +214,7 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
         role: 'user',
         content: payload.message,
         created_at: Date.now() / 1000,
-        attachments: bubbleAttachmentsFromQueuedPayload(payload.attachments),
+		attachments: bubbleAttachmentsFromQueuedPayload(payload.attachments, sessionId),
       })
 
       try {
@@ -249,6 +251,9 @@ export async function drainQueuedConversationTurns(sessionId: string): Promise<v
           void generateSessionTitle(sessionId, payload.message).catch(() => {})
         }
       } catch (e: any) {
+        if (isRejectedMessageRequest(e)) {
+          removeUnacceptedLocalTurn(state.sessionMessages[sessionId] || [], payload.client_msg_id)
+        }
         await failQueuedTurn(sessionId, item.id, e?.message || String(e))
         break
       }
@@ -307,14 +312,14 @@ function scheduleQueueDrainRetry(sessionId: string) {
   }, 1000)
 }
 
-function bubbleAttachmentsFromQueuedPayload(attachments?: api.InlineAttachment[]): api.MessageAttachment[] | undefined {
+function bubbleAttachmentsFromQueuedPayload(attachments: api.InlineAttachment[] | undefined, sessionId: string): api.MessageAttachment[] | undefined {
   if (!attachments?.length) return undefined
   const out: api.MessageAttachment[] = []
   for (const att of attachments) {
     if (att.type === 'image_url' || att.type === 'audio_url' || att.type === 'video_url') {
       out.push({
         type: att.type,
-        url: dataURLToBlobURL(att.upload_id ? api.uploadURL(att.upload_id) : att.url),
+		url: dataURLToBlobURL(att.upload_id ? api.uploadURL(att.upload_id, sessionId) : att.url),
         name: att.name,
         kind: att.kind,
         mime: att.mime,
@@ -324,7 +329,7 @@ function bubbleAttachmentsFromQueuedPayload(attachments?: api.InlineAttachment[]
     out.push({
       type: 'text',
       text: att.text,
-      url: att.upload_id ? api.uploadURL(att.upload_id) : undefined,
+		url: att.upload_id ? api.uploadURL(att.upload_id, sessionId) : undefined,
       name: att.name,
       kind: att.kind,
       mime: att.mime,

@@ -250,17 +250,17 @@ defineExpose({ open: openSwitcher })
   gap: var(--space-2);
   min-height: 44px;
   padding: var(--space-2);
-  border: 1px solid var(--border-default);
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
-  background: var(--surface-0);
+  background: transparent;
   color: var(--text-primary);
   cursor: pointer;
   text-align: left;
   transition: var(--transition-colors);
 }
 .switcher-trigger:hover {
-  background: color-mix(in srgb, var(--brand-500) 5%, var(--surface-0));
-  border-color: color-mix(in srgb, var(--brand-500) 22%, var(--border-default));
+  background: var(--surface-2);
+  border-color: transparent;
 }
 .switcher-icon {
   width: 28px;

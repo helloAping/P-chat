@@ -1132,6 +1132,47 @@ func TestUpdateProvider_CustomHeadersReplaceClearAndValidate(t *testing.T) {
 	}
 }
 
+// TestUpdateProvider_CustomHeadersEmptyValueKeepsPrior covers the
+// redacted-read round trip: clients send header names with blank
+// values and must not wipe the stored secret/template.
+func TestUpdateProvider_CustomHeadersEmptyValueKeepsPrior(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("USERPROFILE", dir)
+	t.Setenv("HOME", dir)
+	initial := `{
+  "llm": {
+    "default": "cs",
+    "providers": [
+      { "name": "cs", "protocol": "openai", "base_url": "http://x", "api_key": "k", "model": "m", "custom_headers": {"X-Token":"secret","X-ID":"{{uuid}}"} }
+    ]
+  }
+}`
+	if err := osWriteFile(dir+"/.p-chat/config.json", initial); err != nil {
+		t.Fatal(err)
+	}
+
+	keepNames := map[string]string{"X-Token": "", "X-ID": ""}
+	updated, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &keepNames})
+	if err != nil {
+		t.Fatalf("keep names: %v", err)
+	}
+	if updated.CustomHeaders["X-Token"] != "secret" || updated.CustomHeaders["X-ID"] != "{{uuid}}" {
+		t.Fatalf("CustomHeaders = %#v, want prior values kept", updated.CustomHeaders)
+	}
+
+	dropOne := map[string]string{"X-Token": ""}
+	dropped, err := UpdateProvider("cs", ProviderPatch{CustomHeaders: &dropOne})
+	if err != nil {
+		t.Fatalf("drop one: %v", err)
+	}
+	if dropped.CustomHeaders["X-Token"] != "secret" {
+		t.Fatalf("kept header wiped: %#v", dropped.CustomHeaders)
+	}
+	if _, ok := dropped.CustomHeaders["X-ID"]; ok {
+		t.Fatalf("removed header still present: %#v", dropped.CustomHeaders)
+	}
+}
+
 // TestUpdateProvider_SetDefault verifies IsDefault promotes
 // the target provider to the global default and leaves the
 // others alone.

@@ -3,6 +3,7 @@ package cli
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -20,13 +21,15 @@ import (
 //  3. The LLM response as plain streaming text
 //  4. A final status bar with model, tokens, elapsed
 type ChatUI struct {
-	provider string
-	model    string
+	provider         string
+	model            string
+	turnHeaderOutput io.Writer
 
 	// Question support
-	sessionID     string
-	submitAnswer  func(sessionID string, answers map[string]string) error
-	submitConfirm func(sessionID string, approved bool, action string) error
+	sessionID           string
+	submitAnswer        func(sessionID string, answers map[string]string) error
+	submitConfirm       func(sessionID string, approved bool, action string) error
+	submitConfirmWithID func(sessionID string, approved bool, action, confirmID string) error
 
 	// Spinner state
 	spinner *Spinner
@@ -52,10 +55,11 @@ type ChatUI struct {
 // NewChatUI creates a new chat UI renderer.
 func NewChatUI(provider, model string) *ChatUI {
 	return &ChatUI{
-		provider:     provider,
-		model:        model,
-		start:        time.Now(),
-		firstContent: true,
+		provider:         provider,
+		model:            model,
+		turnHeaderOutput: os.Stdout,
+		start:            time.Now(),
+		firstContent:     true,
 	}
 }
 
@@ -70,6 +74,13 @@ func (u *ChatUI) SetQuestionHandler(sessionID string, submit func(sessionID stri
 func (u *ChatUI) SetConfirmHandler(sessionID string, submit func(sessionID string, approved bool, action string) error) {
 	u.sessionID = sessionID
 	u.submitConfirm = submit
+}
+
+// SetConfirmHandlerWithID wires a confirmation callback that binds the
+// response to the exact confirm_id supplied by the stream.
+func (u *ChatUI) SetConfirmHandlerWithID(sessionID string, submit func(sessionID string, approved bool, action, confirmID string) error) {
+	u.sessionID = sessionID
+	u.submitConfirmWithID = submit
 }
 
 // Handle processes a single chunk from the agent stream.
@@ -101,6 +112,11 @@ func (u *ChatUI) Handle(chunk agent.ChatStreamChunk) {
 	// user can see what's happening inside the task tool.
 	if chunk.SubAgent {
 		u.handleSubAgentEvent(chunk)
+		return
+	}
+
+	if chunk.StreamReset {
+		u.handleStreamReset()
 		return
 	}
 
@@ -172,6 +188,14 @@ func (u *ChatUI) Handle(chunk agent.ChatStreamChunk) {
 func (u *ChatUI) handleSubAgentEvent(chunk agent.ChatStreamChunk) {
 	dim := color.New(color.FgHiBlack)
 	indent := "    " // 4 spaces: aligned under "  ● task(args)"
+	if chunk.StreamReset {
+		// 终端无法可靠删除已经流式输出的任意多行文本，因此明确标记旧片段作废。
+		// A terminal cannot reliably erase arbitrary streamed lines, so mark the
+		// previous fragment as discarded before the retry continues.
+		fmt.Println()
+		color.Yellow("%s↻ 子代理上一次尝试的部分输出已作废，正在重试…", indent)
+		return
+	}
 
 	// Synthetic start event: open the sub-agent card on its
 	// own line. We print the agent name (when known) so the
@@ -322,6 +346,18 @@ func (u *ChatUI) handleSessionStatusEvent(chunk agent.ChatStreamChunk) bool {
 	}
 }
 
+// handleStreamReset 标记失败 attempt 的已打印片段作废，并为重试开启新区块。
+// handleStreamReset marks the already-printed failed attempt as discarded and
+// starts a visually separate block for the retried stream.
+func (u *ChatUI) handleStreamReset() {
+	u.stopSpinner()
+	u.ensureLine()
+	color.Yellow("  ↻ 上一次尝试的部分输出已作废，重试结果将从下方重新输出…")
+	u.firstContent = true
+	u.inTextBlock = false
+	u.startSpinner("重新尝试中...")
+}
+
 func (u *ChatUI) handleSystemEvent(chunk agent.ChatStreamChunk) {
 	msg := strings.TrimSpace(chunk.Message)
 	if msg == "" {
@@ -462,6 +498,7 @@ type cliQuestion struct {
 }
 
 type cliConfirmRequest struct {
+	ConfirmID    string `json:"confirm_id,omitempty"`
 	ToolName     string `json:"tool_name"`
 	Args         string `json:"args"`
 	Reason       string `json:"reason"`
@@ -532,6 +569,12 @@ func (u *ChatUI) handleToolConfirmEvent(rawJSON string) {
 		color.Yellow("  非交互终端: 已拒绝工具调用")
 	}
 
+	if u.submitConfirmWithID != nil {
+		if err := u.submitConfirmWithID(u.sessionID, approved, action, req.ConfirmID); err != nil {
+			color.Red("  提交工具确认失败: %v", err)
+		}
+		return
+	}
 	if u.submitConfirm == nil {
 		color.Red("  工具确认处理器不可用")
 		return
@@ -753,9 +796,9 @@ func (u *ChatUI) printStatusBar() {
 	dim.Printf("  ⏵ %s\n", strings.Join(parts, " · "))
 }
 
-// PrintBannerHeader prints a small "user message" header before the response.
-// This makes the chat look like a conversation.
-func (u *ChatUI) PrintBannerHeader(userInput string) {
+// BeginTurn 初始化一次终端响应的渲染状态，并输出回合分隔。
+// BeginTurn initializes terminal rendering state and prints the turn separator.
+func (u *ChatUI) BeginTurn(userInput string, showUserInput bool) {
 	u.start = time.Now()
 	u.tokensIn.Store(0)
 	u.tokensOut.Store(0)
@@ -766,9 +809,11 @@ func (u *ChatUI) PrintBannerHeader(userInput string) {
 	u.maxRound = 0
 	u.firstContent = true
 	u.inTextBlock = false
-	dim := color.New(color.FgCyan, color.Bold)
-	dim.Printf("  ❯ %s\n", userInput)
-	fmt.Println()
+	if showUserInput {
+		dim := color.New(color.FgCyan, color.Bold)
+		dim.Fprintf(u.turnHeaderOutput, "  ❯ %s\n", userInput)
+	}
+	fmt.Fprintln(u.turnHeaderOutput)
 }
 
 func (u *ChatUI) startSpinner(msg string) {

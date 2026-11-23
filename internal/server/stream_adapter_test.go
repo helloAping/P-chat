@@ -29,6 +29,19 @@ func TestChunkToEvent(t *testing.T) {
 			t.Errorf("TokensIn = %d, want 10", ev.TokensIn)
 		}
 	})
+	t.Run("done with cache", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Done: true, TokensIn: 1000, TokensOut: 20,
+			CacheHitTokens: 850, CacheMissTokens: 150, CacheReported: true,
+			Duration: "1.2s",
+		}, "cs", "gpt-4o")
+		if ev.CacheHitTokens == nil || *ev.CacheHitTokens != 850 {
+			t.Fatalf("cache hit = %v", ev.CacheHitTokens)
+		}
+		if ev.CacheMissTokens == nil || *ev.CacheMissTokens != 150 {
+			t.Fatalf("cache miss = %v", ev.CacheMissTokens)
+		}
+	})
 	t.Run("error", func(t *testing.T) {
 		ev := chunkToEvent(agent.ChatStreamChunk{Error: "[auth_error] bad key"}, "cs", "gpt-4o")
 		if ev.Type != "error" {
@@ -64,6 +77,15 @@ func TestChunkToEvent(t *testing.T) {
 		}, "cs", "gpt-4o")
 		if ev.ToolStatus != "blocked" || ev.ToolCallStatus != "blocked" {
 			t.Fatalf("blocked tool event = %#v", ev)
+		}
+	})
+	t.Run("tool args delta", func(t *testing.T) {
+		ev := chunkToEvent(agent.ChatStreamChunk{
+			Phase: "tool", Step: "call-1-args", ToolName: "write_file",
+			ToolID: "call_1", ToolArgs: `{"path":`, ToolCallStatus: "args",
+		}, "cs", "gpt-4o")
+		if ev.Type != "tool" || ev.ToolStatus != "args" || ev.ToolArgs != `{"path":` {
+			t.Fatalf("args delta event = %#v", ev)
 		}
 	})
 	t.Run("skill", func(t *testing.T) {

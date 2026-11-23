@@ -2,16 +2,21 @@ package server
 
 import (
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/p-chat/pchat/internal/agent"
+	"github.com/p-chat/pchat/internal/knowledge"
 	"github.com/p-chat/pchat/internal/paths"
 )
 
@@ -45,6 +50,13 @@ type uploadMeta struct {
 	StoredAs string `json:"-"`
 }
 
+// uploadOwner records the conversation that is allowed to attach an upload.
+// It intentionally lives next to the upload bytes rather than in SQLite: an
+// upload may be created before a message row exists.
+type uploadOwner struct {
+	SessionID string `json:"session_id"`
+}
+
 // UploadMeta is the public alias used by the JSON response and
 // by external test packages.
 type UploadMeta = uploadMeta
@@ -53,6 +65,7 @@ type UploadMeta = uploadMeta
 // limit; well under gin's default 32 MB so the multipart parser
 // never gets close to that ceiling.
 const maxUploadSize = 25 << 20
+const maxUploadRequestSize = maxUploadSize + (1 << 20)
 
 // UploadDir returns ~/.p-chat/uploads/. Created on first use.
 func UploadDir() string {
@@ -74,7 +87,7 @@ func (h *Handler) pruneUploadFiles(ids []string) {
 		if id == "" {
 			continue
 		}
-		if h.store.CountUploadRefs(id) > 0 {
+		if h.store.CountUploadRefs(id) > 0 || h.store.CountPendingTurnQueueUploadRefs(id) > 0 {
 			continue // still referenced elsewhere — keep the file
 		}
 		entries, err := os.ReadDir(UploadDir())
@@ -88,6 +101,7 @@ func (h *Handler) pruneUploadFiles(ids []string) {
 			}
 			_ = os.Remove(filepath.Join(UploadDir(), e.Name()))
 		}
+		_ = os.Remove(uploadOwnerPath(id))
 	}
 }
 
@@ -109,7 +123,7 @@ func (h *Handler) sweepOrphanUploads(grace time.Duration) int {
 	removed := 0
 	cutoff := time.Now().Add(-grace)
 	for _, e := range entries {
-		if e.IsDir() {
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".owner.json") {
 			continue
 		}
 		info, err := e.Info()
@@ -127,10 +141,11 @@ func (h *Handler) sweepOrphanUploads(grace time.Duration) int {
 		if !validUploadID(id) {
 			continue
 		}
-		if h.store.CountUploadRefs(id) > 0 {
+		if h.store.CountUploadRefs(id) > 0 || h.store.CountPendingTurnQueueUploadRefs(id) > 0 {
 			continue
 		}
 		_ = os.Remove(filepath.Join(UploadDir(), name))
+		_ = os.Remove(uploadOwnerPath(id))
 		removed++
 	}
 	return removed
@@ -141,13 +156,25 @@ func (h *Handler) sweepOrphanUploads(grace time.Duration) int {
 // file lives on disk; the client passes the id back when sending
 // a message and the server reads it from disk.
 func (h *Handler) Upload(c *gin.Context) {
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	// Install the cap before any multipart accessor parses the body.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUploadRequestSize)
+	sessionID := strings.TrimSpace(c.PostForm("session_id"))
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session_id is required"})
+		return
+	}
+	if _, err := h.store.GetConversation(sessionID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+		return
+	}
 	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "mkdir: " + err.Error()})
 		return
 	}
-	// Cap the request body so a malicious client can't fill the disk.
-	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxUploadSize)
-
 	fh, err := c.FormFile("file")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no file: " + err.Error()})
@@ -167,7 +194,7 @@ func (h *Handler) Upload(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "create: " + err.Error()})
 		return
 	}
-	written, err := io.Copy(out, f)
+	written, err := io.Copy(out, io.LimitReader(f, maxUploadSize+1))
 	out.Close()
 	if err != nil {
 		_ = os.Remove(stored)
@@ -177,6 +204,21 @@ func (h *Handler) Upload(c *gin.Context) {
 	if written == 0 {
 		_ = os.Remove(stored)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "empty file"})
+		return
+	}
+	if written > maxUploadSize {
+		_ = os.Remove(stored)
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("file too large: max %d bytes", maxUploadSize)})
+		return
+	}
+	if err := validateDocumentUpload(fh.Filename, stored); err != nil {
+		_ = os.Remove(stored)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error(), "code": "invalid_attachment"})
+		return
+	}
+	if err := writeUploadOwner(id, sessionID); err != nil {
+		_ = os.Remove(stored)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "record upload owner: " + err.Error()})
 		return
 	}
 
@@ -191,6 +233,207 @@ func (h *Handler) Upload(c *gin.Context) {
 	c.JSON(http.StatusCreated, meta)
 }
 
+func validateDocumentUpload(name, path string) error {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".pdf":
+		if err := knowledge.ValidatePDF(path); err != nil {
+			return fmt.Errorf("PDF 文件不完整或格式无效，请重新下载后上传: %w", err)
+		}
+	case ".docx", ".docm":
+		if err := knowledge.ValidateDOCX(path); err != nil {
+			return fmt.Errorf("Word 文件不完整或格式无效，请重新下载后上传: %w", err)
+		}
+	}
+	return nil
+}
+
+func uploadOwnerPath(id string) string {
+	return filepath.Join(UploadDir(), id+".owner.json")
+}
+
+func writeUploadOwner(id, sessionID string) error {
+	data, err := json.Marshal(uploadOwner{SessionID: sessionID})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(uploadOwnerPath(id), data, 0o600)
+}
+
+func readUploadOwner(id string) (string, bool, error) {
+	data, err := os.ReadFile(uploadOwnerPath(id))
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	var owner uploadOwner
+	if err := json.Unmarshal(data, &owner); err != nil {
+		return "", false, err
+	}
+	return owner.SessionID, true, nil
+}
+
+// validateAttachmentOwnership rejects unresolved or cross-session upload
+// references before they reach the agent. Legacy uploads without an owner
+// sidecar remain readable only when this session already persisted the same
+// upl:// reference, preserving existing chat history without reopening the
+// global upload namespace for new messages.
+func (h *Handler) validateAttachmentOwnership(sessionID string, atts []agent.Attachment) error {
+	legacyRefs := make(map[string]struct{})
+	for _, id := range h.store.UploadRefsForConversation(sessionID) {
+		legacyRefs[id] = struct{}{}
+	}
+	type ownedDocument struct {
+		name string
+		path string
+	}
+	ownedDocuments := make([]ownedDocument, 0, len(atts))
+	for _, att := range atts {
+		id := strings.TrimSpace(att.UploadID)
+		if id == "" {
+			id = strings.TrimSpace(att.ID)
+		}
+		if id == "" {
+			continue
+		}
+		if !validUploadID(id) {
+			return fmt.Errorf("attachment %q has invalid upload_id", att.Name)
+		}
+		owner, found, err := readUploadOwner(id)
+		if err != nil {
+			return fmt.Errorf("read attachment %q owner: %w", att.Name, err)
+		}
+		if found && owner != sessionID {
+			return fmt.Errorf("attachment %q belongs to another session", att.Name)
+		}
+		if !found {
+			if _, ok := legacyRefs[id]; !ok {
+				return fmt.Errorf("attachment %q is not available in this session; upload it again", att.Name)
+			}
+		}
+		path, _ := (&agent.DiskAttachmentResolver{BaseDir: UploadDir()}).Resolve(agent.Attachment{ID: id})
+		if path == "" {
+			return fmt.Errorf("attachment %q bytes are missing; upload it again", att.Name)
+		}
+		ownedDocuments = append(ownedDocuments, ownedDocument{name: att.Name, path: path})
+	}
+	// 先确认全部附件属于本会话，再汇总格式错误，避免跨会话请求窥探文件状态。
+	// Check every attachment's ownership before reporting document errors to avoid cross-session disclosure.
+	invalid := make([]string, 0)
+	for _, document := range ownedDocuments {
+		if err := validateDocumentUpload(document.path, document.path); err != nil {
+			invalid = append(invalid, fmt.Sprintf("%q：%v", document.name, err))
+		}
+	}
+	if len(invalid) > 0 {
+		return fmt.Errorf("以下附件无效：%s", strings.Join(invalid, "；"))
+	}
+	return nil
+}
+
+// materializeInlineFileAttachments upgrades the legacy inline document
+// fallback into a normal, session-owned upload before the agent sees it.
+// Binary documents must use a data URL; plain Text is accepted for callers
+// that provide a textual file body. Other opaque inline encodings are
+// rejected instead of pretending the document can later be read by upload id.
+func (h *Handler) materializeInlineFileAttachments(sessionID string, atts []agent.Attachment) (err error) {
+	if len(atts) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(UploadDir(), 0o755); err != nil {
+		return fmt.Errorf("create upload directory: %w", err)
+	}
+	type materializedAttachment struct {
+		index int
+		value agent.Attachment
+		path  string
+		owner string
+	}
+	created := make([]materializedAttachment, 0, len(atts))
+	defer func() {
+		if err == nil {
+			return
+		}
+		for _, item := range created {
+			_ = os.Remove(item.path)
+			_ = os.Remove(item.owner)
+		}
+	}()
+	for i := range atts {
+		a := atts[i]
+		if (a.Kind != string(kindFile) && a.Kind != string(kindText)) || a.UploadID != "" || a.ID != "" {
+			continue
+		}
+		payload := a.Data
+		if payload == "" {
+			payload = a.URL
+		}
+		if payload == "" {
+			payload = a.Text
+		}
+		if payload == "" {
+			continue
+		}
+		plainText := a.Kind == string(kindText) && !strings.HasPrefix(payload, "data:")
+		data, mime, err := decodeInlineFilePayload(payload, plainText)
+		if err != nil {
+			return fmt.Errorf("attachment %q inline fallback: %w", a.Name, err)
+		}
+		if len(data) == 0 || len(data) > maxUploadSize {
+			return fmt.Errorf("attachment %q inline fallback has invalid size", a.Name)
+		}
+		name := filepath.Base(strings.TrimSpace(a.Name))
+		if name == "." || name == "" {
+			return fmt.Errorf("attachment inline fallback requires a filename")
+		}
+		id := newUploadID()
+		stored := filepath.Join(UploadDir(), id+"-"+name)
+		if err := os.WriteFile(stored, data, 0o600); err != nil {
+			return fmt.Errorf("write attachment %q: %w", name, err)
+		}
+		if err := validateDocumentUpload(name, stored); err != nil {
+			_ = os.Remove(stored)
+			return fmt.Errorf("attachment %q: %w", name, err)
+		}
+		if err := writeUploadOwner(id, sessionID); err != nil {
+			_ = os.Remove(stored)
+			return fmt.Errorf("record attachment %q owner: %w", name, err)
+		}
+		a.ID, a.UploadID, a.Size = id, id, int64(len(data))
+		if a.MIME == "" {
+			a.MIME = mime
+		}
+		a.Data, a.URL, a.Text = "", "", ""
+		created = append(created, materializedAttachment{index: i, value: a, path: stored, owner: uploadOwnerPath(id)})
+	}
+	for _, item := range created {
+		atts[item.index] = item.value
+	}
+	return nil
+}
+
+func decodeInlineFilePayload(payload string, plainText bool) ([]byte, string, error) {
+	if plainText {
+		return []byte(payload), "text/plain", nil
+	}
+	if !strings.HasPrefix(payload, "data:") {
+		return nil, "", fmt.Errorf("must be a data URL")
+	}
+	comma := strings.IndexByte(payload, ',')
+	if comma < 0 {
+		return nil, "", fmt.Errorf("malformed data URL")
+	}
+	header, body := payload[5:comma], payload[comma+1:]
+	mime := strings.Split(header, ";")[0]
+	if strings.Contains(header, ";base64") {
+		data, err := base64.StdEncoding.DecodeString(body)
+		return data, mime, err
+	}
+	data, err := url.PathUnescape(body)
+	return []byte(data), mime, err
+}
+
 // GET /api/v1/uploads/:id �?serve the raw file back. Used by the
 // web UI for thumbnail previews and by future LLM clients that
 // prefer HTTP URLs over inline base64.
@@ -198,6 +441,23 @@ func (h *Handler) GetUpload(c *gin.Context) {
 	id := c.Param("id")
 	if !validUploadID(id) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "bad id"})
+		return
+	}
+	sessionID := strings.TrimSpace(c.Query("session_id"))
+	if sessionID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "session_id is required"})
+		return
+	}
+	if h.store == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "memory store not available"})
+		return
+	}
+	if _, err := h.store.GetConversation(sessionID); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "session not found"})
+		return
+	}
+	if err := h.validateAttachmentOwnership(sessionID, []agent.Attachment{{ID: id, UploadID: id}}); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "upload is not available in this session"})
 		return
 	}
 	dir := UploadDir()

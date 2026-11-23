@@ -160,6 +160,26 @@ func (h *Handler) UpdateStyle(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"ok": true, "id": id})
 }
 
+// DeleteStyleMemoryLine removes one exact `- ` line from a style's memory.
+func (h *Handler) DeleteStyleMemoryLine(c *gin.Context) {
+	if h.styleMgr == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})
+		return
+	}
+	var body struct {
+		Line string `json:"line"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	if err := h.styleMgr.DeleteMemoryLine(c.Param("id"), body.Line); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
 func (h *Handler) DeleteStyle(c *gin.Context) {
 	if h.styleMgr == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "style manager not available"})

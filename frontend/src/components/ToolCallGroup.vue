@@ -170,30 +170,31 @@ function partHasMediaResult(part: ToolPart): boolean {
   width: 100%;
   background: transparent;
   border: 0;
-  padding: var(--space-2) var(--space-3);
+  padding: 6px 0;
   text-align: left;
   cursor: pointer;
   color: var(--text-secondary);
   font-family: inherit;
   font-size: inherit;
-  transition: background var(--dur-fast) var(--ease-out);
+  transition: color var(--dur-fast) var(--ease-out);
 }
 .tool-group-header:hover {
-  background: var(--surface-3);
+  background: transparent;
+  color: var(--text-primary);
 }
 .tool-group-icon {
   display: inline-flex;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-pill);
+  background: transparent;
   flex-shrink: 0;
 }
-.tool-group-icon.start { background: var(--brand-50); color: var(--brand-500); }
-.tool-group-icon.ok { background: var(--success-50); color: var(--success-500); }
-.tool-group-icon.warn { background: var(--warn-50); color: var(--warn-500); }
-.tool-group-icon.error { background: var(--error-50); color: var(--error-500); }
+.tool-group-icon.start { color: var(--brand-500); }
+.tool-group-icon.ok { color: var(--success-500); }
+.tool-group-icon.warn { color: var(--warn-500); }
+.tool-group-icon.error { color: var(--error-500); }
 
 .spin {
   display: inline-block;
@@ -242,9 +243,9 @@ function partHasMediaResult(part: ToolPart): boolean {
 .tool-group-preview {
   display: grid;
   gap: var(--space-1);
-  border-top: 1px dashed var(--border-subtle);
-  padding: var(--space-2) var(--space-3);
-  background: color-mix(in srgb, var(--surface-2) 42%, transparent);
+  border-top: none;
+  padding: 0 0 var(--space-2) 22px;
+  background: transparent;
 }
 .tool-group-row {
   display: grid;
@@ -285,9 +286,9 @@ function partHasMediaResult(part: ToolPart): boolean {
 }
 
 .tool-group-body {
-  border-top: 1px dashed var(--border-subtle);
-  padding: var(--space-2) var(--space-3);
-  background: color-mix(in srgb, var(--surface-2) 42%, transparent);
+  border-top: none;
+  padding: 0 0 var(--space-2) 22px;
+  background: transparent;
 }
 .tool-group-body :deep(.tool-card) {
   margin: var(--space-1) 0;

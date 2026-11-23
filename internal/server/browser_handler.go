@@ -84,15 +84,12 @@ func (h *Handler) UpdateBrowserConfig(c *gin.Context) {
 		return
 	}
 
-	h.browserMgr.SetEnabled(req.Enabled)
-
-	cfg := h.getCfg()
-	cfg.Browser.Enabled = req.Enabled
-	if mgr := config.NewManager(); mgr != nil {
-		if err := mgr.SaveGlobal(cfg); err != nil {
-			log.Printf("[browser] persist config: %v", err)
-		}
+	if _, err := config.UpdateBrowserEnabledAt(h.configPath, req.Enabled); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
 	}
+	h.reloadAfterConfigChange()
+	h.browserMgr.SetEnabled(req.Enabled)
 
 	c.JSON(http.StatusOK, gin.H{"ok": true, "enabled": req.Enabled})
 }
@@ -107,14 +104,12 @@ func (h *Handler) BrowserWebSocket(c *gin.Context) {
 	// reloads extension" step. The feature is implicitly enabled
 	// by the act of connecting.
 	if !h.browserMgr.IsEnabled() {
-		h.browserMgr.SetEnabled(true)
-		cfg := h.getCfg()
-		cfg.Browser.Enabled = true
-		if mgr := config.NewManager(); mgr != nil {
-			if err := mgr.SaveGlobal(cfg); err != nil {
-				log.Printf("[browser] auto-enable persist config: %v", err)
-			}
+		if _, err := config.UpdateBrowserEnabledAt(h.configPath, true); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
 		}
+		h.reloadAfterConfigChange()
+		h.browserMgr.SetEnabled(true)
 		log.Println("[browser] auto-enabled browser control (browser extension connected)")
 	}
 

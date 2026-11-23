@@ -90,6 +90,11 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 		ev.Type = "done"
 		ev.TokensIn = chunk.TokensIn
 		ev.TokensOut = chunk.TokensOut
+		if chunk.CacheReported {
+			hit, miss := chunk.CacheHitTokens, chunk.CacheMissTokens
+			ev.CacheHitTokens = &hit
+			ev.CacheMissTokens = &miss
+		}
 		// ev.Elapsed already populated above (chunk.Duration).
 		return ev
 	}
@@ -127,6 +132,16 @@ func chunkToEvent(chunk agent.ChatStreamChunk, provider, model string) StreamEve
 	if chunk.Content != "" {
 		ev.Type = "content"
 		ev.Content = chunk.Content
+		return ev
+	}
+	// StreamReset: a failed LLM attempt is being retried and the
+	// partial text/thinking it streamed must be dropped from the
+	// live bubble. Routed as its own event type so the chat store
+	// can remove parts rather than append. Must be checked before
+	// the Phase fallthrough — the chunk carries Phase="llm" for
+	// context but is not a status note.
+	if chunk.StreamReset {
+		ev.Type = "stream_reset"
 		return ev
 	}
 	// ContentRewrite: the agent's post-stream redactor rewrote

@@ -101,7 +101,7 @@ func TestValidateBaseURL(t *testing.T) {
 	}{
 		{"https://api.tavily.com", true},
 		{"https://s.jina.ai", true},
-		{"http://127.0.0.1:8080", true},      // loopback http OK
+		{"http://127.0.0.1:8080", true},        // loopback http OK
 		{"http://localhost:9000/search", true}, // loopback http OK
 		{"http://api.example.com", false},      // non-loopback http
 		{"ftp://example.com", false},           // wrong scheme
@@ -178,10 +178,10 @@ func TestTavilyProvider_SearchOK(t *testing.T) {
 			"results": []map[string]any{
 				{"title": "net/http - GoDoc", "url": "https://pkg.go.dev/net/http",
 					"content": "Package http provides HTTP client and server implementations.",
-					"score": 0.95, "published_date": "2024-01-15"},
+					"score":   0.95, "published_date": "2024-01-15"},
 				{"title": "Go by Example: HTTP Client", "url": "https://gobyexample.com/http-client",
 					"content": "The Go standard library provides excellent HTTP support.",
-					"score": 0.87},
+					"score":   0.87},
 			},
 		})
 	}))
@@ -307,8 +307,8 @@ func TestTavilyProvider_PicksTopic(t *testing.T) {
 		"":        "general",
 		"news":    "news",
 		"finance": "finance",
-		"NEWS":    "news",  // case-insensitive
-		"  news ": "news",  // trimmed
+		"NEWS":    "news",    // case-insensitive
+		"  news ": "news",    // trimmed
 		"bogus":   "general", // unknown → general
 	}
 	for in, want := range tests {

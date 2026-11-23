@@ -67,6 +67,7 @@ func NewREPL(ctx cliContext, cfg *config.Config, s style.Style, provider string)
 		mode:         cfg.WorkMode.Default.Normalize(),
 		provider:     provider,
 		useTools:     true,
+		toolCache:    newToolResultCache(20),
 		rollbackUndo: make(map[string][]httpcli.Message),
 	}
 }
@@ -111,18 +112,37 @@ func (r *REPL) SetKBManager(m *KBManager) {
 	r.kbManager = m
 }
 
-// asContext returns a cliContext backed by this REPL.
+// asContext 返回命令处理器使用的上下文。asContext returns the context used
+// by slash-command handlers. In HTTP mode every server-backed capability,
+// including knowledge bases and recall, remains on the server.
 func (r *REPL) asContext() cliContext {
-	if r.ctx != nil {
-		return r.ctx
+	if r.ctx == nil {
+		return &localContext{r: r}
 	}
-	return &localContext{r: r}
+	return r.ctx
+}
+
+// syncContextState 将 REPL 提示与发出的请求同步到 HTTP 命令上下文中的设置。
+// syncContextState keeps the REPL prompt and outgoing requests aligned with
+// settings changed by slash commands on the HTTP context.
+func (r *REPL) syncContextState() {
+	if r.ctx == nil {
+		return
+	}
+	if provider := r.ctx.GetCurrentProvider(); provider != "" {
+		r.provider = provider
+	}
+	if selected, err := style.ParseStyle(r.ctx.StyleName()); err == nil {
+		r.style = selected
+	}
+	r.mode = config.WorkMode(r.ctx.ModeName()).Normalize()
 }
 
 func (r *REPL) Run() error {
 	if err := paths.EnsureGlobal(); err != nil {
 		return fmt.Errorf("init directories: %w", err)
 	}
+	r.syncContextState()
 
 	model := r.providerModel()
 	label := r.styleLabel()
@@ -167,6 +187,7 @@ func (r *REPL) Run() error {
 					continue
 				}
 				err := cmd.Handler(r.asContext(), args)
+				r.syncContextState()
 				if errors.Is(err, errQuit) {
 					return nil
 				}
@@ -214,6 +235,7 @@ func (r *REPL) chat(input string) {
 }
 
 func (r *REPL) chatWithSkills(input string, activeSkills []string) {
+	r.syncContextState()
 	now := time.Now()
 	req := agent.ChatRequest{
 		Style:        r.style,
@@ -234,10 +256,10 @@ func (r *REPL) chatWithSkills(input string, activeSkills []string) {
 	ui.SetQuestionHandler(r.ctx.GetCurrentSessionID(), func(sid string, answers map[string]string) error {
 		return r.ctx.SubmitQuestionAnswer(ctx, sid, answers)
 	})
-	ui.SetConfirmHandler(r.ctx.GetCurrentSessionID(), func(sid string, approved bool, action string) error {
-		return r.ctx.SubmitToolConfirm(ctx, sid, approved, action)
+	ui.SetConfirmHandlerWithID(r.ctx.GetCurrentSessionID(), func(sid string, approved bool, action, confirmID string) error {
+		return submitToolConfirmWithID(r.ctx, ctx, sid, approved, action, confirmID)
 	})
-	ui.PrintBannerHeader(input)
+	ui.BeginTurn(input, false)
 
 	r.mu.Lock()
 	r.cancelCurrent = cancel
@@ -262,6 +284,14 @@ func (r *REPL) chatWithSkills(input string, activeSkills []string) {
 		ui.Handle(chunk)
 	}
 	ui.Finish()
+}
+
+func parseToolDuration(raw string) time.Duration {
+	duration, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0
+	}
+	return duration
 }
 
 // providerModel returns the current model name for display.

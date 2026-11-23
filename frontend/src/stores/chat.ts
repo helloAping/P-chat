@@ -16,6 +16,8 @@ import {
   humanizeStreamDropReason,
   pendingTodoCount,
 } from '../utils/streamInterrupt'
+import { basenameFromPath, sameProjectPath } from '../utils/projectPath'
+import { findOpenToolCard, settleOpenToolCards } from '../utils/toolCards'
 
 export interface PendingAttachment {
   // Server-side metadata returned from /uploads.
@@ -29,6 +31,7 @@ export interface PendingAttachment {
   _blobURL?: string
   _uploading: boolean
   _error: boolean
+  _errorMessage?: string
   // Local URL for immediate preview (blob: during upload,
   // server URL after).
   _previewURL: string
@@ -46,6 +49,9 @@ export interface PendingAttachment {
   // 撤销撤回时只清理自动回填的附件，不误删用户后来新增的附件。
   _rollbackSource?: string
 }
+
+const MAX_PENDING_ATTACHMENTS = 16
+const ATTACHMENT_PREPARE_CONCURRENCY = 4
 
 type RollbackDraft = {
   source: string
@@ -219,6 +225,7 @@ export const state = reactive({
   // flag had to go.
   pendingQuestion: {} as Record<string, { questions: QuestionItem[] }>,
   pendingConfirm: {} as Record<string, Array<{
+    confirmID?: string
     toolName: string
     args: string
     reason: string
@@ -228,7 +235,7 @@ export const state = reactive({
     resolvedPath?: string
     pathClass?: string
     riskLevel?: string
-    resolve: (action: api.ConfirmAction) => void
+    resolve: (decision: api.ConfirmDecision) => void
   }>>,
   pendingPlanText: {} as Record<string, string>,
   turnPlanReview: {} as Record<string, boolean>,
@@ -260,6 +267,8 @@ export const state = reactive({
   // Identifies the draft injected by rollback. InputArea uses the text
   // snapshot to avoid clearing user edits when "undo rollback" is clicked.
   rollbackDraft: {} as Record<string, RollbackDraft | null>,
+  // AE-07: latest undoable file-change batch per session (null = none / dismissed).
+  fileChangeUndo: {} as Record<string, api.FileChangeSummary | null>,
   // P0-1: transient banner shown for ~3s when the
   // recoverMissingParts flow successfully merged
   // server-side parts into the trailing assistant
@@ -291,6 +300,16 @@ export const state = reactive({
     error: string | null
     data: api.ContextInspector | null
   },
+  // AE-03: last completed turn's token/cache usage per session
+  // (Inspector "本回合" card; cleared on session delete).
+  lastTurnUsage: {} as Record<string, {
+    tokens_in: number
+    tokens_out: number
+    cache_hit_tokens?: number
+    cache_miss_tokens?: number
+    elapsed?: string
+    model?: string
+  } | null>,
   // P1-4: per-session, per-user-message regen sibling
   // cache. Keyed by [sessionId][userMsgId] = the full
   // RepliesResponse from GET .../replies. Loaded on
@@ -321,6 +340,12 @@ export const state = reactive({
   // (or flash the empty state while history is in flight).
   viewLoading: false,
   viewLoadingHint: '' as string,
+  // Pending search-result jump target. SessionSidebar's message
+  // search sets this after switching sessions; ChatWindow watches
+  // it, scrolls the matching [data-msg-id] bubble into view, and
+  // flashes a highlight. `requestID` makes repeated jumps to the same
+  // message re-trigger the watcher and settle the correct caller.
+  searchJumpTarget: null as { sessionID: string; messageID: number; requestID: number } | null,
 })
 
 export const currentMessages = computed(() =>
@@ -883,8 +908,31 @@ export async function loadProjects() {
   }
 }
 
+// Delight-2: register a folder as a project, switch into it, and
+// open a blank session. Used by drag-drop of Explorer folders.
+export async function registerProjectAndOpen(path: string, name?: string): Promise<void> {
+  const trimmed = path.trim()
+  if (!trimmed) throw new Error('项目路径为空')
+  const existing = state.projects.find(p => sameProjectPath(p.path, trimmed))
+  if (!existing) {
+    const projectName = (name || basenameFromPath(trimmed)).trim() || basenameFromPath(trimmed)
+    await api.addProject(projectName, trimmed)
+    await loadProjects()
+  }
+  const matched = state.projects.find(p => sameProjectPath(p.path, trimmed))
+  const targetPath = matched?.path || trimmed
+  if (state.activeProjectPath !== targetPath) {
+    await setActiveProject(targetPath)
+  }
+  await createSession()
+}
+
 export async function setActiveProject(path: string) {
   if (path === state.activeProjectPath) return
+  const activeSearchJump = state.searchJumpTarget
+  if (activeSearchJump) {
+    completeSearchJump(activeSearchJump.requestID, '定位期间项目已切换，请重试')
+  }
   const startedAt = nowMs()
   await acquireViewLoad('正在切换项目…')
   try {
@@ -931,6 +979,10 @@ export async function switchSession(id: string) {
 }
 
 async function switchSessionBody(id: string) {
+  const activeSearchJump = state.searchJumpTarget
+  if (activeSearchJump && activeSearchJump.sessionID !== id) {
+    completeSearchJump(activeSearchJump.requestID, '定位期间会话已切换，请重试')
+  }
   state.currentID = id
   state.composerExpandedDock = null
   state.lastSessionByProject[state.activeProjectPath] = id
@@ -975,6 +1027,7 @@ async function switchSessionBody(id: string) {
       const liveIDs = new Set(liveMessages.map(m => m.id).filter((messageID): messageID is number => messageID != null))
       const history = dedupMessagesByKey([], r.messages).filter(m => !liveIDs.has(m.id ?? 0))
       state.sessionMessages[id] = [...history, ...liveMessages]
+      seedLastTurnUsage(id, state.sessionMessages[id])
       state.sessionPaging[id] = {
         // Prefer the seq-based cursor (stable across
         // rollback/undo). Fall back to the legacy id-based
@@ -1050,21 +1103,18 @@ async function switchSessionBody(id: string) {
   void refreshContextUsage(id)
 }
 
-// loadMoreMessages fetches the next page of older history
-// for the given session and prepends the result to the
-// in-memory message list. Returns true if more pages remain
-// (caller can chain another loadMoreMessages). Returns false
-// when the session is at the start of its history or when
-// a load is already in flight.
-//
-// Idempotency: if a load is already in flight (e.g. the
-// user scrolled to the top multiple times in quick
-// succession) the second call returns false without making
-// an HTTP request — protects against request amplification
-// from rapid scroll events.
-export async function loadMoreMessages(id: string): Promise<boolean> {
+type LoadMoreMessagesOptions = {
+  throwOnError?: boolean
+}
+
+// 同一会话的并发翻页共享同一个请求，避免滚动加载与搜索定位互相踩踏。
+// Concurrent pagination for one session shares a single request so scroll
+// loading and search-result location cannot race each other's cursor.
+const historyPageLoads = new Map<string, Promise<boolean>>()
+
+async function fetchMoreMessagesPage(id: string): Promise<boolean> {
   const paging = state.sessionPaging[id]
-  if (!paging || !paging.hasMore || paging.loading) return false
+  if (!paging || !paging.hasMore) return false
   paging.loading = true
   try {
     // Prefer the seq-based cursor when the server
@@ -1117,11 +1167,163 @@ export async function loadMoreMessages(id: string): Promise<boolean> {
     paging.oldestId = r.oldest_id
     paging.hasMore = r.has_more
     return r.has_more
-  } catch (e) {
-    console.warn('loadMoreMessages failed:', e)
-    return false
   } finally {
     paging.loading = false
+  }
+}
+
+// loadMoreMessages 加载下一页更早历史；搜索定位可要求将错误向上抛出。
+// loadMoreMessages fetches the next older page; search navigation may opt in
+// to propagated failures while ordinary infinite scroll remains best-effort.
+export async function loadMoreMessages(id: string, options: LoadMoreMessagesOptions = {}): Promise<boolean> {
+  let load = historyPageLoads.get(id)
+  if (!load) {
+    load = fetchMoreMessagesPage(id)
+    historyPageLoads.set(id, load)
+    void load.finally(() => {
+      if (historyPageLoads.get(id) === load) historyPageLoads.delete(id)
+    }).catch(() => { /* 由下方的调用者分支处理 / handled by caller branch below */ })
+  }
+  try {
+    return await load
+  } catch (error) {
+    console.warn('loadMoreMessages failed:', error)
+    if (options.throwOnError) throw error
+    return false
+  }
+}
+
+let searchJumpRequestID = 0
+// 5 秒是 DOM 回执丢失时的故障边界，不是高亮动画时长。
+// Five seconds bounds a missing DOM acknowledgement; it is not an animation duration.
+const SEARCH_JUMP_ACK_TIMEOUT_MS = 5000
+let pendingSearchJump: {
+  requestID: number
+  resolve: () => void
+  reject: (error: Error) => void
+  timeout: ReturnType<typeof setTimeout>
+} | null = null
+
+function searchBubbleAnchor(messages: Message[] | undefined, sourceMessageID: number): number | null {
+  const message = messages?.find(candidate =>
+    candidate.id === sourceMessageID || candidate.source_message_ids?.includes(sourceMessageID),
+  )
+  return message?.id && message.id > 0 ? message.id : null
+}
+
+// 缓存会话可能在回合结束时被裁剪过；定位前重置到最新真实分页游标。
+// A cached session may have evicted old rows after a turn completed. Reset to
+// the server's latest real page before walking backwards so hasMore=false from
+// an earlier full-history read cannot make a still-existing hit unreachable.
+async function resetSearchHistoryPaging(sessionID: string) {
+  const page = await api.listMessages(sessionID, { limit: initialHistoryLimit })
+  for (const message of page.messages) {
+    if (message.parts) scrubMessagePhantoms(message)
+  }
+  state.sessionMessages[sessionID] = dedupMessagesByKey(
+    state.sessionMessages[sessionID] || [],
+    page.messages,
+  )
+  state.sessionPaging[sessionID] = {
+    oldestSeq: page.oldest_seq ?? 0,
+    oldestId: page.oldest_id,
+    hasMore: page.has_more,
+    loading: false,
+  }
+  convertAndStripScreenshots(sessionID)
+}
+
+// completeSearchJump 由 ChatWindow 在 DOM 滚动与高亮完成（或失败）后回执。
+// completeSearchJump lets ChatWindow settle the navigation only after the
+// target DOM anchor has actually been scrolled to and highlighted.
+export function completeSearchJump(requestID: number, error?: string) {
+  if (state.searchJumpTarget?.requestID === requestID) {
+    state.searchJumpTarget = null
+  }
+  if (!pendingSearchJump || pendingSearchJump.requestID !== requestID) return
+  const pending = pendingSearchJump
+  pendingSearchJump = null
+  clearTimeout(pending.timeout)
+  if (error) pending.reject(new Error(error))
+  else pending.resolve()
+}
+
+let historyJumpDepth = 0
+
+// historyJumpInProgress is true while a bookmark or guide click is
+// loading older pages. Chat scroll followers must not snap to the
+// bottom during that walk.
+export function historyJumpInProgress(): boolean {
+  return historyJumpDepth > 0
+}
+
+// jumpToBookmarkedMessage opens the pin's project and session, then scrolls
+// to that message even when it lives on an older history page.
+export async function jumpToBookmarkedMessage(sessionID: string, messageID: number, projectPath: string): Promise<void> {
+  const target = projectPath || ''
+  if (target !== (state.activeProjectPath || '')) {
+    await setActiveProject(target)
+  }
+  await jumpToSearchResult(sessionID, messageID)
+}
+
+export async function jumpToSearchResult(sessionID: string, messageID: number): Promise<void> {
+  if (!sessionID || !messageID || messageID <= 0) {
+    throw new Error('搜索结果缺少有效的消息定位信息')
+  }
+  historyJumpDepth++
+  try {
+  await switchSession(sessionID)
+  if (state.currentID !== sessionID) {
+    throw new Error('定位期间会话已切换，请重试')
+  }
+  // switchSession early-returns when the session is already active and
+  // loaded, so by this point sessionMessages[sessionID] reflects at
+  // least the most recent page.
+  const visitedCursors = new Set<string>()
+  let anchorID = searchBubbleAnchor(state.sessionMessages[sessionID], messageID)
+  if (!anchorID) {
+    await resetSearchHistoryPaging(sessionID)
+    anchorID = searchBubbleAnchor(state.sessionMessages[sessionID], messageID)
+  }
+  while (!anchorID) {
+    if (state.currentID !== sessionID) {
+      throw new Error('定位期间会话已切换，请重试')
+    }
+    const paging = state.sessionPaging[sessionID]
+    if (!paging?.hasMore) {
+      throw new Error('该消息已被删除、归档或不再可见')
+    }
+    const cursor = paging.oldestSeq > 0
+      ? `seq:${paging.oldestSeq}`
+      : `id:${paging.oldestId}`
+    if (visitedCursors.has(cursor)) {
+      throw new Error('历史分页游标未继续向前推进')
+    }
+    visitedCursors.add(cursor)
+    await loadMoreMessages(sessionID, { throwOnError: true })
+    anchorID = searchBubbleAnchor(state.sessionMessages[sessionID], messageID)
+  }
+
+  if (state.currentID !== sessionID) {
+    throw new Error('定位期间会话已切换，请重试')
+  }
+
+  if (pendingSearchJump) {
+    completeSearchJump(pendingSearchJump.requestID, '已被新的搜索定位请求取代')
+  }
+  const requestID = ++searchJumpRequestID
+  const completion = new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      completeSearchJump(requestID, '页面未在预期时间内完成消息定位')
+    }, SEARCH_JUMP_ACK_TIMEOUT_MS)
+    pendingSearchJump = { requestID, resolve, reject, timeout }
+  })
+  state.searchJumpTarget = { sessionID, messageID: anchorID, requestID }
+  await completion
+  await nextTick()
+  } finally {
+    historyJumpDepth--
   }
 }
 
@@ -1316,10 +1518,12 @@ export async function deleteSessionById(id: string) {
   delete state.pendingInputRevision[id]
   delete state.rollbackDraft[id]
   delete state.rollbackUndo[id]
+  delete state.fileChangeUndo[id]
+  delete state.lastTurnUsage[id]
   delete state.pendingQuestion[id]
   const cfms = state.pendingConfirm[id]
   if (cfms && cfms.length > 0) {
-    for (const pc of cfms) pc.resolve('reject')
+    for (const pc of cfms) pc.resolve({ action: 'reject' })
     delete state.pendingConfirm[id]
   }
   if (state.streaming[id]) {
@@ -1482,35 +1686,90 @@ function rollbackDraftAttachments(target: Message, deletedMessages: Message[]): 
 }
 
 export function addAttachment(file: File): Promise<void> {
+  return addAttachments([file])
+}
+
+// addAttachments synchronously reserves ordered preview slots, then prepares no
+// more than four files concurrently. This prevents a large paste from racing
+// the attachment strip or overwhelming the upload endpoint.
+export function addAttachments(files: Iterable<File>): Promise<void> {
   const id = state.currentID
   if (!id) return Promise.resolve()
   if (!state.pendingAttachments[id]) state.pendingAttachments[id] = []
-  const guessedKind = guessKind(file.name, file.type || '')
-  const blobURL = URL.createObjectURL(file)
-  const placeholder: PendingAttachment = {
-    id: '', name: file.name, size: file.size, mime: file.type || '',
-    kind: guessedKind,
-    _file: file, _blobURL: blobURL, _uploading: true, _error: false,
-    _previewURL: blobURL,
+  const selected = Array.from(files)
+  const capacity = Math.max(0, MAX_PENDING_ATTACHMENTS - state.pendingAttachments[id].length)
+  const accepted = selected.slice(0, capacity)
+  const dropped = selected.length - accepted.length
+  const jobs: Array<{
+    placeholder: PendingAttachment
+    file: File
+    guessedKind: string
+    resolve: () => void
+    reject: (error: unknown) => void
+  }> = []
+
+  for (const file of accepted) {
+    const guessedKind = guessKind(file.name, file.type || '')
+    const blobURL = URL.createObjectURL(file)
+    const placeholder: PendingAttachment = {
+      id: '', name: file.name, size: file.size, mime: file.type || '',
+      kind: guessedKind,
+      _file: file, _blobURL: blobURL, _uploading: true, _error: false,
+      _previewURL: blobURL,
+    }
+    const ready = new Promise<void>((resolve, reject) => {
+      jobs.push({ placeholder, file, guessedKind, resolve, reject })
+    })
+    // The send path observes _ready later. Attach a passive rejection handler
+    // now so an upload failure before Send does not become an unhandled promise.
+    void ready.catch(() => {})
+    placeholder._ready = ready
+    state.pendingAttachments[id].push(placeholder)
   }
-  state.pendingAttachments[id].push(placeholder)
-  const ready = prepareAttachment(placeholder, file, guessedKind)
-  placeholder._ready = ready
-  return ready
+
+  void runAttachmentPreparationQueue(jobs, id)
+  return Promise.all(jobs.map(job => job.placeholder._ready)).then(() => {
+    if (dropped) throw new Error(`最多只能添加 ${MAX_PENDING_ATTACHMENTS} 个附件`)
+  })
 }
 
-async function prepareAttachment(placeholder: PendingAttachment, file: File, guessedKind: string): Promise<void> {
+async function runAttachmentPreparationQueue(
+  jobs: Array<{ placeholder: PendingAttachment; file: File; guessedKind: string; resolve: () => void; reject: (error: unknown) => void }>,
+  sessionID: string,
+): Promise<void> {
+  let cursor = 0
+  const worker = async () => {
+    while (cursor < jobs.length) {
+      const job = jobs[cursor++]
+      try {
+        await prepareAttachment(job.placeholder, job.file, job.guessedKind, sessionID)
+        job.resolve()
+      } catch (error) {
+        job.reject(error)
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(ATTACHMENT_PREPARE_CONCURRENCY, jobs.length) }, worker))
+}
+
+function canInlineAttachmentFallback(kind: string): boolean {
+  return kind === 'image' || kind === 'audio' || kind === 'video' || kind === 'text'
+}
+
+async function prepareAttachment(placeholder: PendingAttachment, file: File, guessedKind: string, sessionID: string): Promise<void> {
   // Cache a base64 data URL up-front so the message can be
   // displayed + sent without re-reading the file from disk.
   // For text attachments this is just the utf-8 text; for binary
   // (images/audio/video) it's the data: URL the LLM wants anyway.
-  try {
-    placeholder._dataURL = await readAsDataURL(file, guessedKind)
-  } catch {
-    // Non-fatal: the upload fallback still gives us a server URL.
+  if (canInlineAttachmentFallback(guessedKind)) {
+    try {
+      placeholder._dataURL = await readAsDataURL(file, guessedKind)
+    } catch {
+      // Non-fatal: the upload fallback still gives us a server URL.
+    }
   }
   try {
-    const meta = await api.uploadFile(file)
+    const meta = await api.uploadFile(file, sessionID)
     placeholder.id = meta.id
     placeholder.kind = meta.kind || guessedKind
     placeholder.mime = meta.mime
@@ -1522,10 +1781,11 @@ async function prepareAttachment(placeholder: PendingAttachment, file: File, gue
     // server URL after upload completed.)
   } catch (e: any) {
     placeholder._uploading = false
-    if (placeholder._dataURL) {
+    if (placeholder._dataURL && canInlineAttachmentFallback(guessedKind)) {
       return
     }
     placeholder._error = true
+    placeholder._errorMessage = e?.message || '上传失败'
     throw e
   }
 }
@@ -1767,6 +2027,8 @@ export function appendLocalUserMessage(sessionId: string, message: Message) {
 export function startStream(id: string, ctrl: AbortController) {
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
   delete state.turnPlanReview[id]
+  // Hide previous-turn file undo while the new turn runs; refreshed on done.
+  state.fileChangeUndo[id] = null
   // Push a placeholder assistant message immediately. The
   // MessageBubble's loading-dots placeholder requires the
   // message object to exist *before* the first content
@@ -2122,6 +2384,56 @@ function closeTrailingThinking(parts: MessagePart[] | undefined) {
   }
 }
 
+// 每个 parts 列表都记录当前 LLM 回合开始时的长度，不把运行态边界写入持久化结构。
+// Each parts array remembers the current LLM-round start length without
+// leaking an ephemeral attempt marker into the persisted MessagePart model.
+const streamAttemptStarts = new WeakMap<MessagePart[], number>()
+
+function markStreamAttemptStart(parts: MessagePart[]) {
+  streamAttemptStarts.set(parts, parts.length)
+}
+
+function startsBeforeCurrentAttempt(parts: MessagePart[]): boolean {
+  const start = streamAttemptStarts.get(parts)
+  return start !== undefined && parts.length <= start
+}
+
+function resetCurrentStreamAttempt(parts: MessagePart[]) {
+  const markedStart = streamAttemptStarts.get(parts)
+  if (markedStart !== undefined) {
+    // 只删除当前 round 边界之后的流式文本 / AE-01 临时工具卡，保留早先成功的 ReAct 轮次。
+    // Remove streamed prose and provisional tool cards after the current round
+    // boundary, preserving successful text/thinking/tools from earlier rounds.
+    for (let i = parts.length - 1; i >= markedStart; i--) {
+      const p = parts[i]
+      if (p.kind === 'text' || p.kind === 'thinking') {
+        parts.splice(i, 1)
+        continue
+      }
+      if (p.kind === 'tool' && p.status === 'start') {
+        parts.splice(i, 1)
+      }
+    }
+    return
+  }
+
+  // 兼容旧服务端：没有 round-start phase 时仅清理连续的尾部流式 part。
+  // Older-server fallback: without a round-start phase, remove only the
+  // contiguous streamed tail and stop at the nearest structural part.
+  while (parts.length > 0) {
+    const last = parts[parts.length - 1]
+    if (last.kind === 'text' || last.kind === 'thinking') {
+      parts.pop()
+      continue
+    }
+    if (last.kind === 'tool' && last.status === 'start') {
+      parts.pop()
+      continue
+    }
+    break
+  }
+}
+
 function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
   closeTrailingThinking(parts)
@@ -2155,7 +2467,7 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
   // globally. The scrub is synchronous so Vue's next
   // tick won't render the phantom.
   const cleanedDelta = scrubPhantomError(delta)
-  if (parts.length === 0 || parts[parts.length - 1].kind !== 'text') {
+  if (parts.length === 0 || parts[parts.length - 1].kind !== 'text' || startsBeforeCurrentAttempt(parts)) {
     if (cleanedDelta.trim()) {
       parts.push({ kind: 'text', text: cleanedDelta })
     }
@@ -2193,7 +2505,7 @@ function appendTextPart(m: Message, delta: string, target?: MessagePart[] | null
 
 function appendThinkingPart(m: Message, delta: string, target?: MessagePart[] | null) {
   const parts = (target ?? m.parts)!
-  if (parts.length === 0 || parts[parts.length - 1].kind !== 'thinking') {
+  if (parts.length === 0 || parts[parts.length - 1].kind !== 'thinking' || startsBeforeCurrentAttempt(parts)) {
     parts.push({ kind: 'thinking', text: delta, streaming: true })
   } else {
     const p = parts[parts.length - 1] as any
@@ -2265,6 +2577,11 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         }
       }
       break
+    case 'stream_reset': {
+      const parts = sub ? sub.parts : m.parts!
+      resetCurrentStreamAttempt(parts)
+      break
+    }
     case 'content_rewrite': {
       // Post-stream redactor rewrote the assistant's trailing
       // text. Replace the existing trailing text part in place
@@ -2383,77 +2700,77 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       const parts = sub ? sub.parts : m.parts!
       if (!ev.tool_name) break
       closeTrailingThinking(parts)
+      // AE-01: append a tool-args fragment while the LLM is still
+      // generating the call. Create the start card if needed.
+      if (ev.tool_status === 'args') {
+        const delta = ev.tool_args || ''
+        if (!delta && !ev.tool_id) break
+        let target: ToolPart | null = null
+        for (let i = parts.length - 1; i >= 0; i--) {
+          const p = parts[i]
+          if (p.kind !== 'tool' || p.status !== 'start') continue
+          if (ev.tool_id ? p.tool_id === ev.tool_id : p.name === ev.tool_name) {
+            target = p
+            break
+          }
+        }
+        if (!target) {
+          target = {
+            kind: 'tool',
+            id: ev.tool_name,
+            tool_id: ev.tool_id,
+            name: ev.tool_name,
+            args: '',
+            status: 'start',
+          }
+          parts.push(target)
+        }
+        if (delta) target.args = (target.args || '') + delta
+        break
+      }
       if (ev.tool_status === 'start') {
-        // When tool_id is present, use it as the unique key
-        // and never reuse the last part (two calls to the
-        // same tool name are distinct). For legacy streams
-        // without tool_id, fall back to name-based reuse.
-        if (ev.tool_id) {
-          if (parts.length > 0) {
-            const last = parts[parts.length - 1]
-            if (last.kind === 'tool' && last.status === 'start' && last.tool_id === ev.tool_id) {
-              last.args = ev.tool_args
-            } else {
-              parts.push({
-                kind: 'tool',
-                id: ev.tool_name,
-                tool_id: ev.tool_id,
-                name: ev.tool_name,
-                args: ev.tool_args,
-                status: 'start',
-              })
-            }
-          } else {
-            parts.push({
-              kind: 'tool',
-              id: ev.tool_name,
-              tool_id: ev.tool_id,
-              name: ev.tool_name,
-              args: ev.tool_args,
-              status: 'start',
-            })
-          }
+        // The preview card is created as soon as the model starts a
+        // call. Later tools in the same batch sit after it, so the
+        // final start must find that card by id instead of only
+        // looking at the last part. A miss used to insert a second
+        // "执行中" card that never received the result.
+        const open = findOpenToolCard(parts, ev.tool_id, ev.tool_name)
+        if (open) {
+          if (ev.tool_args) open.args = ev.tool_args
         } else {
-          const last = parts[parts.length - 1]
-          if (last && last.kind === 'tool' && last.status === 'start' && last.name === ev.tool_name) {
-            last.args = ev.tool_args
-          } else {
-            parts.push({
-              kind: 'tool',
-              id: ev.tool_name,
-              name: ev.tool_name,
-              args: ev.tool_args,
-              status: 'start',
-            })
-          }
+          parts.push({
+            kind: 'tool',
+            id: ev.tool_name,
+            tool_id: ev.tool_id,
+            name: ev.tool_name,
+            args: ev.tool_args,
+            status: 'start',
+          })
         }
       } else {
         // 'ok' / 'warn' / 'error' — exact match by tool_id,
         // fall back to name for legacy streams.
-        let found = false
-        for (let i = parts.length - 1; i >= 0; i--) {
-          const p = parts[i]
-          if (p.kind !== 'tool') continue
-          if ((ev.tool_id && p.tool_id === ev.tool_id) ||
-              (!ev.tool_id && p.name === ev.tool_name)) {
-            p.status = (ev.tool_status as any) || 'ok'
-            // New screenshots are compact asset JSON; legacy screenshot data
-            // URLs are converted before entering the reactive map.
-            p.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
-            p.error = ev.tool_error
-            p.elapsed = ev.tool_elapsed
-              if (ev.tool_args) p.args = ev.tool_args
-              if (ev.tool_context_refs) p.context_refs = ev.tool_context_refs
-              // Server-side truncation marker: the full body (>32
-            // KiB) must be fetched on demand, never stored here.
-            if (ev.tool_result_truncated) {
-              ;(p as any).result_truncated = true
-              ;(p as any).result_full_len = ev.tool_result_full_len
-            }
-            found = true
-            break
+        const found = settleOpenToolCards(parts, {
+          tool_id: ev.tool_id,
+          tool_name: ev.tool_name,
+          tool_args: ev.tool_args,
+          tool_status: ev.tool_status,
+          tool_elapsed: ev.tool_elapsed,
+          tool_result_truncated: ev.tool_result_truncated,
+          tool_result_full_len: ev.tool_result_full_len,
+          tool_context_refs: ev.tool_context_refs,
+        }, (card) => {
+          card.status = (ev.tool_status as ToolPart['status']) || 'ok'
+          card.result = dataURLToBlobURL(ev.tool_result_full || ev.tool_result)
+          card.error = ev.tool_error
+          card.elapsed = ev.tool_elapsed
+          if (ev.tool_args) card.args = ev.tool_args
+          if (ev.tool_context_refs) card.context_refs = ev.tool_context_refs
+          if (ev.tool_result_truncated) {
+            card.result_truncated = true
+            card.result_full_len = ev.tool_result_full_len
           }
-        }
+        })
         if (!found) {
           parts.push({
             kind: 'tool',
@@ -2542,19 +2859,32 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
         if (payload) {
           try {
             const todos: TodoItem[] = JSON.parse(payload)
-            if (Array.isArray(todos)) {
+            if (Array.isArray(todos) && todos.length) {
               state.sessionTodos[id] = todos
+              const thread = state.sessionMessages[id] || []
+              for (let i = thread.length - 1; i >= 0; i--) {
+                if (thread[i].role === 'user') {
+                  thread[i].turn_todos = todos
+                  break
+                }
+              }
             }
           } catch { /* not JSON, ignore */ }
         }
       }
       break
     }
-	    case 'phase':
-	      if (!ev.sub_agent && ev.phase === 'plan' && (ev.step === 'plan-mode' || ev.step === 'auto-plan')) {
-	        state.turnPlanReview[id] = true
-	      }
-	      // Sub-agent lifecycle: open / close the nested card.
+    case 'phase':
+      // `round-N` 是新一轮 LLM attempt 的明确边界；重试时只能回滚该边界后的流式 part。
+      // An exact `round-N` phase marks the next LLM attempt boundary; a
+      // retry may roll back only streamed parts appended after this point.
+      if (ev.phase === 'llm' && /^round-\d+$/.test(ev.step || '')) {
+        markStreamAttemptStart(sub ? sub.parts : m.parts!)
+      }
+      if (!ev.sub_agent && ev.phase === 'plan' && (ev.step === 'plan-mode' || ev.step === 'auto-plan')) {
+        state.turnPlanReview[id] = true
+      }
+      // Sub-agent lifecycle: open / close the nested card.
       // The sub-agent runner emits synthetic start/ok/err
       // phase events with sub_agent=true and
       // sub_agent_status set. These are routed through
@@ -2608,9 +2938,23 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       delete state.streaming[id]
       if (ev.tokens_in != null) m.tokens_in = ev.tokens_in
       if (ev.tokens_out != null) m.tokens_out = ev.tokens_out
+      // AE-03: only stamp cache when the provider reported it
+      // (wire uses present-or-absent pointers, not zero-as-missing).
+      if (ev.cache_hit_tokens != null || ev.cache_miss_tokens != null) {
+        m.cache_hit_tokens = ev.cache_hit_tokens ?? 0
+        m.cache_miss_tokens = ev.cache_miss_tokens ?? 0
+      }
       if (ev.elapsed) m.elapsed = ev.elapsed
       if (ev.provider) m.provider = ev.provider
       if (ev.model) m.model = ev.model
+      state.lastTurnUsage[id] = {
+        tokens_in: m.tokens_in || 0,
+        tokens_out: m.tokens_out || 0,
+        cache_hit_tokens: m.cache_hit_tokens,
+        cache_miss_tokens: m.cache_miss_tokens,
+        elapsed: m.elapsed,
+        model: m.model,
+      }
       // Free the per-message live-status array. The stream
       // is over; the live status bar is no longer shown.
       // Without this, _statusText would stay around for
@@ -2689,6 +3033,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       // P4-x: turn finished — refresh the Inspector context card
       // so the estimate reflects the tokens this turn added.
       void refreshContextUsage(id)
+      // AE-07: surface "undo this turn's file writes" when the journal has entries.
+      if (!sub) void refreshFileChangeUndo(id)
       break
     case 'question':
       // The LLM is asking the user a question. Two emit
@@ -2793,6 +3139,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
           // ones defensively so an older server that
           // doesn't send them still works.
           const cfm = JSON.parse(ev.tool_confirm_json) as {
+            confirm_id?: string
             tool_name: string
             args: string
             reason: string
@@ -2800,9 +3147,10 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
             path_class?: string
             risk_level?: string
           }
-          new Promise<api.ConfirmAction>((resolve) => {
+          new Promise<api.ConfirmDecision>((resolve) => {
             if (!state.pendingConfirm[id]) state.pendingConfirm[id] = []
             state.pendingConfirm[id].push({
+              confirmID: cfm.confirm_id,
               toolName: cfm.tool_name,
               args: cfm.args,
               reason: cfm.reason,
@@ -2811,8 +3159,8 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
               riskLevel: cfm.risk_level,
               resolve,
             })
-          }).then((action) => {
-            submitConfirmResponseInner(id, action)
+          }).then((decision) => {
+            submitConfirmResponseInner(id, cfm.confirm_id, decision)
           })
           notifyManager.play('confirm')
           notifyManager.notify('沙箱请求', `批准 ${cfm.tool_name}?`)
@@ -2842,6 +3190,7 @@ export function appendStreamEvent(id: string, ev: api.StreamEvent) {
       if (ev.trace_id) {
         m.traceId = ev.trace_id
       }
+      if (ev.elapsed) m.elapsed = ev.elapsed
       // 提示音：对话出错
       expirePendingQuestion(id)
       notifyManager.play('error')
@@ -3407,10 +3756,13 @@ export function submitQuestionAnswer(answers: Record<string, string>) {
   }
 }
 
-async function submitConfirmResponseInner(id: string, action: api.ConfirmAction) {
+async function submitConfirmResponseInner(id: string, confirmID: string | undefined, decision: api.ConfirmDecision) {
   try {
-    await api.submitConfirmResponse(id, action !== 'reject', action)
-    if (action === 'always') {
+    const result = await api.submitConfirmResponse(id, decision.action !== 'reject', decision.action, confirmID, {
+      styleId: decision.styleId,
+      newStyleLabel: decision.newStyleLabel,
+    })
+    if (result.action === 'always' && !result.explicit) {
       state.sessionMeta[id] = {
         ...state.sessionMeta[id],
         permission_level: 'full',
@@ -3418,23 +3770,21 @@ async function submitConfirmResponseInner(id: string, action: api.ConfirmAction)
       state.lastPermissionLevel = 'full'
     }
   } catch {
-    // server already unblocked via resolve
+    // The server keeps an unmatched request pending; a later SSE retry or
+    // session reload can surface it again.
   }
 }
 
-export function submitToolConfirm(action: api.ConfirmAction) {
+export function submitToolConfirm(action: api.ConfirmAction, style?: { styleId?: string; newStyleLabel?: string }) {
   const items = state.pendingConfirm[state.currentID]
   if (items && items.length > 0) {
     const pc = items.shift()!
     if (items.length === 0) delete state.pendingConfirm[state.currentID]
-    pc.resolve(action)
-    if (action === 'always') {
-      state.sessionMeta[state.currentID] = {
-        ...state.sessionMeta[state.currentID],
-        permission_level: 'full',
-      }
-      state.lastPermissionLevel = 'full'
-    }
+    pc.resolve({
+      action,
+      styleId: style?.styleId,
+      newStyleLabel: style?.newStyleLabel,
+    })
   }
 }
 
@@ -3483,6 +3833,31 @@ export const currentAttachments = computed(() =>
   state.pendingAttachments[state.currentID] || [],
 )
 
+// AE-03: last completed turn usage for the Inspector card.
+export const currentLastTurnUsage = computed(() =>
+  state.lastTurnUsage[state.currentID] || null,
+)
+
+function seedLastTurnUsage(sessionId: string, messages: Message[]) {
+  if (!sessionId || state.lastTurnUsage[sessionId]) return
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m.role !== 'assistant') continue
+    if (!(m.tokens_in || m.tokens_out || m.cache_hit_tokens != null || m.cache_miss_tokens != null)) {
+      continue
+    }
+    state.lastTurnUsage[sessionId] = {
+      tokens_in: m.tokens_in || 0,
+      tokens_out: m.tokens_out || 0,
+      cache_hit_tokens: m.cache_hit_tokens,
+      cache_miss_tokens: m.cache_miss_tokens,
+      elapsed: m.elapsed,
+      model: m.model,
+    }
+    return
+  }
+}
+
 // --- Rollback ---
 
 export const currentRollbackBanner = computed(() => {
@@ -3490,6 +3865,49 @@ export const currentRollbackBanner = computed(() => {
   if (!undo || !undo.messages.length) return null
   return { count: undo.displayMessages.length }
 })
+
+// AE-07: banner for undoing the latest agent turn's file mutations.
+export const currentFileChangeBanner = computed(() => {
+  const summary = state.fileChangeUndo[state.currentID]
+  if (!summary || !summary.count) return null
+  return {
+    count: summary.count,
+    entries: (summary.entries || []).map((entry) => ({
+      path: entry.path,
+      name: basenameFromPath(entry.path) || entry.path,
+      added: entry.added || 0,
+      deleted: entry.deleted || 0,
+    })),
+  }
+})
+
+export async function refreshFileChangeUndo(sessionId: string) {
+  if (!sessionId) return
+  try {
+    const summary = await api.getFileChanges(sessionId)
+    state.fileChangeUndo[sessionId] = summary?.count ? summary : null
+  } catch {
+    // Best-effort; leave previous banner state alone on network blips.
+  }
+}
+
+export async function undoFileChanges(sessionId: string) {
+  if (!sessionId) return
+  const result = await api.undoFileChanges(sessionId)
+  // After undo, peek again so stacked turns can surface the previous batch.
+  try {
+    const summary = await api.getFileChanges(sessionId)
+    state.fileChangeUndo[sessionId] = summary?.count ? summary : null
+  } catch {
+    state.fileChangeUndo[sessionId] = null
+  }
+  return result
+}
+
+export function dismissFileChangeUndo(sessionId: string) {
+  if (!sessionId) return
+  state.fileChangeUndo[sessionId] = null
+}
 
 export const currentPendingInput = computed(() =>
   state.pendingInput[state.currentID] || '',
@@ -3650,6 +4068,17 @@ export function dismissRollback(sessionId: string) {
   state.rollbackUndo[sessionId] = null
   state.rollbackDraft[sessionId] = null
   state.pendingInput[sessionId] = ''
+}
+
+// Prefill the composer for the active session without sending.
+// Used by empty-state guide cards and scene capsules. Bumping
+// revision wakes InputArea's watch even when the text is identical
+// to a previous inject (user cleared then clicked the same card).
+export function prefillComposer(text: string, sessionId?: string) {
+  const id = sessionId || state.currentID
+  if (!id) return
+  state.pendingInput[id] = text
+  state.pendingInputRevision[id] = (state.pendingInputRevision[id] || 0) + 1
 }
 
 // --- Fork ---

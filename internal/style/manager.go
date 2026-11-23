@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type Style string
@@ -198,6 +199,124 @@ func (m *Manager) Update(id, label, prompt, memory string) error {
 	args = append(args, id)
 	_, err := m.db.Exec(`UPDATE styles SET `+strings.Join(sets, ", ")+` WHERE id=?`, args...)
 	return err
+}
+
+const maxStyleMemoryRunes = 4000
+
+// AppendMemory adds one fact to a style, including built-in personas.
+// The speaking prompt stays unchanged. Duplicate lines are ignored.
+func (m *Manager) AppendMemory(id, line string) error {
+	if m == nil || m.db == nil {
+		return fmt.Errorf("style manager unavailable")
+	}
+	id = normaliseStyleID(id)
+	if id == "" || !m.exists(id) {
+		return fmt.Errorf("unknown style: %s", id)
+	}
+	line = strings.Join(strings.Fields(line), " ")
+	if line == "" {
+		return fmt.Errorf("记忆内容不能为空")
+	}
+	if utf8.RuneCountInString(line) > 200 {
+		return fmt.Errorf("单条记忆不能超过 200 字")
+	}
+	cur, err := m.GetMemory(Style(id))
+	if err != nil {
+		return err
+	}
+	bullet := "- " + line
+	if strings.Contains(cur, bullet) {
+		return nil
+	}
+	next := strings.TrimSpace(cur)
+	if next != "" {
+		next += "\n"
+	}
+	next += bullet
+	if utf8.RuneCountInString(next) > maxStyleMemoryRunes {
+		return fmt.Errorf("该风格的记忆已经太长")
+	}
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = m.db.Exec(`UPDATE styles SET memory=?, updated_at=? WHERE id=?`, next, now, id)
+	return err
+}
+
+// DeleteMemoryLine removes one exact `- ` memory line. A missing line
+// is a no-op. The speaking prompt is left untouched, and deletion is
+// allowed on built-in personas the same way AppendMemory is.
+func (m *Manager) DeleteMemoryLine(id, line string) error {
+	if m == nil || m.db == nil {
+		return fmt.Errorf("style manager unavailable")
+	}
+	id = normaliseStyleID(id)
+	if id == "" || !m.exists(id) {
+		return fmt.Errorf("unknown style: %s", id)
+	}
+	line = strings.TrimSpace(line)
+	if line == "" || !strings.HasPrefix(line, "- ") {
+		return nil
+	}
+	cur, err := m.GetMemory(Style(id))
+	if err != nil {
+		return err
+	}
+	found := false
+	kept := make([]string, 0)
+	for _, row := range strings.Split(cur, "\n") {
+		if !found && strings.TrimSpace(row) == line {
+			found = true
+			continue
+		}
+		kept = append(kept, row)
+	}
+	if !found {
+		return nil
+	}
+	next := strings.TrimSpace(strings.Join(kept, "\n"))
+	now := time.Now().UTC().Format(time.RFC3339)
+	_, err = m.db.Exec(`UPDATE styles SET memory=?, updated_at=? WHERE id=?`, next, now, id)
+	return err
+}
+
+// CreateFromMemory makes a new persona whose memory is this one fact.
+func (m *Manager) CreateFromMemory(label, line string) (string, error) {
+	if m == nil {
+		return "", fmt.Errorf("style manager unavailable")
+	}
+	label = strings.TrimSpace(label)
+	if label == "" {
+		return "", fmt.Errorf("需要风格名称")
+	}
+	line = strings.Join(strings.Fields(line), " ")
+	if line == "" {
+		return "", fmt.Errorf("记忆内容不能为空")
+	}
+	base := normaliseStyleID(label)
+	if base == "" {
+		base = "style"
+	}
+	id := base
+	for n := 2; m.exists(id) || isReservedStyleID(id); n++ {
+		id = fmt.Sprintf("%s%d", base, n)
+		if n > 50 {
+			return "", fmt.Errorf("无法分配风格 id")
+		}
+	}
+	prompt := fmt.Sprintf("# %s\n\n用这个身份说话，并遵守记忆里的事实。", label)
+	created, err := m.Create(id, label, prompt, "- "+line)
+	if err != nil {
+		return "", err
+	}
+	return string(created), nil
+}
+
+func isReservedStyleID(id string) bool {
+	switch Style(id) {
+	case Cute, Guofeng, Tech, Off:
+		return true
+	default:
+		return false
+	}
 }
 
 // Delete removes a user-defined style.

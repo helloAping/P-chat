@@ -18,10 +18,10 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-. "$PSScriptRoot\version-utils.ps1"
+. (Join-Path $PSScriptRoot 'version-utils.ps1')
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$platformOS = (& "$PSScriptRoot\resolve-platform.ps1" -Name $Platform -Format os).Trim()
+$platformOS = (& (Join-Path $PSScriptRoot 'resolve-platform.ps1') -Name $Platform -Format os).Trim()
 $packagePlatform = if ($platformOS -eq "darwin") { "macos" } else { $platformOS }
 $version = (Get-Content -LiteralPath (Join-Path $root "VERSION") -Raw).Trim()
 $versionInfo = Get-PChatVersionInfo -Version $version
@@ -99,9 +99,20 @@ function Get-RelativePath {
         [Parameter(Mandatory = $true)][string]$Base,
         [Parameter(Mandatory = $true)][string]$Path
     )
-    $baseUri = [Uri]($Base.TrimEnd('\') + '\')
-    $pathUri = [Uri]$Path
-    return [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($pathUri).ToString()).Replace('/', '\')
+    $baseFull = [System.IO.Path]::GetFullPath($Base)
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    # Path.GetRelativePath exists on PowerShell 7. Windows PowerShell 5.1 keeps the URI fallback.
+    # A trailing backslash makes Unix paths look like relative URIs to MakeRelativeUri.
+    $getRelative = [System.IO.Path].GetMethod('GetRelativePath', [type[]]@([string], [string]))
+    if ($null -ne $getRelative) {
+        $relative = [System.IO.Path]::GetRelativePath($baseFull, $pathFull)
+    } else {
+        $separator = [System.IO.Path]::DirectorySeparatorChar
+        $baseUri = [Uri]($baseFull.TrimEnd('\', '/') + $separator)
+        $pathUri = [Uri]$pathFull
+        $relative = [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($pathUri).ToString())
+    }
+    return ($relative -replace '/', '\')
 }
 
 function Write-JsonNoBom {
@@ -110,6 +121,8 @@ function Write-JsonNoBom {
         [Parameter(Mandatory = $true)][string]$Path
     )
     $json = $Value | ConvertTo-Json -Depth 8
+    # Windows PowerShell 5.1 escapes < and > as \u003c and \u003e. Keep the upload placeholder literal.
+    $json = $json.Replace('\u003c', '<').Replace('\u003C', '<').Replace('\u003e', '>').Replace('\u003E', '>')
     [System.IO.File]::WriteAllText($Path, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 }
 
@@ -129,21 +142,70 @@ function Get-SHA256Hex {
     }
 }
 
+function Get-UpdateSignature {
+    param(
+        [Parameter(Mandatory = $true)][string]$Sha256,
+        [Parameter(Mandatory = $true)][string]$Kind
+    )
+    $key = [string]$env:PCHAT_UPDATE_SIGNING_KEY
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        return ""
+    }
+    $sigFile = Join-Path ([System.IO.Path]::GetTempPath()) ("pchat-sig-" + [guid]::NewGuid().ToString("n") + ".txt")
+    $env:PCHAT_SIGN_SHA256 = $Sha256
+    $env:PCHAT_SIGN_VERSION = $version
+    $env:PCHAT_SIGN_KIND = $Kind
+    $env:PCHAT_SIGN_OUTPUT = $sigFile
+    $signTool = Join-Path $root "bin\pchat-updatesign.exe"
+    Push-Location $root
+    try {
+        if (Test-Path -LiteralPath $signTool) {
+            & $signTool
+        } else {
+            & go run ./cmd/pchat-updatesign
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to sign update artifact (kind=$Kind, exit $LASTEXITCODE). The private key must match the embedded public key."
+        }
+    } finally {
+        Pop-Location
+        Remove-Item Env:PCHAT_SIGN_SHA256, Env:PCHAT_SIGN_VERSION, Env:PCHAT_SIGN_KIND, Env:PCHAT_SIGN_OUTPUT -ErrorAction SilentlyContinue
+    }
+    if (-not (Test-Path -LiteralPath $sigFile)) {
+        throw "Failed to sign update artifact (kind=$Kind). Signer did not write a signature file."
+    }
+    try {
+        $sig = [System.IO.File]::ReadAllText($sigFile).Trim()
+    } finally {
+        Remove-Item -LiteralPath $sigFile -ErrorAction SilentlyContinue
+    }
+    if ($sig -notmatch '^[A-Za-z0-9+/]+=*$') {
+        throw "Failed to sign update artifact (kind=$Kind). Signer output was not a base64 signature."
+    }
+    return $sig
+}
+
 function New-ArtifactEntry {
     param(
         [Parameter(Mandatory = $true)][string]$Kind,
         [Parameter(Mandatory = $true)][string]$Path
     )
     $file = Get-Item -LiteralPath $Path
-    return [ordered]@{
+    $sha = Get-SHA256Hex -Path $file.FullName
+    $entry = [ordered]@{
         kind     = $Kind
         platform = $packagePlatform
         arch     = $Arch
         version  = $version
         file     = $file.Name
         size     = $file.Length
-        sha256   = Get-SHA256Hex -Path $file.FullName
+        sha256   = $sha
     }
+    $sig = Get-UpdateSignature -Sha256 $sha -Kind $Kind
+    if ($sig) {
+        $entry["signature"] = $sig
+    }
+    return $entry
 }
 
 function Find-FirstExisting {
@@ -261,13 +323,13 @@ switch ($platformOS) {
             Write-Host "[package-update-zip] WARNING: macOS pchat-gui.app missing (patch zip will not contain GUI)" -ForegroundColor Yellow
         }
 
-        Assert-BinaryVersion -Label "pchat-server-darwin-amd64" -Path (Join-Path $bin "pchat-server-darwin-amd64")
-        Assert-BinaryVersion -Label "pchat-darwin-amd64" -Path (Join-Path $bin "pchat-darwin-amd64")
-        Assert-BinaryVersion -Label "pchat-updater-darwin-amd64" -Path (Join-Path $bin "pchat-updater-darwin-amd64")
+        Assert-BinaryVersion -Label "pchat-server-darwin-$Arch" -Path (Join-Path $bin "pchat-server-darwin-$Arch")
+        Assert-BinaryVersion -Label "pchat-darwin-$Arch" -Path (Join-Path $bin "pchat-darwin-$Arch")
+        Assert-BinaryVersion -Label "pchat-updater-darwin-$Arch" -Path (Join-Path $bin "pchat-updater-darwin-$Arch")
 
-        Copy-Item -LiteralPath (Join-Path $bin "pchat-server-darwin-amd64") -Destination (Join-Path $resources "pchat-server") -Force
-        Copy-Item -LiteralPath (Join-Path $bin "pchat-darwin-amd64") -Destination (Join-Path $resources "pchat") -Force
-        Copy-Item -LiteralPath (Join-Path $bin "pchat-updater-darwin-amd64") -Destination (Join-Path $resources "pchat-updater") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-server-darwin-$Arch") -Destination (Join-Path $resources "pchat-server") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-darwin-$Arch") -Destination (Join-Path $resources "pchat") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-updater-darwin-$Arch") -Destination (Join-Path $resources "pchat-updater") -Force
 
         $browserExt = Join-Path $root "cmd\pchat-server\browser-extension.zip"
         if (Test-Path -LiteralPath $browserExt) {
@@ -323,6 +385,17 @@ $createdAtUTC = (Get-Date).ToUniversalTime().ToString("s") + "Z"
 $updateURL = "<upload-url>/" + $updateArtifact.file
 $primaryArtifact = if ($setupArtifact) { $setupArtifact } else { $updateArtifact }
 $primaryURL = "<upload-url>/" + $primaryArtifact.file
+$patchEntry = [ordered]@{
+    kind     = "patch"
+    platform = $packagePlatform
+    arch     = $Arch
+    size     = $updateArtifact.size
+    sha256   = $updateArtifact.sha256
+    url      = $updateURL
+}
+if ($updateArtifact.signature) {
+    $patchEntry["signature"] = $updateArtifact.signature
+}
 $latestJson = [ordered]@{
     name          = "P-Chat"
     slug          = "p-chat"
@@ -335,17 +408,13 @@ $latestJson = [ordered]@{
     size          = $primaryArtifact.size
     sha256        = $primaryArtifact.sha256
     url           = $primaryURL
-    patch         = [ordered]@{
-        kind     = "patch"
-        platform = $packagePlatform
-        arch     = $Arch
-        size     = $updateArtifact.size
-        sha256   = $updateArtifact.sha256
-        url      = $updateURL
-    }
+    patch         = $patchEntry
+}
+if ($primaryArtifact.signature) {
+    $latestJson["signature"] = $primaryArtifact.signature
 }
 if ($setupArtifact) {
-    $latestJson["full"] = [ordered]@{
+    $fullEntry = [ordered]@{
         kind     = "full"
         platform = $packagePlatform
         arch     = $Arch
@@ -353,6 +422,13 @@ if ($setupArtifact) {
         sha256   = $setupArtifact.sha256
         url      = "<upload-url>/" + $setupArtifact.file
     }
+    if ($setupArtifact.signature) {
+        $fullEntry["signature"] = $setupArtifact.signature
+    }
+    $latestJson["full"] = $fullEntry
+}
+if (-not $env:PCHAT_UPDATE_SIGNING_KEY) {
+    Write-Host "[package-update-zip] WARNING: PCHAT_UPDATE_SIGNING_KEY unset; latest.json has no signatures and clients will reject downloads" -ForegroundColor Yellow
 }
 Write-JsonNoBom -Value $latestJson -Path $latestJsonPath
 

@@ -6,30 +6,41 @@
 // insensitively. Unknown commands fall through to the normal send
 // path so the LLM can answer "what is /foo?" questions naturally.
 
-import { h, onMounted, ref, computed, watch, nextTick } from 'vue'
-import { NInput, NButton, NSpace, NScrollbar, NPopover, NDropdown, NSelect, useDialog, useMessage, type DropdownOption } from 'naive-ui'
+import { h, onMounted, onUnmounted, ref, computed, watch, nextTick } from 'vue'
+import { NInput, NButton, NSpace, NScrollbar, NPopover, NTooltip, NDropdown, NSelect, useDialog, useMessage, type DropdownOption } from 'naive-ui'
 import CommandPalette, { type CmdSpec } from './CommandPalette.vue'
+import HeaderCat from './HeaderCat.vue'
 import ModelPicker from './ModelPicker.vue'
 import {
-  Paperclip, Send, Square, Clipboard, Volume2, VolumeX, Hammer,
-  Undo2, FileText, File, Sparkles, ChevronDown,
+  Paperclip, Send, Square, Clipboard, Volume2, Hammer,
+  Undo2, FileText, File, Sparkles, ChevronDown, ChevronUp,
   Lock, Unlock, Key, Copy, Scissors, ClipboardPaste, TextCursorInput,
-  Settings, HelpCircle, Trash2, RotateCcw, CornerDownLeft, ChevronRight,
+  Trash2, RotateCcw, CornerDownLeft, ChevronRight, Palette, Database, Bot, Film,
+  Settings, ImageIcon,
+  Code2, ListTodo, MessageSquare,
 } from './icons'
 import * as api from '../api/client'
 import {
-  state, currentMeta, currentAttachments, addAttachment, removeAttachment, clearAttachments, waitForPendingAttachments,
+  state, currentMeta, currentAttachments, addAttachments, removeAttachment, clearAttachments, waitForPendingAttachments,
   isStreaming,
   switchSession, renameSession, createSession, deleteSessionById,
   currentMessages, appendSystemMessage, loadProviders,
   currentRollbackBanner, currentPendingInput, currentPendingInputRevision, currentRollbackDraft,
-  undoRollback, dismissRollback,
+  undoRollback, dismissRollback, prefillComposer, registerProjectAndOpen,
   currentPendingConfirm, submitToolConfirm, currentTurnQueue, enqueueTurnQueue,
   deleteQueuedTurn, clearQueuedTurns, retryQueuedTurn, currentSessionWorking,
   hasQueuedTurns, markSessionActive,
   currentPendingQuestion, setComposerExpandedDock, toggleComposerExpandedDock,
   generateSessionTitle,
 } from '../stores/chat'
+import { inspectDataTransfer } from '../utils/dropActions'
+import { runStyleCompare } from '../utils/styleCompareState'
+import {
+  SCENE_CAPSULES,
+  matchScene,
+  type SceneId,
+  type TurnMode,
+} from '../utils/scenePresets'
 import type { PendingAttachment } from '../stores/chat'
 import { Pencil, Check, X } from './icons'
 import { editQueuedTurn, setTurnQueueEditing } from '../stores/chat'
@@ -37,14 +48,16 @@ import { drainQueuedConversationTurns, stopConversationTurn, submitConversationT
 import { notifyManager } from '../utils/notify'
 import { copyText } from '../utils/clipboard'
 import { dataURLToBlobURL } from '../utils/mediaPreview'
+import { isRejectedMessageRequest } from '../api/sse'
+import { mergeRejectedDraft, removeUnacceptedLocalTurn, restoreRejectedAttachments } from '../utils/rejectedTurn'
+import { planAttachmentSend } from '../utils/attachmentSend'
 
 const inputEl = ref<HTMLTextAreaElement | null>(null)
 const inputText = ref('')
-// 本地 ref 代理静音状态，确保 Vue 模板能跟踪变化
-const mute = ref(notifyManager.mute)
 
-// Textarea auto-resize: grow with content, cap at 4 lines, then scroll.
-const TEXTAREA_MAX_LINES = 4
+// Textarea auto-resize: start at 3 lines, grow with content, then scroll.
+const TEXTAREA_MIN_LINES = 3
+const TEXTAREA_MAX_LINES = 8
 function resizeTextarea() {
   const el = inputEl.value
   if (!el) return
@@ -52,23 +65,23 @@ function resizeTextarea() {
   const lineHeight = parseFloat(getComputedStyle(el).lineHeight)
   const paddingTop = parseFloat(getComputedStyle(el).paddingTop)
   const paddingBottom = parseFloat(getComputedStyle(el).paddingBottom)
+  const minH = lineHeight * TEXTAREA_MIN_LINES + paddingTop + paddingBottom
   const maxH = lineHeight * TEXTAREA_MAX_LINES + paddingTop + paddingBottom
   const scrollH = el.scrollHeight
-  el.style.height = Math.min(scrollH, maxH) + 'px'
+  el.style.height = Math.max(minH, Math.min(scrollH, maxH)) + 'px'
   el.style.overflowY = scrollH > maxH ? 'auto' : 'hidden'
 }
 
 watch(inputText, () => nextTick(resizeTextarea))
 watch(() => currentAttachments.value.length, () => nextTick(resizeTextarea))
 
-// Sync a rollback draft to the textarea. The revision signal is required for
-// attachment-only messages and repeated rollbacks whose caption is unchanged.
-// 撤回纯附件消息时同样要清空旧文字并聚焦输入框。
+// Sync store-driven composer injects (rollback recall, empty-state
+// guides, scene capsules). Revision must bump even when the text is
+// unchanged so re-clicking the same guide still refocuses the input.
 watch(
   () => [state.currentID, currentPendingInputRevision.value] as const,
   () => {
-    const draft = currentRollbackDraft.value
-    if (!draft) return
+    if (!state.currentID || !currentPendingInputRevision.value) return
     inputText.value = currentPendingInput.value
     nextTick(() => {
       inputEl.value?.focus()
@@ -94,8 +107,11 @@ async function onUndoRollback() {
 onMounted(() => nextTick(resizeTextarea))
 const sending = ref(false)
 const sendPreflightSessions = new Set<string>()
-const showSessionConfig = ref(false)
+const attachmentSendPreflightSessions = new Set<string>()
 const showSubAgentModelPicker = ref(false)
+const showWorkModePicker = ref(false)
+const showLongRunPicker = ref(false)
+const showSubAgentPicker = ref(false)
 const message = useMessage()
 const dialog = useDialog()
 
@@ -135,9 +151,8 @@ const turnModePolicy = computed<api.TurnModePolicy>(() => {
   return meta?.turn_mode_policy || (meta?.plan_mode ? 'plan' : 'build')
 })
 
-async function togglePlanMode() {
+async function setTurnModePolicy(next: api.TurnModePolicy) {
   if (!state.currentID) return
-  const next = nextTurnModePolicy(turnModePolicy.value)
   try {
     const resp = await api.updateSessionMeta(state.currentID, {
       turn_mode_policy: next,
@@ -156,6 +171,53 @@ async function togglePlanMode() {
       session.plan_mode = resp.plan_mode ?? mode === 'plan'
     }
   } catch {}
+}
+
+async function togglePlanMode() {
+  await setTurnModePolicy(nextTurnModePolicy(turnModePolicy.value))
+}
+
+const showStyleCompare = ref(false)
+const compareStyleIDs = ref<string[]>([])
+
+const compareStyleOptions = computed(() => styleOptions.value.filter(option => option.value !== 'off'))
+
+function toggleCompareStyle(id: string) {
+  const selected = compareStyleIDs.value
+  if (selected.includes(id)) {
+    compareStyleIDs.value = selected.filter(item => item !== id)
+    return
+  }
+  if (selected.length >= 2) return
+  compareStyleIDs.value = [...selected, id]
+}
+
+async function onStyleCompare() {
+  const id = state.currentID
+  if (!id || isStreaming.value) return
+  showStyleCompare.value = false
+  window.dispatchEvent(new Event('pchat:open-inspector'))
+  try {
+    await runStyleCompare(id, inputText.value.trim(), compareStyleIDs.value)
+  } catch (err: any) {
+    message.error(err?.message || '换种说法失败')
+  }
+}
+
+async function onRewriteDraft() {
+  const id = state.currentID
+  const original = inputText.value
+  if (!id || isStreaming.value || !original.trim() || compareStyleIDs.value.length !== 1) return
+  showStyleCompare.value = false
+  try {
+    const resp = await api.styleCompare(id, original.trim(), compareStyleIDs.value)
+    const text = resp.variants?.[0]?.text || ''
+    if (!text) throw new Error(resp.variants?.[0]?.error || '没有改写结果')
+    inputText.value = text
+  } catch (err: any) {
+    inputText.value = original
+    message.error(err?.message || '改写草稿失败')
+  }
 }
 
 function nextTurnModePolicy(policy: api.TurnModePolicy): api.TurnModePolicy {
@@ -210,12 +272,6 @@ async function onChangePermissionLevel(val: string) {
   } catch (e: any) {
     message.error(`权限更新失败：${e?.message || e}`)
   }
-}
-
-function onToggleMute() {
-  notifyManager.unlock()
-  notifyManager.mute = !notifyManager.mute
-  mute.value = notifyManager.mute
 }
 
 // --- knowledge base selector ---
@@ -308,13 +364,9 @@ function onPickFiles() {
 
 async function onFiles(files: FileList | null) {
   if (!files) return
-  for (const f of Array.from(files)) {
-    try {
-      await addAttachment(f)
-    } catch (e: any) {
-      message.error(`上传失败: ${e.message}`)
-    }
-  }
+  void addAttachments(Array.from(files)).catch((e: any) => {
+    message.error(`上传失败: ${e.message}`)
+  })
   if (fileInput.value) fileInput.value.value = ''
 }
 
@@ -390,22 +442,20 @@ function onPaste(e: ClipboardEvent) {
   }
   if (files.length === 0) return
   e.preventDefault()
-  // addAttachment() pushes the placeholder to the store
+  // addAttachments() pushes placeholders to the store
   // synchronously, so the chip below the textarea appears
   // the moment this function returns — the upload +
   // readAsDataURL work happens in the background. Going
-  // through addAttachment directly (instead of building a
+  // through addAttachments directly (instead of building a
   // synthetic FileList for onFiles()) keeps the call chain
   // one frame shorter, which matters because the chip's
   // appearance is the user's primary feedback that "the
   // paste worked". Also avoids the synthetic FileList +
   // Array.from round-trip — that path is fine, but the
   // direct call is more obviously correct.
-  for (const f of files) {
-    addAttachment(f).catch((err: any) => {
-      message.error(`上传失败: ${err.message}`)
-    })
-  }
+  void addAttachments(files).catch((err: any) => {
+    message.error(`上传失败: ${err.message}`)
+  })
   // Toast the user. The chip below the textarea is the
   // primary indicator, but a screenshot paste is easy to
   // miss if the user's eye is on the textarea. The toast
@@ -696,7 +746,7 @@ async function runSlash(name: string, args: string): Promise<boolean> {
   }
   // Fall back to the server's command endpoint for anything else.
   try {
-    const r = await api.runCommand(name, args)
+    const r = await api.runCommand(name, args, state.currentID)
     appendSystemMessage(r.output || '(无输出)')
     return true
   } catch (e: any) {
@@ -917,14 +967,14 @@ async function clearUnfinishedTodosBeforeSend(id: string): Promise<TodoSendMode 
   }
 }
 
-function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.MessageAttachment[] {
+function buildLocalBubbleAttachments(attachments: PendingAttachment[], sessionID: string): api.MessageAttachment[] {
   const result: api.MessageAttachment[] = []
   for (const a of attachments) {
     if (a._error) continue
     if (a.kind === 'image' || a.kind === 'audio' || a.kind === 'video') {
       const type = a.kind === 'image' ? 'image_url' : a.kind === 'audio' ? 'audio_url' : 'video_url'
       const url = a._file ? URL.createObjectURL(a._file) : dataURLToBlobURL(a._dataURL)
-      const previewURL = url || (a.id ? api.uploadURL(a.id) : '')
+		const previewURL = url || (a.id ? api.uploadURL(a.id, sessionID) : '')
       if (previewURL) result.push({
         type,
         url: previewURL,
@@ -938,7 +988,7 @@ function buildLocalBubbleAttachments(attachments: PendingAttachment[]): api.Mess
     const url = a._file
       ? URL.createObjectURL(a._file)
       : a.id
-        ? api.uploadURL(a.id)
+			? api.uploadURL(a.id, sessionID)
         : dataURLToBlobURL(a._dataURL)
     result.push({
       type: 'text',
@@ -971,6 +1021,10 @@ function buildInlineAttachments(attachments: PendingAttachment[]): api.InlineAtt
       })
       continue
     }
+    // Documents must retain a durable upload reference. Their inline bytes are
+    // intentionally never used as a fallback because the server cannot expose
+    // such a transient PDF/DOCX to read_attachment on later rounds.
+    if (a.kind === 'file' && !a.id) continue
     if (!a.id && !data) continue
     result.push({
       type: 'text',
@@ -984,9 +1038,33 @@ function buildInlineAttachments(attachments: PendingAttachment[]): api.InlineAtt
   return result
 }
 
+function confirmSendWithoutFailedDocuments(failed: PendingAttachment[]): Promise<boolean> {
+  return new Promise(resolve => {
+    let settled = false
+    let dialogRef: { destroy: () => void } | null = null
+    const finish = (confirmed: boolean) => {
+      if (settled) return
+      settled = true
+      resolve(confirmed)
+      dialogRef?.destroy()
+    }
+    const names = failed.slice(0, 2).map(a => a.name).join('、')
+    const more = failed.length > 2 ? ` 等 ${failed.length} 个` : ''
+    dialogRef = dialog.warning({
+      title: '文档上传失败',
+      content: `${names}${more} 未能上传。仅发送文字和其他成功附件时，模型无法读取这些文档。你也可以取消，重新选择文档。`,
+      action: () => h(NSpace, { justify: 'end', size: 8 }, () => [
+        h(NButton, { size: 'small', onClick: () => finish(false) }, { default: () => '取消发送' }),
+        h(NButton, { size: 'small', type: 'warning', onClick: () => finish(true) }, { default: () => '不带失败文档发送' }),
+      ]),
+      onClose: () => finish(false),
+    })
+  })
+}
+
 async function send() {
   const raw = inputText.value.trim()
-  if (!raw) return
+  if (!raw && currentAttachments.value.length === 0) return
   // NOTE: we intentionally do NOT gate on `sending.value`
   // here. That ref is local to this InputArea instance, but
   // multiple conversations can stream in parallel. If session
@@ -1020,6 +1098,7 @@ async function send() {
   }
 
   const preflightSessionID = state.currentID
+  if (preflightSessionID && attachmentSendPreflightSessions.has(preflightSessionID)) return
   let todoMode: TodoSendMode = 'auto'
   const shouldQueueBeforePreflight = currentConversationBusy.value || currentTurnQueue.value.length > 0
   if (preflightSessionID && !shouldQueueBeforePreflight) {
@@ -1038,8 +1117,7 @@ async function send() {
   }
 
   const text = inputText.value.trim()
-  inputText.value = ''
-  if (!text) return
+  if (!text && currentAttachments.value.length === 0) return
 
   if (!state.currentID) {
     // Use the store's createSession() — it both creates the
@@ -1055,7 +1133,31 @@ async function send() {
   const meta = currentMeta.value
   // Snapshot this session's staged files. Selection owns the single upload;
   // sending only waits for that work and reuses its upload id.
-  const stagedAttachments = currentAttachments.value.filter(a => !a._error)
+  const stagedAttachments = [...currentAttachments.value]
+  let sendAttachments: PendingAttachment[]
+  if (attachmentSendPreflightSessions.has(id)) return
+  attachmentSendPreflightSessions.add(id)
+  try {
+    await waitForPendingAttachments(stagedAttachments)
+    const plan = await planAttachmentSend(stagedAttachments, !!text, confirmSendWithoutFailedDocuments)
+    if (plan.status !== 'ready') {
+      if (plan.status === 'blocked') {
+        message.error(`文档上传失败，未发送消息：${plan.failed.map(a => a.name).join('、')}。请重新选择文件，或移除失败附件后发送。`)
+      }
+      return
+    }
+    if (state.currentID !== id || inputText.value.trim() !== text ||
+        currentAttachments.value.length !== stagedAttachments.length ||
+        currentAttachments.value.some((a, i) => a !== stagedAttachments[i])) return
+    sendAttachments = plan.attachments
+    if (plan.omitted.length) message.warning(`已跳过 ${plan.omitted.length} 个上传失败的文档，本次消息不包含这些文档`)
+  } catch (e: any) {
+    message.error(e?.message || '附件上传失败，消息未发送')
+    return
+  } finally {
+    attachmentSendPreflightSessions.delete(id)
+  }
+  inputText.value = ''
   if (!state.sessionMessages[id]) state.sessionMessages[id] = []
   // Mint a row id for this user message at send time so
   // rollback and regenerate always have a valid `msg.id`
@@ -1073,7 +1175,7 @@ async function send() {
   if (!shouldQueue) {
     // The bubble is optimistic: local object URLs render immediately while a
     // just-selected attachment finishes its existing read/upload task.
-    const bubbleAttachments = buildLocalBubbleAttachments(stagedAttachments)
+		const bubbleAttachments = buildLocalBubbleAttachments(sendAttachments, id)
     optimisticUserMessage = {
       id: clientMsgId,
       role: 'user',
@@ -1089,15 +1191,14 @@ async function send() {
     markSessionActive(id, 'pending')
   }
 
-  await waitForPendingAttachments(stagedAttachments)
-  // Uploads can finish after the optimistic bubble was inserted. Keep the
-  // durable id on that GUI message so an immediate rollback can restore the
-  // same files without reading or uploading them again.
+  // Preparation completed before this bubble was created. Keep each durable id
+  // on the GUI message so an immediate rollback can restore the same files
+  // without reading or uploading them again.
   optimisticUserMessage?.attachments?.forEach((attachment, index) => {
-    const uploadID = stagedAttachments[index]?.id
+    const uploadID = sendAttachments[index]?.id
     if (uploadID) attachment.upload_id = uploadID
   })
-  const inlineAttachments = buildInlineAttachments(stagedAttachments)
+  const inlineAttachments = buildInlineAttachments(sendAttachments)
   const activeSkills = pendingActiveSkills.length ? [...pendingActiveSkills] : undefined
   const turnPayload = api.sendPayloadFromOptions({
     message: text,
@@ -1173,7 +1274,22 @@ async function send() {
     }
   } catch (e: any) {
     if (e.name !== 'AbortError') {
-      message.error(`发送失败: ${e.message}`)
+      if (isRejectedMessageRequest(e)) {
+        const messages = state.sessionMessages[id] || []
+        if (removeUnacceptedLocalTurn(messages, clientMsgId)) {
+          state.pendingAttachments[id] = restoreRejectedAttachments(
+            sendAttachments,
+            state.pendingAttachments[id] || [],
+            e.code === 'invalid_attachment' ? e.detail : '',
+          )
+          if (state.currentID === id) inputText.value = mergeRejectedDraft(text, inputText.value)
+        }
+        message.error(e.code === 'invalid_attachment'
+          ? `附件无效，消息未发送：${e.detail}`
+          : `消息未被接受：${e.detail}`)
+      } else {
+        message.error(`发送失败: ${e.message}`)
+      }
     }
   } finally {
     sending.value = false
@@ -1207,10 +1323,47 @@ function onDragOver(e: DragEvent) {
   }
 }
 function onDragLeave() { isDragging.value = false }
-function onDrop(e: DragEvent) {
+
+async function onDrop(e: DragEvent) {
   e.preventDefault()
+  e.stopPropagation()
   isDragging.value = false
-  onFiles(e.dataTransfer?.files || null)
+  const inspected = await inspectDataTransfer(e.dataTransfer)
+  if (inspected.kind === 'folder') {
+    await handleFolderDrop(inspected.folderPath, inspected.folderName)
+    return
+  }
+  if (inspected.kind !== 'files' || inspected.files.length === 0) return
+  const hadText = !!inputText.value.trim()
+  try {
+    await addAttachments(inspected.files)
+    const preview = inspected.files.slice(0, 2).map(f => f.name).join(', ')
+    const more = inspected.files.length > 2 ? ` 等 ${inspected.files.length} 个` : ''
+    message.success(`已添加附件: ${preview}${more}`, { duration: 1800 })
+    // Empty composer + media/docs → prefill a short ask so send is one click.
+    if (!hadText) {
+      const allImages = inspected.files.every(f => (f.type || '').startsWith('image/'))
+      prefillComposer(allImages ? '请看看这些图片，并简要说明内容。' : '请看看这些附件，并告诉我要点。')
+    }
+  } catch (err: any) {
+    message.error(`上传失败: ${err?.message || err}`)
+  }
+}
+
+async function handleFolderDrop(folderPath: string, folderName: string) {
+  if (!folderPath) {
+    message.info(`检测到文件夹「${folderName}」，浏览器未给出绝对路径。请用侧栏「添加项目」选取目录。`, {
+      duration: 4500,
+    })
+    ;(window as any).openAddProject?.()
+    return
+  }
+  try {
+    await registerProjectAndOpen(folderPath, folderName)
+    message.success(`已打开项目「${folderName || folderPath}」`)
+  } catch (err: any) {
+    message.error(`添加项目失败：${err?.message || err}`)
+  }
 }
 
 onMounted(() => {
@@ -1273,11 +1426,19 @@ async function onModelSelect(sel: { provider: string; model: string }) {
 
 async function onStylePick(v: string) {
   if (!state.currentID) return
+  const prev = currentMeta.value.style || 'off'
   const resp = await api.updateSessionMeta(state.currentID, { style: v })
   const id = state.currentID
+  const next = resp.style ?? v
   state.sessionMeta[id] = {
     ...(state.sessionMeta[id] || currentMeta.value),
-    style: resp.style ?? v,
+    style: next,
+  }
+  // Delight-3: light feedback when switching persona (empty chat
+  // greeting also updates reactively via currentMeta.style).
+  if (next !== prev && next !== 'off') {
+    const label = styleOptions.value.find(o => o.value === next)?.label || next
+    message.success(`已切换风格：${label}`, { duration: 1600 })
   }
 }
 
@@ -1315,6 +1476,9 @@ const todoLongRunOptions = [
 
 const todoLongRunMode = computed(() =>
   state.sessionMeta[state.currentID]?.todo_long_run_mode || 'adaptive',
+)
+const todoLongRunLabel = computed(() =>
+  todoLongRunOptions.find(opt => opt.value === todoLongRunMode.value)?.label || '自适应',
 )
 
 async function onTodoLongRunPick(v: 'off' | 'adaptive' | 'unlimited') {
@@ -1512,6 +1676,139 @@ function toggleGenerationCapability(value: string | number) {
   void onGenerationCapabilitiesPick(next)
 }
 
+const IMAGE_GENERATION_OPS: api.GenerationOperation[] = ['text_to_image', 'image_to_image']
+const VIDEO_GENERATION_OPS: api.GenerationOperation[] = ['text_to_video', 'image_to_video', 'video_to_video']
+const AUDIO_GENERATION_OPS: api.GenerationOperation[] = ['text_to_speech', 'text_to_music', 'text_to_sound', 'audio_to_audio']
+
+function generationOpsIn(ops: api.GenerationOperation[]) {
+  return generationOptions.value.filter(item => ops.includes(item.operation) && item.available)
+}
+function generationEnabledIn(ops: api.GenerationOperation[]) {
+  return enabledGenerationOperations.value.filter(operation => ops.includes(operation))
+}
+function generationGroupValue(ops: api.GenerationOperation[]) {
+  if (generationOptionsLoading.value) return '加载中'
+  const available = generationOpsIn(ops)
+  if (!available.length) return '不可用'
+  const enabled = generationEnabledIn(ops)
+  if (!enabled.length) return '关闭'
+  if (enabled.length === 1) return generationLabels[enabled[0]]
+  return String(enabled.length)
+}
+
+const showSessionSettings = ref(false)
+const sessionPanel = ref<string | null>(null)
+
+function closeSessionSettings() {
+  showSessionSettings.value = false
+  sessionPanel.value = null
+}
+
+function toggleSessionSettings() {
+  if (showSessionSettings.value) closeSessionSettings()
+  else showSessionSettings.value = true
+}
+
+function openSessionPanel(id: string) {
+  sessionPanel.value = sessionPanel.value === id ? null : id
+}
+
+function onSessionSettingsPointerDown(event: Event) {
+  const target = event.target as HTMLElement | null
+  if (!target) return
+  if (target.closest('.session-settings, .n-dropdown-menu, .n-popover, .n-modal')) return
+  closeSessionSettings()
+}
+
+function onSessionSettingsKeydown(event: KeyboardEvent) {
+  if (event.key !== 'Escape') return
+  closeSessionSettings()
+}
+
+watch(showSessionSettings, (open) => {
+  if (open) {
+    window.addEventListener('pointerdown', onSessionSettingsPointerDown, true)
+    window.addEventListener('keydown', onSessionSettingsKeydown)
+  } else {
+    window.removeEventListener('pointerdown', onSessionSettingsPointerDown, true)
+    window.removeEventListener('keydown', onSessionSettingsKeydown)
+    sessionPanel.value = null
+  }
+})
+
+onUnmounted(() => {
+  window.removeEventListener('pointerdown', onSessionSettingsPointerDown, true)
+  window.removeEventListener('keydown', onSessionSettingsKeydown)
+})
+
+const sessionSettingEntries = computed(() => [
+  {
+    id: 'work',
+    label: '类型',
+    value: currentWorkModeLabel.value,
+    icon: Code2,
+    active: false,
+    title: '类型：编码适合改代码，日常适合写作和问答。',
+  },
+  {
+    id: 'kb',
+    label: '知识库',
+    value: currentKBLabel.value,
+    icon: Database,
+    active: kbBase.value !== '__off__',
+    title: `知识库：${currentKBLabel.value}。如果没有可用的知识库，请到“应用设置 > 知识库”添加或启用。`,
+  },
+  {
+    id: 'recognition',
+    label: '媒体识别',
+    value: enabledRecognitionCapabilities.value.length ? recognitionCapabilityFirstLabel.value : recognitionCapabilityLabel.value,
+    icon: ImageIcon,
+    active: enabledRecognitionCapabilities.value.length > 0,
+    title: `媒体识别：${recognitionCapabilityDetail.value}。如果没有可选能力，请先到该页面配置至少一种能力。`,
+  },
+  {
+    id: 'image',
+    label: '图片生成',
+    value: generationGroupValue(IMAGE_GENERATION_OPS),
+    icon: ImageIcon,
+    active: generationEnabledIn(IMAGE_GENERATION_OPS).length > 0,
+    title: `图片生成：${generationGroupValue(IMAGE_GENERATION_OPS)}。关闭后，即使模型尝试调用工具，工具内部也会直接拒绝，不会请求厂商 API。会话只选择能力；每项能力直接使用应用设置中的默认模型。如果显示“不可用”，请先到“应用设置 > 系统 > 媒体生成”配置默认模型。`,
+  },
+  {
+    id: 'video',
+    label: '视频生成',
+    value: generationGroupValue(VIDEO_GENERATION_OPS),
+    icon: Film,
+    active: generationEnabledIn(VIDEO_GENERATION_OPS).length > 0,
+    title: `视频生成：${generationGroupValue(VIDEO_GENERATION_OPS)}。`,
+  },
+  {
+    id: 'audio',
+    label: '音频生成',
+    value: generationGroupValue(AUDIO_GENERATION_OPS),
+    icon: Volume2,
+    active: generationEnabledIn(AUDIO_GENERATION_OPS).length > 0,
+    title: `音频生成：${generationGroupValue(AUDIO_GENERATION_OPS)}。`,
+  },
+  {
+    id: 'subagent',
+    label: '子代理',
+    value: subAgentModelLabel.value,
+    icon: Bot,
+    active: subAgentModelEnabled.value,
+    title: '子代理模型。默认继承当前主对话模型，自定义后子任务优先用这里选的模型。',
+  },
+  {
+    id: 'longrun',
+    label: '长任务',
+    value: todoLongRunLabel.value,
+    icon: ListTodo,
+    active: todoLongRunMode.value !== 'adaptive',
+    title: '长任务：自适应适合大多数情况；不限轮次适合长流程；关闭则每步停下来等确认。',
+  },
+])
+const sessionSettingsActive = computed(() => sessionSettingEntries.value.some(item => item.active))
+
 function providerHasModel(provider: string, model: string): boolean {
   const p = state.providers.find(x => x.name === provider)
   const models = (p?.models || []) as api.ModelInfo[]
@@ -1612,6 +1909,42 @@ const currentWorkModeValue = computed({
 const currentWorkModeLabel = computed(() =>
   currentWorkModeValue.value === 'daily' ? '日常' : '编码',
 )
+
+const sceneCapsules = SCENE_CAPSULES
+const sceneIconById: Record<SceneId, typeof Code2> = {
+  coding: Code2,
+  plan: ListTodo,
+  daily: MessageSquare,
+}
+
+const activeSceneId = computed(() =>
+  matchScene(currentWorkModeValue.value, turnModePolicy.value),
+)
+const activeScene = computed(() =>
+  sceneCapsules.find(item => item.id === activeSceneId.value) || sceneCapsules[0],
+)
+
+async function applyScene(id: SceneId, opts?: { prompt?: string }) {
+  if (!state.currentID) return
+  const scene = SCENE_CAPSULES.find(item => item.id === id)
+  if (!scene) return
+  try {
+    if (currentWorkModeValue.value !== scene.workMode) {
+      await onWorkModePick(scene.workMode)
+    }
+    if (turnModePolicy.value !== scene.turnMode) {
+      await setTurnModePolicy(scene.turnMode as TurnMode)
+    }
+    if (opts?.prompt) prefillComposer(opts.prompt)
+    else nextTick(() => inputEl.value?.focus())
+  } catch (e: any) {
+    message.error(`切换场景失败：${e?.message || e}`)
+  }
+}
+
+function onSceneCapsuleClick(id: SceneId) {
+  void applyScene(id)
+}
 // Display label for the reasoning picker. Maps the enum
 // value (off/low/medium/high/max) to the Chinese label
 // that reasoningEffortOptions uses, so the button shows
@@ -1642,10 +1975,6 @@ const currentKBLabel = computed(() => {
   return v
 })
 
-const sessionConfigSummary = computed(() =>
-  `${currentWorkModeLabel.value} · 思考${currentReasoningLabel.value} · 知识库${currentKBLabel.value} · 识别${recognitionCapabilityLabel.value} · 生成${generationCapabilityLabel.value} · 子代理${subAgentModelLabel.value} · 风格${currentStyleLabel.value}`,
-)
-
 // Setter wrappers for the NDropdown @select handler.
 // The handlers receive (key: string | number), but Vue's
 // computed refs don't expose `.value` cleanly from the
@@ -1668,16 +1997,41 @@ function pickKB(v: string | number) {
 // model or hits Esc, so we only need to handle the open
 // direction here.
 const showModelPicker = ref(false)
+const showModelSheet = ref(false)
 function openModelPicker() {
   if (!state.currentID) return
+  showModelSheet.value = false
   showModelPicker.value = true
 }
+function openModelList() {
+  showModelSheet.value = false
+  nextTick(() => openModelPicker())
+}
+const reasoningSteps = computed(() => reasoningEffortOptions[0]?.children || [])
+const reasoningLevel = computed(() => {
+  const idx = reasoningSteps.value.findIndex(opt => opt.value === reasoningEffort.value)
+  return idx < 0 ? 0 : idx
+})
+// 思考开启后，一条短光沿名称外圈走。纯 CSS translate，大部分时间停住，
+// 避免脚本逐帧改 transform。
+const reasoningSpark = computed(() => reasoningLevel.value >= 1)
+const reasoningMeterStyle = computed(() => {
+  const fills = [
+    { width: '0%', background: 'transparent' },
+    { width: '40%', background: 'color-mix(in srgb, var(--success-500) 34%, white)' },
+    { width: '60%', background: 'color-mix(in srgb, var(--success-500) 54%, white)' },
+    { width: '80%', background: 'color-mix(in srgb, var(--success-500) 76%, white)' },
+    { width: '100%', background: 'var(--success-500)' },
+  ]
+  return fills[reasoningLevel.value] || fills[0]
+})
 
 // Permission-level picker: small icon-only popover that
 // shows a 3-option list (always-ask / auto-approve /
 // full-access). Replaces the old NSelect which took a lot
 // of horizontal space.
 const showPermPicker = ref(false)
+const showScenePicker = ref(false)
 const permIcon = computed(() => {
   if (permissionLevel.value === 'full') return Key
   if (permissionLevel.value === 'auto') return Unlock
@@ -1712,6 +2066,11 @@ const currentConversationBusy = computed(() =>
   currentSessionWorking.value ||
   !!state.turnQueueDraining[state.currentID],
 )
+// Composer mascot riding the input box's top edge. Always present; the
+// `working` prop tells it whether a turn is running, and it runs its own
+// sleep → wake → walk → groom → jump → goHome → sleep state machine.
+const catWorking = currentConversationBusy
+const catVisible = computed(() => !!state.currentID)
 // 队列 draining 本身属于 currentConversationBusy，用于输入区状态。
 // Queue draining is itself part of currentConversationBusy for composer UI.
 // 监听该聚合状态会让 drain 完成后再次触发 drain。
@@ -1867,6 +2226,390 @@ watch([() => state.currentID, queueSignature], () => {
 </script>
 
 <template>
+  <div class="composer-shell">
+  <div
+    v-if="state.currentID"
+    class="composer-toolbar"
+    role="toolbar"
+    aria-label="写作与会话快捷操作"
+  >
+    <div class="composer-toolbar-group" role="group" aria-label="写作与会话快捷操作">
+      <span id="pchat-question-capsule" class="question-capsule-anchor" />
+      <NPopover
+        v-model:show="showScenePicker"
+        trigger="click"
+        placement="top-start"
+        :show-arrow="false"
+        style="padding: 0; background: transparent; box-shadow: none;"
+      >
+        <template #trigger>
+          <button
+            type="button"
+            class="scene-capsule scene-capsule--active"
+            :title="activeScene.hint"
+            :aria-label="`场景：${activeScene.label}，点击切换`"
+            :aria-expanded="showScenePicker"
+          >
+            <component :is="sceneIconById[activeScene.id]" :size="13" />
+            <span>{{ activeScene.label }}</span>
+            <ChevronUp :size="11" />
+          </button>
+        </template>
+        <div class="scene-popover" role="listbox" aria-label="选择场景">
+          <button
+            v-for="scene in sceneCapsules"
+            :key="scene.id"
+            type="button"
+            class="scene-popover-item"
+            :class="{ 'scene-popover-item--active': activeSceneId === scene.id }"
+            role="option"
+            :aria-selected="activeSceneId === scene.id"
+            :title="scene.hint"
+            @click="onSceneCapsuleClick(scene.id); showScenePicker = false"
+          >
+            <component :is="sceneIconById[scene.id]" :size="14" />
+            <span class="scene-popover-copy">
+              <span class="scene-popover-label">{{ scene.label }}</span>
+              <span class="scene-popover-hint">{{ scene.hint }}</span>
+            </span>
+          </button>
+        </div>
+      </NPopover>
+        <NPopover
+          v-model:show="showPermPicker"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          style="padding: 0; background: transparent; box-shadow: none;"
+        >
+          <template #trigger>
+            <button
+              type="button"
+              class="scene-capsule"
+              :disabled="!state.currentID"
+              :title="`权限: ${permLabel}`"
+              :aria-label="`权限级别: ${permLabel}，点击更改`"
+            >
+              <component :is="permIcon" :size="13" />
+              <span class="ctrl-btn-label">{{ permLabel }}</span>
+            </button>
+          </template>
+          <div class="perm-popover">
+            <div class="perm-popover-label">工具权限</div>
+            <button
+              v-for="opt in permissionOptions"
+              :key="opt.value"
+              type="button"
+              class="perm-popover-item"
+              :class="{ 'perm-popover-item--active': permissionLevel === opt.value }"
+              @click="onChangePermissionLevel(opt.value); showPermPicker = false"
+            >
+              <span class="perm-popover-radio" />
+              <span class="perm-popover-name">{{ opt.label }}</span>
+            </button>
+          </div>
+        </NPopover>
+
+        <NDropdown
+          trigger="click"
+          placement="top-start"
+          :z-index="3200"
+          :options="styleDropdownOptions"
+          @select="pickStyle"
+        >
+          <button
+            type="button"
+            class="scene-capsule"
+            :class="{ 'scene-capsule--active': currentStyleValue !== 'off' }"
+            data-testid="session-style-dropdown"
+            :disabled="!state.currentID"
+            :title="`风格：${currentStyleLabel}。决定当前会话的说话方式，只影响这一条对话。`"
+            :aria-label="`选择风格，当前为${currentStyleLabel}`"
+          >
+            <Palette :size="13" />
+            <span>风格</span>
+            <span class="scene-capsule-value">{{ currentStyleLabel }}</span>
+            <ChevronUp :size="11" />
+          </button>
+        </NDropdown>
+
+        <div class="session-settings">
+          <NPopover
+            v-model:show="showSessionSettings"
+            trigger="manual"
+            placement="top-start"
+            :show-arrow="false"
+            :z-index="3100"
+            style="padding: 0; background: transparent; box-shadow: none;"
+          >
+            <template #trigger>
+              <button
+                type="button"
+                class="scene-capsule"
+                :class="{ 'scene-capsule--active': sessionSettingsActive || showSessionSettings }"
+                :disabled="!state.currentID"
+                :aria-expanded="showSessionSettings"
+                aria-label="会话设置"
+                title="知识库、识别、图片和视频生成、子代理、长任务"
+                @click="toggleSessionSettings"
+              >
+                <Settings :size="13" />
+                <span>会话设置</span>
+              </button>
+            </template>
+            <div class="session-card session-settings" role="dialog" aria-label="会话设置">
+              <div class="session-card-grid">
+                <button
+                  v-for="item in sessionSettingEntries"
+                  :key="item.id"
+                  type="button"
+                  class="session-card-cell"
+                  :class="{ 'session-card-cell--active': item.active, 'session-card-cell--open': sessionPanel === item.id }"
+                  :title="item.title"
+                  :aria-label="`${item.label}：${item.value}`"
+                  :aria-expanded="sessionPanel === item.id"
+                  @click="openSessionPanel(item.id)"
+                >
+                  <span class="session-card-cell-label">
+                    <component :is="item.icon" :size="13" />
+                    <span>{{ item.label }}</span>
+                  </span>
+                  <span class="session-card-cell-value">{{ item.value }}</span>
+                </button>
+              </div>
+              <div v-if="sessionPanel" class="session-card-detail" @click.stop>
+                <div v-if="sessionPanel === 'work'" class="perm-popover" role="listbox" aria-label="会话类型">
+                  <div class="perm-popover-label">类型</div>
+                  <button
+                    v-for="opt in workModeOptions"
+                    :key="opt.value"
+                    type="button"
+                    class="perm-popover-item"
+                    :class="{ 'perm-popover-item--active': currentWorkModeValue === opt.value }"
+                    @click="onWorkModePick(opt.value); showWorkModePicker = false"
+                  >
+                    <span class="perm-popover-radio" />
+                    <span class="perm-popover-name">{{ opt.label }}</span>
+                  </button>
+                </div>
+                <div v-else-if="sessionPanel === 'kb'" class="perm-popover">
+                  <div class="perm-popover-label">知识库</div>
+                  <NDropdown
+                    trigger="click"
+                    placement="bottom-start"
+                    :z-index="3200"
+                    :options="kbDropdownOptions"
+                    @select="pickKB"
+                  >
+                    <button
+                      type="button"
+                      class="perm-popover-item"
+                      data-testid="session-knowledge-dropdown"
+                      :aria-label="`选择知识库，当前为${currentKBLabel}`"
+                    >
+                      <span class="perm-popover-name">{{ currentKBLabel }}</span>
+                      <ChevronUp :size="11" />
+                    </button>
+                  </NDropdown>
+                </div>
+                <div v-else-if="sessionPanel === 'recognition'" class="perm-popover">
+                  <div class="perm-popover-label">媒体识别</div>
+                  <NDropdown
+                    trigger="click"
+                    placement="bottom-start"
+                    :z-index="3200"
+                    :options="recognitionCapabilityDropdownOptions"
+                    @select="toggleRecognitionCapability"
+                  >
+                    <button
+                      type="button"
+                      class="perm-popover-item"
+                      data-testid="session-recognition-dropdown"
+                      :disabled="!state.recognitionCapabilitiesAvailable.length"
+                      :aria-label="`选择媒体识别能力，当前为${recognitionCapabilityDetail}`"
+                    >
+                      <span>媒体识别</span>
+                      <span v-if="enabledRecognitionCapabilities.length" class="opt-pick-tags">
+                        <span class="opt-pick-tag opt-pick-tag--name">{{ recognitionCapabilityFirstLabel }}</span>
+                        <span class="opt-pick-tag opt-pick-tag--count">{{ enabledRecognitionCapabilities.length }}</span>
+                      </span>
+                      <span v-else class="perm-popover-name">{{ recognitionCapabilityLabel }}</span>
+                      <ChevronUp :size="11" />
+                    </button>
+                  </NDropdown>
+                </div>
+                <div v-else-if="sessionPanel === 'image'" class="perm-popover" data-testid="session-generation-dropdown">
+                  <div class="perm-popover-label">图片生成</div>
+                  <span class="orbit-detail-probe" aria-hidden="true">
+                    <span class="opt-pick-tag opt-pick-tag--name">{{ generationCapabilityFirstLabel }}</span>
+                    <span class="opt-pick-tag opt-pick-tag--count">{{ enabledGenerationOperations.length }}</span>
+                  </span>
+                  <button
+                    v-for="item in generationOpsIn(IMAGE_GENERATION_OPS)"
+                    :key="item.operation"
+                    type="button"
+                    class="perm-popover-item"
+                    :class="{ 'perm-popover-item--active': generationEnabledIn(IMAGE_GENERATION_OPS).includes(item.operation) }"
+                    @click="toggleGenerationCapability(item.operation)"
+                  >
+                    <span class="perm-popover-radio" />
+                    <span class="perm-popover-name">{{ generationLabels[item.operation] }}</span>
+                  </button>
+                  <div v-if="!generationOpsIn(IMAGE_GENERATION_OPS).length" class="perm-popover-name">不可用</div>
+                </div>
+                <div v-else-if="sessionPanel === 'video'" class="perm-popover">
+                  <div class="perm-popover-label">视频生成</div>
+                  <button
+                    v-for="item in generationOpsIn(VIDEO_GENERATION_OPS)"
+                    :key="item.operation"
+                    type="button"
+                    class="perm-popover-item"
+                    :class="{ 'perm-popover-item--active': generationEnabledIn(VIDEO_GENERATION_OPS).includes(item.operation) }"
+                    @click="toggleGenerationCapability(item.operation)"
+                  >
+                    <span class="perm-popover-radio" />
+                    <span class="perm-popover-name">{{ generationLabels[item.operation] }}</span>
+                  </button>
+                  <div v-if="!generationOpsIn(VIDEO_GENERATION_OPS).length" class="perm-popover-name">不可用</div>
+                </div>
+                <div v-else-if="sessionPanel === 'audio'" class="perm-popover">
+                  <div class="perm-popover-label">音频生成</div>
+                  <button
+                    v-for="item in generationOpsIn(AUDIO_GENERATION_OPS)"
+                    :key="item.operation"
+                    type="button"
+                    class="perm-popover-item"
+                    :class="{ 'perm-popover-item--active': generationEnabledIn(AUDIO_GENERATION_OPS).includes(item.operation) }"
+                    @click="toggleGenerationCapability(item.operation)"
+                  >
+                    <span class="perm-popover-radio" />
+                    <span class="perm-popover-name">{{ generationLabels[item.operation] }}</span>
+                  </button>
+                  <div v-if="!generationOpsIn(AUDIO_GENERATION_OPS).length" class="perm-popover-name">不可用</div>
+                </div>
+                <div v-else-if="sessionPanel === 'subagent'" class="perm-popover perm-popover--wide">
+                  <div class="perm-popover-label">子代理模型</div>
+                  <button
+                    type="button"
+                    class="perm-popover-item"
+                    :class="{ 'perm-popover-item--active': !subAgentModelEnabled }"
+                    @click="onSubAgentModelModePick(false); showSubAgentPicker = false"
+                  >
+                    <span class="perm-popover-radio" />
+                    <span class="perm-popover-name">继承主模型</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="perm-popover-item"
+                    :class="{ 'perm-popover-item--active': subAgentModelEnabled }"
+                    @click="onSubAgentModelModePick(true)"
+                  >
+                    <span class="perm-popover-radio" />
+                    <span class="perm-popover-name">自定义</span>
+                  </button>
+                  <ModelPicker
+                    v-if="subAgentModelEnabled"
+                    v-model:show="showSubAgentModelPicker"
+                    :provider="subAgentModelProvider"
+                    :model="subAgentModelName"
+                    :providers="state.providers as any"
+                    @select="onSubAgentModelSelect"
+                  >
+                    <template #trigger>
+                      <button
+                        type="button"
+                        class="perm-popover-item"
+                        :title="`${subAgentModelProvider}/${subAgentModelName}`"
+                        @click="showSubAgentModelPicker = true"
+                      >
+                        <Sparkles :size="12" />
+                        <span class="perm-popover-name">{{ subAgentModelName || '选择模型' }}</span>
+                      </button>
+                    </template>
+                  </ModelPicker>
+                </div>
+                <div v-else-if="sessionPanel === 'longrun'" class="perm-popover" role="listbox" aria-label="长任务">
+                  <div class="perm-popover-label">长任务</div>
+                  <button
+                    v-for="opt in todoLongRunOptions"
+                    :key="opt.value"
+                    type="button"
+                    class="perm-popover-item"
+                    :class="{ 'perm-popover-item--active': todoLongRunMode === opt.value }"
+                    @click="onTodoLongRunPick(opt.value); showLongRunPicker = false"
+                  >
+                    <span class="perm-popover-radio" />
+                    <span class="perm-popover-name">{{ opt.label }}</span>
+                  </button>
+                </div>
+              </div>
+            </div>
+          </NPopover>
+        </div>
+
+
+		        <!-- Turn mode cycles auto / plan / build inline. -->
+        <button
+          type="button"
+          class="scene-capsule"
+          :class="{ 'scene-capsule--active': turnModePolicy !== 'build' }"
+		          :disabled="!state.currentID"
+		          :title="turnModeTitle"
+		          :aria-label="turnModeAria"
+		          @click="togglePlanMode"
+		        >
+		          <component :is="turnModeIcon" :size="13" />
+		          <span class="ctrl-btn-label">{{ turnModeLabel }}</span>
+		        </button>
+        <NPopover
+          v-model:show="showStyleCompare"
+          trigger="click"
+          placement="top-start"
+          :show-arrow="false"
+          :disabled="!state.currentID || isStreaming"
+          style="padding: 0; background: transparent; box-shadow: none;"
+        >
+          <template #trigger>
+            <button
+              type="button"
+              class="scene-capsule"
+              :disabled="!state.currentID || isStreaming"
+              title="选一种或两种风格对照，或用一种风格改写草稿"
+            >
+              <Palette :size="13" />
+              <span class="ctrl-btn-label">换种说法</span>
+            </button>
+          </template>
+          <div class="perm-popover perm-popover--compare" role="listbox" aria-label="换种说法">
+            <div class="perm-popover-label">换种说法</div>
+            <button
+              v-for="opt in compareStyleOptions"
+              :key="opt.value"
+              type="button"
+              class="perm-popover-item"
+              :class="{ 'perm-popover-item--active': compareStyleIDs.includes(opt.value) }"
+              @click="toggleCompareStyle(opt.value)"
+            >
+              <span class="perm-popover-radio" />
+              <span class="perm-popover-name">{{ opt.label }}</span>
+            </button>
+            <div class="style-compare-actions">
+              <button type="button" class="scene-capsule" @click="onStyleCompare">对照</button>
+              <button
+                type="button"
+                class="scene-capsule"
+                :disabled="!inputText.trim() || compareStyleIDs.length !== 1"
+                title="选一个风格，把结果填回输入框"
+                @click="onRewriteDraft"
+              >改写草稿</button>
+            </div>
+          </div>
+        </NPopover>
+    </div>
+  </div>
+
+  <slot name="composer-docks" />
+
   <div class="input-area" :class="{ 'input-area--has-queue': queuedTurns.length > 0 && !currentRollbackBanner }">
     <NDropdown
       trigger="manual"
@@ -2026,20 +2769,151 @@ watch([() => state.currentID, queueSignature], () => {
       @dragleave="onDragLeave"
       @drop="onDrop"
     >
+      <!-- Composer mascot riding the input box's top-left edge. Runs the
+           sleep → wake → walk → groom → jump → goHome → sleep cycle based
+           on whether a turn is running. Feet straddle the top border. -->
+      <span v-if="catVisible" class="composer-cat" aria-hidden="true">
+        <HeaderCat :working="catWorking" />
+      </span>
       <div class="input-row">
-        <button class="attach-icon-btn" @click="onPickFiles" title="添加附件(支持拖拽、剪贴板粘贴)" aria-label="添加附件">
-          <Paperclip :size="18" />
-        </button>
         <textarea
           ref="inputEl"
           v-model="inputText"
           class="textarea"
-          rows="1"
+          rows="3"
           :placeholder="isSlashLine() ? '输入 / 后跟命令 (例如 /help)' : '输入消息，Enter 发送，Shift+Enter 换行，Esc 停止，/ 前缀是命令'"
           @keydown="onKeyDown"
           @paste="onPaste"
           @contextmenu="onInputContextMenu"
         ></textarea>
+      </div>
+      <div v-if="currentAttachments.length > 0" class="attach-strip">
+        <NTooltip
+          v-for="(a, i) in currentAttachments"
+          :key="i"
+          placement="top"
+          :show-arrow="false"
+          :delay="180"
+        >
+          <template #trigger>
+            <div
+              class="attach-chip"
+              :class="{ uploading: a._uploading, error: a._error }"
+              :aria-label="a._errorMessage ? `${a.name}，${a._errorMessage}` : a.name"
+            >
+              <div
+                class="thumb"
+                :class="{ 'thumb--previewable': isPreviewableAttachment(a) }"
+                @click="openAttachmentPreview(a)"
+              >
+                <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
+                <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
+                <Volume2 v-else-if="a.kind === 'audio'" :size="18" />
+                <FileText v-else-if="a.kind === 'text'" :size="18" />
+                <File v-else :size="18" />
+              </div>
+              <button class="rm" type="button" @click.stop="removeAttachment(i)" title="移除" aria-label="移除附件">×</button>
+            </div>
+          </template>
+          {{ a._errorMessage ? `${a.name} · ${a._errorMessage}` : a.name }}
+        </NTooltip>
+      </div>
+      <div class="input-footer">
+        <button
+          type="button"
+          class="attach-btn"
+          @click="onPickFiles"
+          title="添加附件(支持拖拽、剪贴板粘贴)"
+          aria-label="添加附件"
+        >
+          <Paperclip :size="15" />
+        </button>
+        <ModelPicker
+          :show="showModelPicker"
+          @update:show="(v) => showModelPicker = v"
+          :provider="currentMeta.provider"
+          :model="currentMeta.model"
+          :providers="state.providers as any"
+          @select="onModelSelect"
+        >
+          <template #trigger>
+            <NPopover
+              v-model:show="showModelSheet"
+              trigger="click"
+              placement="top-start"
+              :show-arrow="false"
+              :disabled="!state.currentID || showModelPicker"
+              style="padding: 0; background: transparent; box-shadow: none;"
+            >
+              <template #trigger>
+                <button
+                  type="button"
+                  class="model-badge"
+                  :class="[
+                    { 'model-badge--unset': !currentMeta.model },
+                    `model-badge--level-${reasoningLevel}`,
+                  ]"
+                  :disabled="!state.currentID"
+                  :title="`模型 ${currentMeta.model || '未选择'} · 思考${currentReasoningLabel}`"
+                  :aria-label="currentMeta.model ? `当前模型 ${currentMeta.model}，思考强度${currentReasoningLabel}` : '选择模型'"
+                  :aria-expanded="showModelSheet"
+                >
+                  <span v-if="reasoningSpark" class="model-badge-ecg" aria-hidden="true">
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--top"><span class="model-badge-ecg-runner" /></span>
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--right"><span class="model-badge-ecg-runner" /></span>
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--bottom"><span class="model-badge-ecg-runner" /></span>
+                    <span class="model-badge-ecg-edge model-badge-ecg-edge--left"><span class="model-badge-ecg-runner" /></span>
+                  </span>
+                  <Sparkles :size="12" class="model-badge-icon" />
+                  <span class="model-badge-name">{{ currentMeta.model || '选择模型' }}</span>
+                  <span class="model-badge-level" :class="`model-badge-level--${reasoningLevel}`">{{ currentReasoningLabel }}</span>
+                  <ChevronUp :size="11" class="model-badge-caret" />
+                </button>
+              </template>
+              <div class="model-sheet">
+                <button
+                  type="button"
+                  class="model-sheet-model"
+                  @click.stop="openModelList"
+                >
+                  <span class="model-sheet-level" :class="reasoningLevel > 0 ? `reasoning-tone--${reasoningLevel}` : ''">{{ currentReasoningLabel }}</span>
+                  <span class="model-sheet-name-row">
+                    <span class="model-sheet-name">{{ currentMeta.model || '选择模型' }}</span>
+                    <ChevronRight :size="14" />
+                  </span>
+                </button>
+                <div class="reasoning-meter" role="radiogroup" aria-label="思考强度">
+                  <div class="reasoning-meter-track">
+                    <div
+                      class="reasoning-meter-fill"
+                      :class="{ 'reasoning-meter-fill--live': reasoningLevel > 0 }"
+                      :style="reasoningMeterStyle"
+                    />
+                    <button
+                      v-for="(opt, i) in reasoningSteps"
+                      :key="opt.value"
+                      type="button"
+                      class="reasoning-meter-stop"
+                      role="radio"
+                      :aria-checked="reasoningEffort === opt.value"
+                      :title="opt.label"
+                      @click="pickReasoning(opt.value)"
+                    >
+                      <span
+                        class="reasoning-meter-dot"
+                        :class="[
+                          reasoningLevel > 0 && i <= reasoningLevel && reasoningEffort !== opt.value ? 'reasoning-meter-dot--passed' : '',
+                          reasoningEffort === opt.value ? 'reasoning-meter-dot--current' : '',
+                        ]"
+                      />
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </NPopover>
+          </template>
+        </ModelPicker>
+        <span class="input-footer-spacer" />
         <button
           v-if="isStreaming"
           class="stop-btn"
@@ -2059,29 +2933,6 @@ watch([() => state.currentID, queueSignature], () => {
           <Send :size="16" />
         </button>
       </div>
-      <div v-if="currentAttachments.length > 0" class="attach-strip">
-        <div
-          v-for="(a, i) in currentAttachments"
-          :key="i"
-          class="attach-chip"
-          :class="{ uploading: a._uploading, error: a._error }"
-        >
-          <div
-            class="thumb"
-            :class="{ 'thumb--previewable': isPreviewableAttachment(a) }"
-            :title="isPreviewableAttachment(a) ? '点击预览' : undefined"
-            @click="openAttachmentPreview(a)"
-          >
-            <img v-if="a.kind === 'image'" :src="a._previewURL" :alt="a.name" />
-            <video v-else-if="a.kind === 'video'" :src="a._previewURL" muted preload="metadata" />
-            <Volume2 v-else-if="a.kind === 'audio'" :size="18" />
-            <FileText v-else-if="a.kind === 'text'" :size="18" />
-            <File v-else :size="18" />
-          </div>
-          <span class="name" :title="a.name">{{ a.name }}</span>
-          <button class="rm" @click="removeAttachment(i)" title="移除" aria-label="移除附件">×</button>
-        </div>
-      </div>
     </div>
     <input
       ref="fileInput"
@@ -2092,509 +2943,10 @@ watch([() => state.currentID, queueSignature], () => {
       @change="onFiles(($event.target as HTMLInputElement).files)"
     />
 
-    <!-- Bottom row: compact high-frequency controls. Session-scoped
-         settings that need more explanation live behind the
-         会话设置 popover. -->
-    <div class="input-bottom">
-      <div class="input-primary">
-        <!-- Model badge: the current model name with a sparkle
-             icon. Click opens the ModelPicker popover
-             (PR #6) which replaces the old NSelect — see
-             ModelPicker.vue for the command-palette-style
-             search + grouped list + keyboard nav. -->
-        <ModelPicker
-          :show="showModelPicker"
-          @update:show="(v) => showModelPicker = v"
-          :provider="currentMeta.provider"
-          :model="currentMeta.model"
-          :providers="state.providers as any"
-          @select="onModelSelect"
-        >
-          <template #trigger>
-            <button
-              type="button"
-              class="model-badge"
-              :class="{ 'model-badge--unset': !currentMeta.model }"
-              :disabled="!state.currentID"
-              :title="'选择模型'"
-              :aria-label="currentMeta.model ? `当前模型 ${currentMeta.model}，点击更换` : '选择模型'"
-              @click="openModelPicker"
-            >
-              <Sparkles :size="12" class="model-badge-icon" />
-              <span class="model-badge-name">{{ currentMeta.model || '选择模型' }}</span>
-              <ChevronDown :size="11" class="model-badge-caret" />
-            </button>
-          </template>
-        </ModelPicker>
-
-        <NPopover
-          v-model:show="showSessionConfig"
-          trigger="click"
-          placement="top-start"
-          :show-arrow="false"
-          style="padding: 0; background: transparent; box-shadow: none;"
-        >
-          <template #trigger>
-            <button
-              type="button"
-              class="ctrl-btn session-config-trigger"
-              :disabled="!state.currentID"
-              :title="sessionConfigSummary"
-              :aria-label="`会话设置：${sessionConfigSummary}`"
-            >
-              <Settings :size="13" />
-              <span class="ctrl-btn-label">会话设置</span>
-              <span class="session-config-summary">{{ currentWorkModeLabel }} · 思考{{ currentReasoningLabel }} · 知识库{{ currentKBLabel }} · 识别{{ recognitionCapabilityLabel }} · 生成{{ generationCapabilityLabel }} · 子代理{{ subAgentModelLabel }}</span>
-            </button>
-          </template>
-          <div class="session-config-popover">
-            <div class="session-config-head">
-              <Settings :size="14" />
-              <span>会话设置</span>
-            </div>
-
-            <div class="session-config-grid">
-            <div class="session-config-row">
-              <div class="session-config-label">
-                <span>风格</span>
-                <NPopover
-                  trigger="hover"
-                  placement="top"
-                  :show-arrow="false"
-                  style="padding: 0; background: transparent; box-shadow: none;"
-                >
-                  <template #trigger>
-                    <button
-                      type="button"
-                      class="session-config-help"
-                      aria-label="风格说明"
-                    >
-                      <HelpCircle :size="12" />
-                    </button>
-                  </template>
-                  <div class="session-config-help-popover">
-                    <div class="session-config-help-title">风格</div>
-                    <p>决定助手在当前会话里的说话方式，比如更活泼、更简洁，或按某个角色来回复。</p>
-                    <p>右侧检查器的“会话操作”里可以根据当前对话自动整理一个新风格，也可以优化已有风格，并把相关备注一起保存。</p>
-                    <p>这里选中的风格只影响当前会话。想查看、编辑或手动新增风格，可以到“应用设置 > 风格”。</p>
-                  </div>
-                </NPopover>
-              </div>
-              <NDropdown
-                trigger="click"
-                placement="bottom-start"
-                :z-index="3200"
-                :options="styleDropdownOptions"
-                @select="pickStyle"
-              >
-                <button
-                  type="button"
-                  class="opt-pick"
-                  data-testid="session-style-dropdown"
-                  :title="`当前风格：${currentStyleLabel}`"
-                  :aria-label="`选择风格，当前为${currentStyleLabel}`"
-                >
-                  <span class="opt-pick-label">{{ currentStyleLabel }}</span>
-                  <ChevronDown :size="11" class="opt-pick-caret" />
-                </button>
-              </NDropdown>
-            </div>
-
-            <div class="session-config-row">
-              <div class="session-config-label">类型</div>
-              <div class="session-config-options">
-                <button
-                  v-for="opt in workModeOptions"
-                  :key="opt.value"
-                  type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': currentWorkModeValue === opt.value }"
-                  @click="onWorkModePick(opt.value)"
-                >
-                  {{ opt.label }}
-                </button>
-              </div>
-            </div>
-
-            <div class="session-config-row">
-              <div class="session-config-label">
-                <span>知识库</span>
-                <NPopover
-                  trigger="hover"
-                  placement="top"
-                  :show-arrow="false"
-                  style="padding: 0; background: transparent; box-shadow: none;"
-                >
-                  <template #trigger>
-                    <button
-                      type="button"
-                      class="session-config-help"
-                      aria-label="知识库说明"
-                    >
-                      <HelpCircle :size="12" />
-                    </button>
-                  </template>
-                  <div class="session-config-help-popover">
-                    <div class="session-config-help-title">知识库</div>
-                    <p>控制当前会话是否接入本地知识库检索。开启后，助手可以按需调用 wiki_lookup / wiki_list 查找已扫描资料。</p>
-                    <p>“全部知识库”会检索所有已启用知识库；选择单个知识库时，只检索那一个库。</p>
-                    <p>如果没有可用的知识库，请到“应用设置 > 知识库”添加或启用。新增、路径和扫描也在该页面管理。</p>
-                  </div>
-                </NPopover>
-              </div>
-              <div class="session-config-options session-config-options--stacked">
-                <NDropdown
-                  trigger="click"
-                  placement="bottom-start"
-                  :z-index="3200"
-                  :options="kbDropdownOptions"
-                  @select="pickKB"
-                >
-                  <button
-                    type="button"
-                    class="opt-pick"
-                    data-testid="session-knowledge-dropdown"
-                    :title="`当前知识库：${currentKBLabel}`"
-                    :aria-label="`选择知识库，当前为${currentKBLabel}`"
-                  >
-                    <span class="opt-pick-label">{{ currentKBLabel }}</span>
-                    <ChevronDown :size="11" class="opt-pick-caret" />
-                  </button>
-                </NDropdown>
-              </div>
-            </div>
-
-            <div class="session-config-row">
-              <div class="session-config-label">
-                <span>思考</span>
-                <NPopover
-                  trigger="hover"
-                  placement="top"
-                  :show-arrow="false"
-                  style="padding: 0; background: transparent; box-shadow: none;"
-                >
-                  <template #trigger>
-                    <button
-                      type="button"
-                      class="session-config-help"
-                      aria-label="思考说明"
-                    >
-                      <HelpCircle :size="12" />
-                    </button>
-                  </template>
-                  <div class="session-config-help-popover">
-                    <div class="session-config-help-title">思考</div>
-                    <p>控制助手回答前要不要多想一会儿。问题越复杂，适当调高越容易得到更稳的结果。</p>
-                    <p>调高后回复可能更慢，也可能消耗更多额度；普通聊天、简单改写建议保持关闭或低。</p>
-                    <p>这里设置只影响当前会话，并且是否生效取决于当前模型是否支持。</p>
-                  </div>
-                </NPopover>
-              </div>
-              <div class="session-config-options">
-                <button
-                  v-for="opt in reasoningEffortOptions[0]?.children || []"
-                  :key="opt.value"
-                  type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': reasoningEffort === opt.value }"
-                  @click="pickReasoning(opt.value)"
-                >
-                  {{ opt.label }}
-                </button>
-              </div>
-            </div>
-
-            <div class="session-config-row">
-              <div class="session-config-label">
-                <span>媒体识别</span>
-                <NPopover
-                  trigger="hover"
-                  placement="top"
-                  :show-arrow="false"
-                  style="padding: 0; background: transparent; box-shadow: none;"
-                >
-                  <template #trigger>
-                    <button
-                      type="button"
-                      class="session-config-help"
-                      aria-label="媒体识别说明"
-                    >
-                      <HelpCircle :size="12" />
-                    </button>
-                  </template>
-                  <div class="session-config-help-popover">
-                    <div class="session-config-help-title">媒体识别</div>
-                    <p>选择当前会话允许使用的媒体识别能力，可同时启用图片、视频和音频。</p>
-                    <p>每种能力都需要先在“应用设置 > 系统 > 媒体识别”配置独立的供应商和模型。</p>
-                    <p>如果没有可选能力，请先到该页面配置至少一种能力；未完成系统配置的能力不会出现在选择列表中。</p>
-                  </div>
-                </NPopover>
-              </div>
-              <div class="session-config-options session-config-options--stacked">
-                <NDropdown
-                  trigger="click"
-                  placement="bottom-start"
-                  :z-index="3200"
-                  :options="recognitionCapabilityDropdownOptions"
-                  @select="toggleRecognitionCapability"
-                >
-                  <button
-                    type="button"
-                    class="opt-pick"
-                    data-testid="session-recognition-dropdown"
-                    :disabled="!state.recognitionCapabilitiesAvailable.length"
-                    :title="`当前媒体识别能力：${recognitionCapabilityDetail}`"
-                    :aria-label="`选择媒体识别能力，当前为${recognitionCapabilityDetail}`"
-                  >
-                    <span v-if="enabledRecognitionCapabilities.length" class="opt-pick-tags">
-                      <span class="opt-pick-tag opt-pick-tag--name">{{ recognitionCapabilityFirstLabel }}</span>
-                      <span class="opt-pick-tag opt-pick-tag--count">{{ enabledRecognitionCapabilities.length }}</span>
-                    </span>
-                    <span v-else class="opt-pick-label">{{ recognitionCapabilityLabel }}</span>
-                    <ChevronDown :size="11" class="opt-pick-caret" />
-                  </button>
-                </NDropdown>
-              </div>
-            </div>
-
-            <div class="session-config-row">
-              <div class="session-config-label">
-                <span>媒体生成</span>
-                <NPopover
-                  trigger="hover"
-                  placement="top"
-                  :show-arrow="false"
-                  style="padding: 0; background: transparent; box-shadow: none;"
-                >
-                  <template #trigger>
-                    <button type="button" class="session-config-help" aria-label="媒体生成说明">
-                      <HelpCircle :size="12" />
-                    </button>
-                  </template>
-                  <div class="session-config-help-popover">
-                    <div class="session-config-help-title">媒体生成</div>
-                    <p>只允许当前会话使用已选中的生成能力。关闭后，即使模型尝试调用工具，工具内部也会直接拒绝，不会请求厂商 API。</p>
-                    <p>会话只选择能力；每项能力直接使用应用设置中的默认模型，不提供会话级模型覆盖。如果显示“不可用”，请先到“应用设置 > 系统 > 媒体生成”配置能力的默认模型。</p>
-                    <p>LLM 会根据用户要求与附件内容整理最终提示词，附件仍只通过上传 ID 传给生成工具。</p>
-                  </div>
-                </NPopover>
-              </div>
-              <div class="session-config-options session-config-options--stacked generation-session-options">
-                <NDropdown
-                  trigger="click"
-                  placement="bottom-start"
-                  :z-index="3200"
-                  :options="generationCapabilityDropdownOptions"
-                  @select="toggleGenerationCapability"
-                >
-                  <button
-                    type="button"
-                    class="opt-pick"
-                    data-testid="session-generation-dropdown"
-                    :disabled="generationOptionsLoading || !generationOptions.some(item => item.available)"
-                    :title="`当前媒体生成能力：${generationCapabilityDetail}`"
-                    :aria-label="`选择媒体生成能力，当前为${generationCapabilityDetail}`"
-                  >
-                    <span v-if="enabledGenerationOperations.length" class="opt-pick-tags">
-                      <span class="opt-pick-tag opt-pick-tag--name">{{ generationCapabilityFirstLabel }}</span>
-                      <span class="opt-pick-tag opt-pick-tag--count">{{ enabledGenerationOperations.length }}</span>
-                    </span>
-                    <span v-else class="opt-pick-label">{{ generationCapabilityLabel }}</span>
-                    <ChevronDown :size="11" class="opt-pick-caret" />
-                  </button>
-                </NDropdown>
-              </div>
-            </div>
-
-            <div class="session-config-row">
-              <div class="session-config-label">
-                <span>子代理模型</span>
-                <NPopover
-                  trigger="hover"
-                  placement="top"
-                  :show-arrow="false"
-                  style="padding: 0; background: transparent; box-shadow: none;"
-                >
-                  <template #trigger>
-                    <button
-                      type="button"
-                      class="session-config-help"
-                      aria-label="子代理模型说明"
-                    >
-                      <HelpCircle :size="12" />
-                    </button>
-                  </template>
-                  <div class="session-config-help-popover">
-                    <div class="session-config-help-title">子代理模型</div>
-                    <p>默认继承当前主对话模型。开启自定义后，子代理会优先使用这里选择的模型，除非 task 调用或专用子代理自己指定了模型。</p>
-                    <p>适合把探索、规划这类子任务交给更快或更便宜的模型，同时主对话继续使用当前模型。</p>
-                  </div>
-                </NPopover>
-              </div>
-              <div class="session-config-options">
-                <button
-                  type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': !subAgentModelEnabled }"
-                  @click="onSubAgentModelModePick(false)"
-                >
-                  继承主模型
-                </button>
-                <button
-                  type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': subAgentModelEnabled }"
-                  @click="onSubAgentModelModePick(true)"
-                >
-                  自定义
-                </button>
-                <ModelPicker
-                  v-if="subAgentModelEnabled"
-                  v-model:show="showSubAgentModelPicker"
-                  :provider="subAgentModelProvider"
-                  :model="subAgentModelName"
-                  :providers="state.providers as any"
-                  @select="onSubAgentModelSelect"
-                >
-                  <template #trigger>
-                    <button
-                      type="button"
-                      class="session-config-choice session-config-choice--model"
-                      :title="`${subAgentModelProvider}/${subAgentModelName}`"
-                      @click="showSubAgentModelPicker = true"
-                    >
-                      <Sparkles :size="12" />
-                      <span class="session-config-choice-label">{{ subAgentModelName || '选择模型' }}</span>
-                      <ChevronDown :size="11" />
-                    </button>
-                  </template>
-                </ModelPicker>
-              </div>
-            </div>
-
-            <div class="session-config-row">
-              <div class="session-config-label">
-                <span>长任务</span>
-                <NPopover
-                  trigger="hover"
-                  placement="top"
-                  :show-arrow="false"
-                  style="padding: 0; background: transparent; box-shadow: none;"
-                >
-                  <template #trigger>
-                    <button
-                      type="button"
-                      class="session-config-help"
-                      aria-label="长任务说明"
-                    >
-                      <HelpCircle :size="12" />
-                    </button>
-                  </template>
-                  <div class="session-config-help-popover">
-                    <div class="session-config-help-title">长任务</div>
-                    <p>控制助手处理多步骤任务时，完成一轮后要不要继续往下做。</p>
-                    <p>“自适应”适合大多数情况；“不限轮次”适合整理大量资料、批量修改这类长流程，但可能运行更久。</p>
-                    <p>如果你希望助手每一步都先停下来等你确认，可以选择“关闭”。</p>
-                  </div>
-                </NPopover>
-              </div>
-              <div class="session-config-options">
-                <button
-                  v-for="opt in todoLongRunOptions"
-                  :key="opt.value"
-                  type="button"
-                  class="session-config-choice"
-                  :class="{ 'session-config-choice--active': todoLongRunMode === opt.value }"
-                  @click="onTodoLongRunPick(opt.value)"
-                >
-                  {{ opt.label }}
-                </button>
-              </div>
-	            </div>
-	            </div>
-	          </div>
-	        </NPopover>
-
-		        <!-- Turn mode cycles auto / plan / build inline. -->
-		        <button
-		          type="button"
-		          class="ctrl-btn"
-		          :class="{ 'ctrl-btn--active': turnModePolicy !== 'build' }"
-		          :disabled="!state.currentID"
-		          :title="turnModeTitle"
-		          :aria-label="turnModeAria"
-		          @click="togglePlanMode"
-		        >
-		          <component :is="turnModeIcon" :size="13" />
-		          <span class="ctrl-btn-label">{{ turnModeLabel }}</span>
-		        </button>
-
-        <!-- Permission picker: icon-only popover. Three
-             states map to lock / unlock / key icons. Keeps
-             the bottom row narrow. NPopover with
-             trigger="click" + v-model:show handles the open /
-             close state — no separate @click handler on the
-             trigger button (that would race with the
-             popover's own click listener). -->
-        <NPopover
-          v-model:show="showPermPicker"
-          trigger="click"
-          placement="top-start"
-          :show-arrow="false"
-          style="padding: 0; background: transparent; box-shadow: none;"
-        >
-          <template #trigger>
-            <button
-              type="button"
-              class="ctrl-btn"
-              :disabled="!state.currentID"
-              :title="`权限: ${permLabel}`"
-              :aria-label="`权限级别: ${permLabel}，点击更改`"
-            >
-              <component :is="permIcon" :size="13" />
-              <span class="ctrl-btn-label">{{ permLabel }}</span>
-            </button>
-          </template>
-          <div class="perm-popover">
-            <div class="perm-popover-label">工具权限</div>
-            <button
-              v-for="opt in permissionOptions"
-              :key="opt.value"
-              type="button"
-              class="perm-popover-item"
-              :class="{ 'perm-popover-item--active': permissionLevel === opt.value }"
-              @click="onChangePermissionLevel(opt.value); showPermPicker = false"
-            >
-              <span class="perm-popover-radio" />
-              <span class="perm-popover-name">{{ opt.label }}</span>
-            </button>
-          </div>
-        </NPopover>
-
-        <!-- Mute toggle: same icon-only treatment as the
-             other controls. Stays in the always-visible
-             row because it's a one-click toggle. -->
-        <button
-          type="button"
-          class="ctrl-btn"
-          :class="{ 'ctrl-btn--active-warn': mute }"
-          :disabled="!state.currentID"
-          :title="mute ? '提示音已关闭' : '提示音已开启'"
-          :aria-label="mute ? '开启提示音' : '关闭提示音'"
-          @click="onToggleMute"
-        >
-          <component :is="mute ? VolumeX : Volume2" :size="13" />
-        </button>
-      </div>
-
-      <!-- Keyboard hints: live at the very bottom, always
-           visible. Aligns to the right so the rest of the
-           row has the user's eye path. -->
-      <div class="hints">
-        <span><kbd>Enter</kbd> {{ currentConversationBusy ? '排队' : '发送' }}</span>
-        <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
-        <span><kbd>Esc</kbd> 停止</span>
-      </div>
+    <div class="hints">
+      <span><kbd>Enter</kbd> {{ currentConversationBusy ? '排队' : '发送' }}</span>
+      <span><kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</span>
+      <span><kbd>Esc</kbd> 停止</span>
     </div>
   </div>
   <!-- Teleported to body to avoid clipping by .input-area overflow -->
@@ -2608,6 +2960,7 @@ watch([() => state.currentID, queueSignature], () => {
       @select="onSelectCommand"
     />
   </Teleport>
+  </div>
 </template>
 
 <style scoped>
@@ -2627,10 +2980,10 @@ watch([() => state.currentID, queueSignature], () => {
 .attach-strip {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 6px 0 2px 0;
+  gap: var(--space-2);
+  padding: var(--space-2) 0 var(--space-1) 0;
   border-top: 1px dashed var(--border-subtle);
-  margin-top: 4px;
+  margin-top: var(--space-1);
   max-height: 160px;
   overflow-y: auto;
   overflow-x: hidden;
@@ -2642,15 +2995,15 @@ watch([() => state.currentID, queueSignature], () => {
   transition: max-height var(--dur-base) var(--ease-out);
 }
 .attach-chip {
-  display: inline-flex; align-items: center; gap: 6px;
+  position: relative;
+  display: inline-flex;
+  width: var(--space-8);
+  height: var(--space-8);
   background: var(--surface-2);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  padding: 4px 6px 4px 4px;
-  font-size: 12px;
+  padding: 0;
   flex: 0 0 auto;
-  max-width: 100%;
-  min-width: 0;
   /* fade-in: a chip that just appeared (e.g. from a paste)
    * animates in from slightly above + a touch of scale.
    * translateY direction is "from above" so the chip looks
@@ -2667,23 +3020,36 @@ watch([() => state.currentID, queueSignature], () => {
 .attach-chip.uploading { opacity: 0.7; }
 .attach-chip.error { border-color: var(--error-500); }
 .thumb {
-  width: var(--space-8); height: var(--space-8);
+  width: 100%;
+  height: 100%;
   background: var(--surface-3);
-  border-radius: var(--radius-sm);
+  border-radius: inherit;
   display: flex; align-items: center; justify-content: center;
   overflow: hidden;
-  font-size: 18px;
+  color: var(--text-tertiary);
   flex-shrink: 0;
 }
 .thumb--previewable { cursor: zoom-in; }
 .thumb img, .thumb video { width: 100%; height: 100%; object-fit: cover; }
-.name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rm {
-  background: none; border: none; color: var(--text-tertiary);
-  cursor: pointer; padding: 0 4px; font-size: 16px; line-height: 1;
-  flex-shrink: 0;
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  width: var(--space-4);
+  height: var(--space-4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--surface-0) 88%, transparent);
+  border: none;
+  border-radius: var(--radius-pill);
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1;
 }
-.rm:hover { color: var(--error-500); }
+.rm:hover { color: var(--error-500); background: var(--surface-0); }
 
 @keyframes chip-appear {
   from { opacity: 0; transform: translateY(-4px) scale(0.95); }
@@ -2890,11 +3256,38 @@ watch([() => state.currentID, queueSignature], () => {
  * sit on top of the textarea with no gap (the strip's bottom
  * padding + textarea's top margin provides the spacing, and
  * the box's outer border wraps both). */
+/* Idle/empty mascot riding the input box's top-left border: vertically
+ * centered on the border line so the toolbar pills floating above the
+ * composer never cover it. Body straddles the edge (half in, half out). */
+.composer-cat {
+  position: absolute;
+  /* Span the whole input box width so the walking lane reaches both
+   * edges; the cat walks back and forth inside and never leaves the box.
+   * transform lifts the lane so the cat's body straddles the top border. */
+  left: var(--space-3);
+  right: var(--space-3);
+  top: 0;
+  transform: translateY(-50%);
+  height: 14px;
+  z-index: 4;
+  pointer-events: none;
+  /* No overflow clip: the jump frames rise above the lane and must not
+   * be cut. Horizontal containment is enforced by the walk logic, which
+   * clamps the cat's center to [walkMin, walkMax] inside this lane. */
+}
+.composer-cat :deep(.header-cat) {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 14px;
+}
 .input-wrap {
+  position: relative;
   background: var(--surface-input, var(--surface-1));
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-md);
-  padding: 0 var(--space-3) 0 var(--space-3);
+  padding: var(--space-1) var(--space-3) var(--space-2);
   transition: border-color var(--dur-fast) var(--ease-out),
               box-shadow var(--dur-fast) var(--ease-out),
               background var(--dur-fast) var(--ease-out);
@@ -2903,18 +3296,13 @@ watch([() => state.currentID, queueSignature], () => {
   min-width: 0;
 }
 .input-wrap.has-attachments { padding-top: 0; }
-.input-wrap:focus-within {
-  border-color: var(--border-default);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--brand-500) 12%, transparent);
-  background: var(--surface-input, var(--surface-1));
-}
 .input-wrap.dragover {
   border-color: var(--brand-500);
   background: color-mix(in srgb, var(--brand-500) 6%, var(--surface-1));
 }
 .input-row {
   display: flex;
-  align-items: center;
+  align-items: flex-end;
   gap: 6px;
   min-width: 0;
 }
@@ -2940,11 +3328,12 @@ watch([() => state.currentID, queueSignature], () => {
   flex: 1;
   min-width: 0;
   overflow-x: hidden;
-  /* Height is managed by resizeTextarea(). */
+  /* Height is managed by resizeTextarea(); min is about 3 lines. */
   font-family: inherit;
   line-height: 1.5;
   margin: 0;
-  padding: 8px 0 8px 0;
+  padding: 8px 0;
+  min-height: calc(1.5em * 3 + 16px);
 }
 .send-btn, .stop-btn {
   width: 32px; height: 32px;
@@ -2953,7 +3342,7 @@ watch([() => state.currentID, queueSignature], () => {
   display: flex; align-items: center; justify-content: center;
   background: var(--accent); color: var(--on-accent);
   flex-shrink: 0;
-  margin-left: 8px;
+  margin-left: 0;
   transition: background var(--dur-fast) var(--ease-out),
               color var(--dur-fast) var(--ease-out),
               opacity var(--dur-fast) var(--ease-out);
@@ -2966,12 +3355,13 @@ watch([() => state.currentID, queueSignature], () => {
 /* Keyboard hints: live at the very bottom of the input area,
  * right-aligned. Always visible. */
 .hints {
-  font-size: 10.5px;
-  color: var(--text-tertiary);
+  font-size: 10px;
+  color: var(--text-quaternary);
   display: flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 10px;
-  margin-left: auto;
+  margin-top: var(--space-1);
   flex-wrap: wrap;
   min-width: 0;
   max-width: 100%;
@@ -2988,7 +3378,7 @@ watch([() => state.currentID, queueSignature], () => {
 }
 
 /* The input area's height is determined by its content: the
- * textarea (capped at 4 lines by resizeTextarea()), the
+ * textarea (starts at 3 lines, capped by resizeTextarea()), the
  * attach-strip (capped internally), and the bottom controls.
  * Each child caps itself, so the area as a whole can grow
  * to whatever's needed without clipping the dialog or
@@ -2996,8 +3386,8 @@ watch([() => state.currentID, queueSignature], () => {
  * `flex-shrink: 0` ensures the message list above gets
  * compressed first if the viewport is genuinely too small. */
 .input-area {
-  border-top: 1px solid var(--border-subtle);
-  background: var(--surface-1);
+  border-top: none;
+  background: transparent;
   padding: var(--space-2) var(--space-3);
   flex-shrink: 0;
   min-width: 0;
@@ -3005,6 +3395,241 @@ watch([() => state.currentID, queueSignature], () => {
 }
 .input-area--has-queue {
   padding-top: 0;
+}
+.composer-shell {
+  position: relative;
+  flex-shrink: 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: transparent;
+}
+.composer-toolbar {
+  position: absolute;
+  left: var(--space-3);
+  bottom: calc(100% + var(--space-1));
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  width: max-content;
+  max-width: calc(100% - var(--space-6));
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  min-width: 0;
+  pointer-events: none;
+}
+.composer-toolbar .composer-toolbar-group,
+.composer-toolbar .scene-capsule {
+  pointer-events: auto;
+}
+.composer-toolbar-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.question-capsule-anchor {
+  display: inline-flex;
+  align-items: center;
+}
+.question-capsule-anchor:empty {
+  display: none;
+}
+.input-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  padding-top: var(--space-1);
+  min-width: 0;
+}
+.attach-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-height);
+  height: var(--control-height);
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.attach-btn:hover {
+  color: var(--text-secondary);
+  background: color-mix(in srgb, var(--brand-500) 8%, transparent);
+}
+.input-footer-spacer {
+  flex: 1 1 auto;
+  min-width: var(--space-2);
+}
+.scene-popover {
+  width: 240px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.scene-popover-item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 8px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  cursor: pointer;
+  text-align: left;
+}
+.scene-popover-item:hover {
+  background: var(--surface-3);
+  color: var(--text-1);
+}
+.scene-popover-item--active {
+  background: color-mix(in srgb, var(--brand-500) 12%, transparent);
+  color: var(--text-1);
+}
+.scene-popover-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.scene-popover-label {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+}
+.scene-popover-hint {
+  font-size: 11px;
+  color: var(--text-3);
+  line-height: 1.35;
+}
+.scene-capsule {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  height: calc(var(--control-height) - 4px);
+  padding: 0 var(--space-2);
+  border: var(--control-border);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: none;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+.scene-capsule-value {
+  max-width: 8em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.scene-capsule:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.session-card {
+  width: min(420px, calc(100vw - var(--space-8)));
+  background: var(--surface-0);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-2);
+}
+.session-card-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-1);
+}
+.session-card-cell {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-align: left;
+}
+.session-card-cell:hover {
+  background: var(--surface-2);
+}
+.session-card-cell--open {
+  border-color: color-mix(in srgb, var(--brand-500) 36%, var(--border-default));
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-1));
+}
+.session-card-cell-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+.session-card-cell-value {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.session-card-cell--active .session-card-cell-value {
+  color: var(--brand-600);
+}
+.session-card-detail {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-default);
+}
+.session-card-detail .perm-popover,
+.session-card-detail .perm-popover--wide {
+  width: auto;
+  background: transparent;
+  border: none;
+  box-shadow: none;
+  padding: 0;
+}
+.orbit-detail-probe {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+}
+.scene-capsule:hover {
+  color: var(--text-2);
+  border-color: color-mix(in srgb, var(--brand-500) 28%, var(--border-default));
+  background: color-mix(in srgb, var(--brand-500) 8%, var(--surface-0));
+}
+.scene-capsule--active {
+  color: var(--text-1);
+  border-color: color-mix(in srgb, var(--brand-500) 36%, var(--border-default));
+  background: color-mix(in srgb, var(--brand-500) 12%, var(--surface-0));
 }
 .input-bottom {
   display: flex;
@@ -3080,29 +3705,123 @@ watch([() => state.currentID, queueSignature], () => {
  * state when no model is selected (no current session, or
  * no provider configured). */
 .model-badge {
+  position: relative;
+  z-index: 0;
   display: inline-flex;
   align-items: center;
   gap: var(--space-1);
-  height: var(--control-height);
+  height: calc(var(--control-height) - 4px);
   padding: 0 var(--space-2);
-  background: var(--surface-2);
-  border: 1px solid var(--border-subtle);
+  background: transparent;
+  border: none;
   border-radius: var(--radius-md);
-  color: var(--text-primary);
+  color: var(--text-1);
   font-size: 12px;
   font-weight: 500;
   cursor: pointer;
   flex: 0 1 auto;
   min-width: 0;
-  max-width: 180px;
-  transition: background var(--dur-fast) var(--ease-out),
-              border-color var(--dur-fast) var(--ease-out);
+  max-width: 280px;
+  transition:
+    background var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
 }
 .model-badge:hover:not(:disabled) {
-  background: var(--surface-2);
-  border-color: var(--border-default);
+  background: color-mix(in srgb, var(--text-primary) 6%, transparent);
 }
 .model-badge:disabled { opacity: 0.5; cursor: not-allowed; }
+.model-badge--level-1,
+.reasoning-tone--1 { --reasoning-tone: color-mix(in srgb, var(--success-500) 34%, white); }
+.model-badge--level-2,
+.reasoning-tone--2 { --reasoning-tone: color-mix(in srgb, var(--success-500) 54%, white); }
+.model-badge--level-3,
+.reasoning-tone--3 { --reasoning-tone: color-mix(in srgb, var(--success-500) 76%, white); }
+.model-badge--level-4,
+.reasoning-tone--4 { --reasoning-tone: var(--success-500); }
+.model-badge--level-1,
+.model-badge--level-2,
+.model-badge--level-3,
+.model-badge--level-4 { --ecg: var(--reasoning-tone); }
+.model-badge-level.model-badge-level--0 { color: var(--text-tertiary); }
+.model-badge-level.model-badge-level--1,
+.model-badge-level.model-badge-level--2,
+.model-badge-level.model-badge-level--3,
+.model-badge-level.model-badge-level--4,
+.model-sheet-level.reasoning-tone--1,
+.model-sheet-level.reasoning-tone--2,
+.model-sheet-level.reasoning-tone--3,
+.model-sheet-level.reasoning-tone--4 { color: var(--reasoning-tone); }
+.model-badge-ecg {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 1;
+}
+.model-badge-ecg-edge {
+  position: absolute;
+  overflow: hidden;
+}
+.model-badge-ecg-edge--top,
+.model-badge-ecg-edge--bottom {
+  left: 8px;
+  right: 8px;
+  height: 2px;
+}
+.model-badge-ecg-edge--top { top: 0; }
+.model-badge-ecg-edge--bottom { bottom: 0; }
+.model-badge-ecg-edge--left,
+.model-badge-ecg-edge--right {
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+}
+.model-badge-ecg-edge--left { left: 0; }
+.model-badge-ecg-edge--right { right: 0; }
+.model-badge-ecg-runner {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 100%;
+  border-radius: 999px;
+}
+.model-badge-ecg-edge--top .model-badge-ecg-runner,
+.model-badge-ecg-edge--bottom .model-badge-ecg-runner {
+  background: linear-gradient(90deg, var(--ecg, var(--success-500)), transparent 14px);
+}
+.model-badge-ecg-edge--left .model-badge-ecg-runner,
+.model-badge-ecg-edge--right .model-badge-ecg-runner {
+  background: linear-gradient(180deg, var(--ecg, var(--success-500)), transparent 10px);
+}
+.model-badge-ecg-edge--top .model-badge-ecg-runner { animation: ecg-x 4.8s linear infinite; }
+.model-badge-ecg-edge--right .model-badge-ecg-runner { animation: ecg-y 4.8s linear -3.6s infinite; }
+.model-badge-ecg-edge--bottom .model-badge-ecg-runner { animation: ecg-x-back 4.8s linear -2.4s infinite; }
+.model-badge-ecg-edge--left .model-badge-ecg-runner { animation: ecg-y-back 4.8s linear -1.2s infinite; }
+@keyframes ecg-x {
+  0% { transform: translate3d(-100%, 0, 0); }
+  25% { transform: translate3d(100%, 0, 0); }
+  100% { transform: translate3d(100%, 0, 0); }
+}
+@keyframes ecg-x-back {
+  0% { transform: translate3d(100%, 0, 0); }
+  25% { transform: translate3d(-100%, 0, 0); }
+  100% { transform: translate3d(-100%, 0, 0); }
+}
+@keyframes ecg-y {
+  0% { transform: translate3d(0, -100%, 0); }
+  25% { transform: translate3d(0, 100%, 0); }
+  100% { transform: translate3d(0, 100%, 0); }
+}
+@keyframes ecg-y-back {
+  0% { transform: translate3d(0, 100%, 0); }
+  25% { transform: translate3d(0, -100%, 0); }
+  100% { transform: translate3d(0, -100%, 0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .model-badge-ecg-runner { animation: none; opacity: 0; }
+}
 .model-badge-icon { color: var(--ai-500); flex-shrink: 0; }
 .model-badge-caret { color: var(--text-tertiary); flex-shrink: 0; }
 .model-badge-name {
@@ -3112,8 +3831,153 @@ watch([() => state.currentID, queueSignature], () => {
   min-width: 0;
   flex: 1;
   font-family: var(--font-mono);
+  font-weight: 600;
+}
+.model-badge-level {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--text-secondary);
 }
 .model-badge--unset .model-badge-name { color: var(--text-tertiary); font-style: italic; }
+.model-sheet {
+  width: 240px;
+  background: var(--surface-1);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  padding: var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.reasoning-meter-track {
+  position: relative;
+  display: flex;
+  align-items: center;
+  height: 22px;
+  border-radius: 999px;
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.reasoning-meter-fill {
+  position: absolute;
+  z-index: 2;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  pointer-events: none;
+  overflow: hidden;
+  transition: width var(--dur-base) var(--ease-out), background var(--dur-base) var(--ease-out);
+}
+.reasoning-meter-fill--live::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 40%;
+  background: linear-gradient(90deg, transparent, color-mix(in srgb, white 55%, transparent), transparent);
+  transform: translateX(-120%);
+  animation: reasoning-meter-loop 1.6s linear infinite;
+}
+@keyframes reasoning-meter-loop {
+  from { transform: translateX(-120%); }
+  to { transform: translateX(280%); }
+}
+.reasoning-meter-stop {
+  position: relative;
+  z-index: 3;
+  flex: 1;
+  height: 100%;
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.reasoning-meter-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--surface-0);
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--text-tertiary) 70%, var(--border-default));
+  pointer-events: none;
+}
+.reasoning-meter-dot--passed {
+  background: var(--surface-0);
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--success-500) 55%, white);
+}
+.reasoning-meter-dot--current {
+  width: 16px;
+  height: 16px;
+  background: var(--surface-0);
+  box-shadow:
+    0 1px 2px color-mix(in srgb, black 16%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--success-500) 40%, var(--border-default));
+}
+.model-sheet-model {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 2px 0 2px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-1);
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.model-sheet-level {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  color: var(--text-1);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  transition: color var(--dur-fast) var(--ease-out), background var(--dur-fast) var(--ease-out);
+}
+.model-sheet-name-row {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  max-width: 100%;
+  min-width: 0;
+  color: var(--text-1);
+  font-size: 14px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+.model-sheet-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+.model-sheet-model:hover,
+.model-sheet-model:hover .model-sheet-name-row {
+  color: var(--text-tertiary);
+}
+.model-sheet-model:hover .model-sheet-level {
+  color: var(--text-tertiary);
+  background: var(--surface-3);
+}
 
 /* --- Session config popover ------------------------------------ */
 .session-config-trigger {
@@ -3391,6 +4255,7 @@ watch([() => state.currentID, queueSignature], () => {
  * radio-style rows (always-ask / auto-approve / full-
  * access). Kept narrow — the user picks one and the
  * popover closes. */
+.perm-popover--wide { width: 240px; }
 .perm-popover {
   width: 200px;
   background: var(--surface-1);
@@ -3401,6 +4266,20 @@ watch([() => state.currentID, queueSignature], () => {
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.perm-popover--compare {
+  width: max-content;
+  min-width: 196px;
+  max-width: 280px;
+}
+.style-compare-actions {
+  display: flex;
+  gap: var(--space-1);
+  padding: var(--space-1) 2px 2px;
+}
+.style-compare-actions .scene-capsule {
+  flex: 1;
+  justify-content: center;
 }
 .perm-popover-label {
   font-size: 10.5px;
@@ -3437,7 +4316,7 @@ watch([() => state.currentID, queueSignature], () => {
 .perm-popover-radio {
   width: 12px; height: 12px;
   border-radius: 50%;
-  border: 1.5px solid var(--border-strong);
+  border: var(--control-border);
   flex-shrink: 0;
   position: relative;
 }

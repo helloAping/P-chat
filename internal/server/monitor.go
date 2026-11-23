@@ -11,7 +11,8 @@ package server
 // the heartbeat interval and heap-dump threshold at runtime via the
 // /api/v1/diagnostics/config endpoint.
 //
-//	PC_PPROF             "0" disables the /debug/pprof endpoint (default on)
+//	PC_PPROF             "1" enables the /debug/pprof endpoint (default off)
+//	PC_DIAGNOSTICS_SNAPSHOTS "1" enables loopback-only snapshot downloads (default off)
 //	PC_MEM_HEARTBEAT_SEC seconds between heartbeat log lines (default 30, 0 = off)
 //	PC_HEAP_DUMP_MB      auto-dump heap profile when heap exceeds this MB
 //	                     (default 1024, 0 = off)
@@ -38,11 +39,19 @@ import (
 // /debug/pprof/* (heap, goroutine, allocs, profile, ...). net/http/pprof
 // registers its handlers on http.DefaultServeMux when imported, so we delegate
 // the whole subtree to it.
+//
+// The endpoint is opt-in (PC_PPROF=1): heap/goroutine snapshots can contain
+// secrets and message content, so an unauthenticated local endpoint must not
+// be on by default.
 func registerPprof(r *gin.Engine) {
-	if os.Getenv("PC_PPROF") == "0" {
+	if os.Getenv("PC_PPROF") != "1" {
 		return
 	}
 	serve := func(w http.ResponseWriter, req *http.Request) {
+		if !isLoopbackRemoteAddr(req.RemoteAddr) {
+			http.Error(w, "pprof endpoints are restricted to loopback clients", http.StatusForbidden)
+			return
+		}
 		http.DefaultServeMux.ServeHTTP(w, req)
 	}
 	r.GET("/debug/pprof", gin.WrapF(serve))
@@ -64,6 +73,7 @@ type DiagnosticsConfig struct {
 	MemHeartbeatSec int    `json:"mem_heartbeat_sec"`
 	HeapDumpMB      int    `json:"heap_dump_mb"`
 	PprofEnabled    bool   `json:"pprof_enabled"`
+	SnapshotEnabled bool   `json:"snapshot_enabled"`
 	HeapDumpDir     string `json:"heap_dump_dir"`
 }
 
@@ -113,9 +123,14 @@ func (m *memoryMonitor) config() DiagnosticsConfig {
 	return DiagnosticsConfig{
 		MemHeartbeatSec: m.heartbeatSec,
 		HeapDumpMB:      m.heapDumpMB,
-		PprofEnabled:    os.Getenv("PC_PPROF") != "0",
+		PprofEnabled:    os.Getenv("PC_PPROF") == "1",
+		SnapshotEnabled: diagnosticsSnapshotsEnabled(),
 		HeapDumpDir:     m.heapDumpDir,
 	}
+}
+
+func diagnosticsSnapshotsEnabled() bool {
+	return os.Getenv("PC_DIAGNOSTICS_SNAPSHOTS") == "1"
 }
 
 func (m *memoryMonitor) update(u DiagnosticsConfigUpdate) {
@@ -199,14 +214,19 @@ func (m *memoryMonitor) writeGoroutine() (string, error) {
 }
 
 func writeProfileFile(name string, write func(*os.File) error) error {
-	if err := os.MkdirAll(filepath.Dir(name), 0o755); err != nil {
+	// profile 可能包含栈参数、路径和运行时元数据，只允许当前用户读取。
+	// Profiles may expose stack arguments, paths, and runtime metadata; keep them owner-only.
+	if err := os.MkdirAll(filepath.Dir(name), 0o700); err != nil {
 		return fmt.Errorf("mkdir: %w", err)
 	}
-	f, err := os.Create(name)
+	f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return fmt.Errorf("create: %w", err)
 	}
 	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("chmod: %w", err)
+	}
 	if err := write(f); err != nil {
 		return fmt.Errorf("write: %w", err)
 	}

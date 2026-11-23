@@ -114,8 +114,8 @@ onUnmounted(() => {
     </div>
 
     <template #footer>
-      <NButton @click="cancel">取消</NButton>
-      <NButton type="primary" @click="confirm">确认</NButton>
+      <NButton size="small" quaternary @click="cancel">取消</NButton>
+      <NButton size="small" type="primary" @click="confirm">确认</NButton>
     </template>
   </AppModal>
 </template>
@@ -143,9 +143,9 @@ onUnmounted(() => {
   align-items: center;
   gap: 10px;
   padding: 12px;
-  border: 1px solid var(--border-default);
-  border-radius: var(--radius-md);
-  background: var(--surface-2);
+  border: var(--control-border);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--surface-2) 72%, transparent);
   cursor: pointer;
 }
 

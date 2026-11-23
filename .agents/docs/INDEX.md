@@ -23,16 +23,17 @@
 | 修改知识库系统（扫描/搜索/三层索引） | [knowledge.md](knowledge.md) | server.md, tool.md, frontend.md |
 | 修改浏览器控制（扩展/标签页/截图/权限策略） | [server.md](server.md) §10-12 | tool.md, frontend.md, [结构总览](../../docs/project-structure.md) |
 | 修改导出、自动更新、诊断接口 | [server.md](server.md) | [结构总览](../../docs/project-structure.md), frontend.md |
+| 修改稳定版/Beta 更新选择 | [server.md](server.md) | [frontend.md](frontend.md), [versioning.md](versioning.md), [功能状态](../../docs/feature-opportunities.md) |
 | 修改版本升级流程 | [upgrade.md](upgrade.md) | knowledge.md |
 | 修改 CLI 终端界面 (REPL) | [cli.md](cli.md) | server.md, agent.md |
 | 修改沙箱/安全检查 | [infrastructure.md](infrastructure.md) | tool.md |
 | 修改 Skill/Agent 定义系统 | [infrastructure.md](infrastructure.md) | subagent.md |
 | 修改项目目录管理 | [infrastructure.md](infrastructure.md) | config.md |
 | 修改多环境共存、运行 profile、动态端口或 server 启动握手 | [infrastructure.md](infrastructure.md) § Server 进程管理 | [server.md](server.md), [frontend.md](frontend.md), [设计背景](../../docs/plans/runtime-profile-coexistence.md) |
-| **修改 IM 桥接（飞书 / TG / 企微 / QQ / 微信 Gateway）** | [**im.md**](im.md) | [server.md](server.md), [config.md](config.md), [agent.md](agent.md), [实现计划](../../docs/plans/im-bridge-plan.md) |
 | 回答用户“agent 功能怎么用 / GUI 怎么操作” | [../../README.md](../../README.md)「GUI 操作速查 / 常见问题」 | [完整图文指南](../../docs/p-chat-article-2026-09.md), agent.md, tool.md, frontend.md |
 | 梳理项目目录、模块职责、运行流 | [../../docs/project-structure.md](../../docs/project-structure.md) | 本索引 + 对应模块文档 |
 | 查看当前项目现状与可做事项 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) | — |
+| 风格记忆 / 风格对照 / 回合改动摘要 / 书签备注 | [../../docs/feature-opportunities.md](../../docs/feature-opportunities.md) §1.8 | [后续计划](../../docs/plans/local-life-followups.md), memory.md, tool.md, frontend.md |
 | **P0-3 自动续 LLM / todo 守卫** | [agent.md](agent.md) §1 退出条件 | [实现计划](../../docs/plans/auto-continue-plan.md), [用户指南](../../docs/auto-continue.md) |
 | **P3-3 端到端 trace id** | [trace 包](../../internal/trace/trace.go) | [server.md](server.md) §8, [P3-3 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
 | **P3-2 工具 hot-reload** | [tool.md](tool.md) §8 | [P3-2 设计](../../docs/plans/round4-trace-and-extensibility-plan.md) |
@@ -58,7 +59,6 @@ P-Chat 项目
 │   ├── config/       → 请读 [config.md](config.md)
 │   ├── generation/   → 媒体生成执行器与资产存储，先读 [实现说明](../../docs/plans/media-generation-implementation.md)
 │   ├── cli/          → 请读 [cli.md](cli.md)
-│   ├── im/           → 请读 [im.md](im.md)   # IM 桥接 Gateway（飞书 / TG / 企微 / QQ / 微信）
 │   ├── browser/      → 浏览器控制，先读 [server.md](server.md) §10-12
 │   ├── export/       → 会话导出，先读 [server.md](server.md)
 │   ├── update/       → 自动更新，先读 [server.md](server.md)

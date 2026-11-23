@@ -1,13 +1,12 @@
 <script setup lang="ts">
-// Compact card for an LLM `question` tool call.
-// Options render as single-line chips (label only; description
-// lives in the title tooltip) so multi-option questions stay
-// scannable instead of stacking tall two-line cards.
-import { computed } from 'vue'
+// Answered questions stay in the transcript as a short confirmed list.
+// Options are not repeated here; selection happens in QuestionModal.
+import { computed, ref } from 'vue'
 import type { MessagePart } from '../api/client'
-import { Circle, Square, Check, TextCursorInput } from './icons'
+import { Check } from './icons'
 
 const props = defineProps<{ part: Extract<MessagePart, { kind: 'question' }> }>()
+const PREVIEW_COUNT = 3
 
 interface QuestionItem {
   question: string
@@ -28,31 +27,16 @@ const answers = computed<AnswerMap>(() => {
 
 const isOpen = computed(() => !props.part.question_status || props.part.question_status === 'open')
 const isErrored = computed(() => props.part.question_status === 'error')
+const expanded = ref(true)
+const showAll = ref(false)
 
-function selected(header: string, label: string): boolean {
-  return answerValues(header).includes(label)
-}
+const rows = computed(() => questions.value.map((question) => ({
+  header: question.header || question.question,
+  value: (answers.value[question.header] || '').trim(),
+})).filter((row) => row.value))
 
-function answerValues(header: string): string[] {
-  const ans = answers.value[header] || ''
-  return ans.split(/\s*,\s*/).map(v => v.trim()).filter(Boolean)
-}
-
-function customAnswersFor(q: QuestionItem): string[] {
-  const labels = new Set((q.options || []).map(opt => opt.label))
-  return answerValues(q.header).filter(value => !labels.has(value))
-}
-
-function isAnswered(q: QuestionItem): boolean {
-  return !!answers.value[q.header]
-}
-
-/** Prefer a one-line prompt; skip when it only repeats the header. */
-function promptLine(q: QuestionItem): string {
-  const prompt = (q.question || '').trim()
-  if (!prompt || prompt === q.header) return ''
-  return prompt
-}
+const visibleRows = computed(() => showAll.value ? rows.value : rows.value.slice(0, PREVIEW_COUNT))
+const hiddenCount = computed(() => Math.max(0, rows.value.length - PREVIEW_COUNT))
 </script>
 
 <template>
@@ -61,59 +45,28 @@ function promptLine(q: QuestionItem): string {
     class="question-card"
     :class="{ 'status-open': isOpen, 'status-error': isErrored }"
   >
-    <div class="qt-header">
+    <button type="button" class="qt-header" @click="expanded = !expanded">
       <span class="qt-header-icon" :class="isOpen ? 'pending' : isErrored ? 'errored' : 'done'">
         <Check v-if="!isOpen && !isErrored" :size="10" />
-        <Circle v-else-if="isOpen" :size="10" />
       </span>
-      <span class="qt-header-title">LLM 提问</span>
-      <span v-if="questions.length > 1" class="qt-header-count">{{ questions.length }} 题</span>
-      <span v-if="isOpen" class="qt-header-status">等待回答</span>
-      <span v-else-if="isErrored" class="qt-header-status error">未回答</span>
-      <span v-else class="qt-header-status done">已回答</span>
-    </div>
+      <span class="qt-header-title">{{ isErrored ? '未回答' : isOpen ? '等待确认' : '已确认' }}</span>
+      <span class="qt-header-count">{{ isOpen || isErrored ? questions.length : rows.length }} 项</span>
+      <span class="qt-caret">{{ expanded ? '⌄' : '›' }}</span>
+    </button>
 
-    <div class="qt-body">
-      <section
-        v-for="q in questions"
-        :key="q.header"
-        class="qt-group"
-        :class="{ 'qt-group-answered': isAnswered(q) }"
+    <div v-if="expanded && !isOpen && !isErrored" class="qt-body">
+      <div v-for="row in visibleRows" :key="row.header" class="qt-row">
+        <span class="qt-label">{{ row.header }}</span>
+        <span class="qt-value">{{ row.value }}</span>
+      </div>
+      <button
+        v-if="hiddenCount > 0"
+        type="button"
+        class="qt-more"
+        @click="showAll = !showAll"
       >
-        <div class="qt-group-head">
-          <span class="qt-q-title">{{ q.header }}</span>
-          <span v-if="q.multi_select" class="qt-multi">多选</span>
-        </div>
-        <p v-if="promptLine(q)" class="qt-q-prompt" :title="promptLine(q)">{{ promptLine(q) }}</p>
-
-        <div class="qt-options">
-          <span
-            v-for="opt in q.options"
-            :key="opt.label"
-            class="qt-option"
-            :class="{ 'qt-selected': selected(q.header, opt.label) }"
-            :title="opt.description || opt.label"
-          >
-            <component
-              :is="q.multi_select ? Square : Circle"
-              :size="11"
-              :fill="selected(q.header, opt.label) ? 'currentColor' : 'none'"
-              class="qt-pick-icon"
-            />
-            <span class="qt-option-label">{{ opt.label }}</span>
-          </span>
-
-          <span
-            v-for="answer in customAnswersFor(q)"
-            :key="`custom:${answer}`"
-            class="qt-option qt-option-custom qt-selected"
-            :title="answer"
-          >
-            <TextCursorInput :size="11" class="qt-pick-icon" />
-            <span class="qt-option-label">{{ answer }}</span>
-          </span>
-        </div>
-      </section>
+        {{ showAll ? '收起' : `展开其余 ${hiddenCount} 项` }} {{ showAll ? '⌃' : '⌄' }}
+      </button>
     </div>
   </div>
 </template>
@@ -121,172 +74,78 @@ function promptLine(q: QuestionItem): string {
 <style scoped>
 .question-card {
   margin: var(--space-2) 0;
-  border: 1px solid var(--border-subtle);
-  border-left: 3px solid var(--border-default);
-  border-radius: var(--radius-md);
-  background: var(--surface-1);
-  overflow: hidden;
   font-size: 12.5px;
 }
-.question-card.status-open { border-left-color: var(--brand-500); }
-.question-card.status-error { border-left-color: var(--warn-500); }
-
 .qt-header {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  padding: 6px var(--space-3);
-  border-bottom: 1px solid var(--border-subtle);
-  font-size: 12px;
-  color: var(--text-secondary);
+  width: 100%;
+  margin: 0;
+  padding: 6px 0;
+  border: none;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
 }
 .qt-header-icon {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 14px;
-  height: 14px;
+  width: 16px;
+  height: 16px;
   border-radius: 50%;
   flex-shrink: 0;
   background: var(--surface-3);
   color: var(--text-tertiary);
 }
-.qt-header-icon.pending { background: var(--brand-50); color: var(--brand-500); }
-.qt-header-icon.done { background: var(--success-50); color: var(--success-500); }
-.qt-header-icon.errored { background: var(--warn-50); color: var(--warn-500); }
-.qt-header-title {
-  color: var(--text-primary);
-  font-weight: 600;
+.qt-header-icon.pending { background: var(--surface-3); color: var(--question-green); }
+.qt-header-icon.done {
+  background: var(--question-green);
+  color: var(--question-on-green);
 }
+.qt-header-icon.errored { background: var(--warn-50); color: var(--warn-500); }
+.qt-header-title { font-weight: 600; }
 .qt-header-count {
   color: var(--text-tertiary);
-  font: 500 11px/1 var(--font-mono);
+  font-size: 12px;
 }
-.qt-header-status {
+.qt-caret {
   margin-left: auto;
-  padding: 0 var(--space-2);
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-pill);
-  color: var(--text-tertiary);
-  font-size: 11px;
-  line-height: 18px;
+  color: var(--text-quaternary);
+  font-size: 12px;
 }
-.qt-header-status.done {
-  border-color: color-mix(in srgb, var(--success-500) 35%, var(--border-subtle));
-  background: var(--success-50);
-  color: var(--success-500);
-}
-.qt-header-status.error {
-  border-color: color-mix(in srgb, var(--warn-500) 35%, var(--border-subtle));
-  background: var(--warn-50);
-  color: var(--warn-500);
-}
-
-.qt-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3) var(--space-3);
-}
-.qt-group {
-  min-width: 0;
-  padding: var(--space-2) 0 0;
+.qt-row {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: var(--space-4);
+  padding: 11px 0;
   border-top: 1px solid var(--border-subtle);
 }
-.qt-group:first-child {
-  padding-top: 0;
-  border-top: 0;
+.qt-label {
+  color: var(--text-secondary);
+  font-size: 12.5px;
 }
-.qt-group-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  min-width: 0;
-  margin-bottom: 2px;
-}
-.qt-q-title {
-  min-width: 0;
-  overflow: hidden;
+.qt-value {
   color: var(--text-primary);
   font-size: 12.5px;
   font-weight: 600;
-  line-height: 1.3;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.qt-q-prompt {
-  margin: 0 0 var(--space-1);
-  color: var(--text-tertiary);
-  font-size: 11.5px;
-  line-height: 1.35;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.qt-multi {
-  display: inline-flex;
-  align-items: center;
-  flex-shrink: 0;
-  height: 16px;
-  padding: 0 6px;
-  border-radius: var(--radius-pill);
-  background: var(--brand-50);
-  color: var(--brand-500);
-  font-size: 10px;
-  font-weight: 600;
-  line-height: 1;
-}
-
-/* Wrapping chips — label may take up to two lines so long option text
- * (e.g. "…（推荐）") stays readable in the history card. */
-.qt-options {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.qt-option {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  max-width: 100%;
-  min-width: 0;
-  min-height: 26px;
-  height: auto;
-  padding: 3px 8px 3px 6px;
-  border: 1px solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  background: var(--surface-2);
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.35;
-  transition:
-    border-color var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out),
-    background var(--dur-fast) var(--ease-out);
-}
-.qt-option.qt-selected {
-  border-color: var(--brand-100);
-  background: var(--brand-50);
-  color: var(--brand-600);
-}
-.qt-option.qt-selected .qt-option-label { font-weight: 600; }
-.qt-option.qt-selected .qt-pick-icon { color: var(--brand-500); }
-.qt-option-custom {
-  border-style: dashed;
-  max-width: min(100%, 280px);
-}
-.qt-pick-icon {
-  flex-shrink: 0;
-  color: var(--text-tertiary);
-}
-.qt-option-label {
-  min-width: 0;
-  overflow: hidden;
-  color: inherit;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  white-space: normal;
+  line-height: 1.4;
   word-break: break-word;
+}
+.qt-more {
+  width: 100%;
+  margin: 0;
+  padding: 10px 0 4px;
+  border: none;
+  border-top: 1px solid var(--border-subtle);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
 }
 </style>

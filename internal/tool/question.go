@@ -7,7 +7,6 @@ import (
 	"log"
 	"sort"
 	"sync"
-	"time"
 )
 
 type QuestionOption struct {
@@ -56,7 +55,9 @@ func eventSenderFromCtx(ctx context.Context) func(string) {
 
 // WaitForAnswer sends the question payload through a callback
 // (which should write to the tool event channel for SSE) and
-// blocks until the user responds or the context is cancelled.
+// blocks until the user submits an answer or the context is
+// cancelled (user stop / client disconnect). There is no wait
+// timeout: an open question stays open until one of those happens.
 func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, sendFn func(jsonData string)) (QuestionResponse, error) {
 	ch := make(chan QuestionResponse, 1)
 
@@ -65,8 +66,8 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 	// just overwrite the map entry — do NOT close the old
 	// channel. Closing while SubmitAnswer may still hold a
 	// reference and write to it would cause a panic.
-	// The old goroutine will return via QuestionWaitTimeout
-	// (or ctx cancel) and the old channel is then GC'd.
+	// The old goroutine returns when its context is cancelled
+	// and the old channel is then GC'd.
 	questionChs[sessionID] = ch
 	questionMu.Unlock()
 
@@ -88,9 +89,7 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 	}
 
 	waitCtx := InteractiveContextFrom(ctx)
-	log.Printf("[question] waiting for user answer (session=%s, timeout=%s)", sessionID, QuestionWaitTimeout)
-	timer := time.NewTimer(QuestionWaitTimeout)
-	defer timer.Stop()
+	log.Printf("[question] waiting for user answer (session=%s, no timeout)", sessionID)
 	select {
 	case <-waitCtx.Done():
 		log.Printf("[question] ctx cancelled (session=%s): %v", sessionID, waitCtx.Err())
@@ -125,9 +124,6 @@ func WaitForAnswer(ctx context.Context, sessionID string, questions []Question, 
 			sendFn(string(data))
 		}
 		return resp, nil
-	case <-timer.C:
-		log.Printf("[question] timeout (session=%s)", sessionID)
-		return QuestionResponse{}, fmt.Errorf("question timed out waiting for user response")
 	}
 }
 

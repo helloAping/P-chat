@@ -82,6 +82,30 @@ func TestClient_ListSkills(t *testing.T) {
 	}
 }
 
+func TestClient_SessionInstructionObservations(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/sessions/conv-1/rules":
+			_ = json.NewEncoder(w).Encode(map[string]any{"rules": []RuleInfo{{Name: "global", Scope: "global", Path: "/home/u/.p-chat/rules/global.md"}, {Name: "project", Scope: "project", Path: "/repo/.p-chat/rules/project.md"}}})
+		case "/api/v1/sessions/conv-1/agents":
+			_ = json.NewEncoder(w).Encode(AgentsContext{Candidates: []AgentsCandidate{{Slot: "project_root", Label: "项目根", Path: "/repo/AGENTS.md", Exists: true, Selected: true}, {Slot: "global", Label: "全局", Path: "/home/u/.p-chat/AGENTS.md", Exists: true}}, Prompt: "## Agent Instructions\n\n### Project (root)\n\nproject"})
+		default:
+			t.Fatalf("unexpected request: %s", r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	client := NewClient(srv.URL)
+	rules, err := client.ListSessionRules(context.Background(), "conv-1")
+	if err != nil || len(rules) != 2 || rules[1].Scope != "project" {
+		t.Fatalf("ListSessionRules = %+v, %v", rules, err)
+	}
+	agents, err := client.GetSessionAgents(context.Background(), "conv-1")
+	if err != nil || len(agents.Candidates) != 2 || !agents.Candidates[0].Selected || !strings.Contains(agents.Prompt, "Project (root)") {
+		t.Fatalf("GetSessionAgents = %+v, %v", agents, err)
+	}
+}
+
 func TestClient_ListSessions_FreshServer(t *testing.T) {
 	// pchat-server auto-creates a "current" session on startup, so a
 	// brand-new server has 1 session, not 0. We verify the list
@@ -96,6 +120,239 @@ func TestClient_ListSessions_FreshServer(t *testing.T) {
 	}
 	if len(sessions) != 1 {
 		t.Errorf("fresh server should have 1 session, got %d", len(sessions))
+	}
+}
+
+func TestClient_ListSessionsForProject_EncodesAndPreservesEmptyScope(t *testing.T) {
+	t.Run("project", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if got := r.URL.Query().Get("project_path"); got != "D:/my project" {
+				t.Fatalf("project_path = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		}))
+		defer srv.Close()
+		path := "D:/my project"
+		if _, err := NewClient(srv.URL).ListSessionsForProject(context.Background(), &path); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("global", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if _, ok := r.URL.Query()["project_path"]; !ok {
+				t.Fatal("project_path query parameter missing")
+			}
+			if got := r.URL.Query().Get("project_path"); got != "" {
+				t.Fatalf("project_path = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"sessions":[]}`))
+		}))
+		defer srv.Close()
+		path := ""
+		if _, err := NewClient(srv.URL).ListSessionsForProject(context.Background(), &path); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestClient_ExportSessionDownloadsBodyAndSafeFilename(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sessions/conv%2F1/export" && r.URL.Path != "/api/v1/sessions/conv/1/export" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("format"); got != "pdf" {
+			t.Fatalf("format = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/pdf")
+		w.Header().Set("Content-Disposition", `attachment; filename="fallback.pdf"; filename*=UTF-8''..%2Freport.pdf`)
+		_, _ = w.Write([]byte("%PDF-test"))
+	}))
+	defer srv.Close()
+
+	file, err := NewClient(srv.URL).ExportSession(context.Background(), "conv/1", "pdf")
+	if err != nil {
+		t.Fatalf("ExportSession: %v", err)
+	}
+	if got := string(file.Body); got != "%PDF-test" {
+		t.Fatalf("body = %q", got)
+	}
+	if file.Filename != "report.pdf" {
+		t.Fatalf("filename = %q", file.Filename)
+	}
+	if file.ContentType != "application/pdf" {
+		t.Fatalf("content type = %q", file.ContentType)
+	}
+}
+
+func TestClient_ExportSessionReturnsHTTPError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	_, err := NewClient(srv.URL).ExportSession(context.Background(), "missing", "md")
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("err = %v, want HTTP 404", err)
+	}
+}
+
+func TestClient_KnowledgeAPIsUseCanonicalServerRoutes(t *testing.T) {
+	var seen []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Method+" "+r.URL.EscapedPath())
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/knowledge/bases":
+			_ = json.NewEncoder(w).Encode([]KnowledgeBase{{Name: "docs", Path: "D:/docs", Enabled: true, DocCount: 7}})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/knowledge/bases":
+			var base KnowledgeBase
+			if err := json.NewDecoder(r.Body).Decode(&base); err != nil {
+				t.Fatal(err)
+			}
+			if base.Name != "docs" || base.Path != "D:/docs" || !base.Enabled {
+				t.Fatalf("base = %+v", base)
+			}
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPatch && r.URL.Path == "/api/v1/knowledge/config":
+			var patch struct {
+				Enabled *bool `json:"enabled"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
+				t.Fatal(err)
+			}
+			if patch.Enabled == nil || !*patch.Enabled {
+				t.Fatalf("knowledge patch = %+v, want enabled=true", patch)
+			}
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && r.URL.Path == "/api/v1/knowledge/bases/docs one":
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/knowledge/bases/docs one/scan":
+			w.WriteHeader(http.StatusAccepted)
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/knowledge/bases/docs one/scan/status":
+			_ = json.NewEncoder(w).Encode(KnowledgeScanStatus{Message: "扫描中...", Current: 2, Total: 5, Chunks: 8})
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/knowledge/search":
+			var request KnowledgeSearchRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			if request.Query != "setup" || request.TopK != 5 {
+				t.Fatalf("search request = %+v", request)
+			}
+			_ = json.NewEncoder(w).Encode(KnowledgeSearchResponse{Query: request.Query, Results: []KnowledgeSearchResult{{Title: "Install", Source: "guide.md", Content: "run setup"}}})
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	ctx := context.Background()
+	bases, err := c.ListKnowledgeBases(ctx)
+	if err != nil || len(bases) != 1 || bases[0].DocCount != 7 {
+		t.Fatalf("ListKnowledgeBases = %+v, %v", bases, err)
+	}
+	if err := c.AddKnowledgeBase(ctx, KnowledgeBase{Name: "docs", Path: "D:/docs", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SetKnowledgeEnabled(ctx, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.RemoveKnowledgeBase(ctx, "docs one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.StartKnowledgeScan(ctx, "docs one"); err != nil {
+		t.Fatal(err)
+	}
+	status, err := c.GetKnowledgeScanStatus(ctx, "docs one")
+	if err != nil || status.Message != "扫描中..." || status.Current != 2 || status.Total != 5 {
+		t.Fatalf("GetKnowledgeScanStatus = %+v, %v", status, err)
+	}
+	search, err := c.SearchKnowledge(ctx, KnowledgeSearchRequest{Query: "setup", TopK: 5})
+	if err != nil || len(search.Results) != 1 || search.Results[0].Title != "Install" {
+		t.Fatalf("SearchKnowledge = %+v, %v", search, err)
+	}
+
+	joined := strings.Join(seen, "\n")
+	for _, want := range []string{
+		"GET /api/v1/knowledge/bases",
+		"POST /api/v1/knowledge/bases",
+		"PATCH /api/v1/knowledge/config",
+		"DELETE /api/v1/knowledge/bases/docs%20one",
+		"POST /api/v1/knowledge/bases/docs%20one/scan",
+		"GET /api/v1/knowledge/bases/docs%20one/scan/status",
+		"POST /api/v1/knowledge/search",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in requests:\n%s", want, joined)
+		}
+	}
+}
+
+func TestClient_ProviderCRUDUsesEscapedPathsAndRefreshesCache(t *testing.T) {
+	var requests []string
+	var patchBody map[string]any
+	deletedModel := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.EscapedPath())
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/providers":
+			models := []Model{{Name: "m/1", Default: true}}
+			if deletedModel {
+				models = []Model{}
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"providers": []ProviderInfo{{Name: "acme / one", Model: "m/1", Protocol: "openai", Models: models}}})
+		case r.Method == http.MethodPatch:
+			if err := json.NewDecoder(r.Body).Decode(&patchBody); err != nil {
+				t.Fatal(err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"name": "acme / one", "api_key": "secret"})
+		case r.Method == http.MethodDelete && strings.Contains(r.URL.Path, "/models/"):
+			deletedModel = true
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL)
+	c.SetCfgProviders([]ProviderInfo{{Name: "acme / one", Models: []Model{{Name: "m/1", Default: true}}}})
+	if err := c.SetModel("acme / one", "m/1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CreateProvider(context.Background(), ProviderCreate{Name: "new", Protocol: "openai", BaseURL: "https://example.test", Model: "m"}); err != nil {
+		t.Fatal(err)
+	}
+	emptyKey := ""
+	details, err := c.PatchProvider(context.Background(), "acme / one", ProviderPatch{APIKey: &emptyKey})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !details.APIKeySet {
+		t.Fatal("ProviderDetails did not preserve the API key configured state")
+	}
+	if got, ok := patchBody["api_key"]; !ok || got != "" {
+		t.Fatalf("patch api_key = %#v, want explicit empty string", patchBody)
+	}
+	if err := c.CreateModel(context.Background(), "acme / one", config.ModelConfig{Name: "m/1", Default: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.DeleteModel(context.Background(), "acme / one", "m/1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.ProviderModel(); got != "" {
+		t.Fatalf("ProviderModel after deleting selected model = %q, want empty", got)
+	}
+
+	joined := strings.Join(requests, "\n")
+	for _, want := range []string{
+		"POST /api/v1/providers",
+		"PATCH /api/v1/providers/acme%20%2F%20one",
+		"POST /api/v1/providers/acme%20%2F%20one/models/m%2F1/default",
+		"DELETE /api/v1/providers/acme%20%2F%20one/models/m%2F1",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("missing %q in requests:\n%s", want, joined)
+		}
 	}
 }
 
@@ -429,6 +686,28 @@ func TestClient_SendMessage_PreservesProviderAndModel(t *testing.T) {
 	}
 }
 
+func TestClient_SendMessage_PreservesToolsEnabled(t *testing.T) {
+	var got SendMessageOptions
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"type\":\"done\"}\n\n"))
+	}))
+	defer srv.Close()
+
+	disabled := false
+	if err := NewClient(srv.URL).SendMessage(context.Background(), "conv_x", SendMessageOptions{
+		Message: "hi", ToolsEnabled: &disabled,
+	}, func(StreamEvent) {}); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got.ToolsEnabled == nil || *got.ToolsEnabled {
+		t.Fatalf("tools_enabled = %v, want explicit false", got.ToolsEnabled)
+	}
+}
+
 func TestClient_ModelsForUsesProviderModelList(t *testing.T) {
 	c := NewClient("http://example.test")
 	c.SetCfgProviders([]ProviderInfo{{
@@ -446,6 +725,36 @@ func TestClient_ModelsForUsesProviderModelList(t *testing.T) {
 	}
 	if len(models) != 2 || models[1].Name != "gpt-4o-mini" {
 		t.Errorf("models = %#v, want conversational provider models only", models)
+	}
+}
+
+func TestClient_SetModel_DefaultAndFailureAreAtomic(t *testing.T) {
+	c := NewClient("http://example.test")
+	c.SetCfgProviders([]ProviderInfo{
+		{Name: "openai", Models: []Model{{Name: "gpt-4o"}, {Name: "gpt-4o-mini", Default: true}}},
+		{Name: "cs", Models: []Model{{Name: "doubao", Default: true}}},
+	})
+	c.SetCurrentProvider("openai")
+	c.currentModel = "gpt-4o-mini"
+
+	if err := c.SetModel("cs", ""); err != nil {
+		t.Fatalf("select provider default: %v", err)
+	}
+	if got := c.CurrentProvider(); got != "cs" {
+		t.Fatalf("provider = %q, want cs", got)
+	}
+	if got := c.ProviderModel(); got != "doubao" {
+		t.Fatalf("model = %q, want doubao", got)
+	}
+
+	if err := c.SetModel("openai", "missing"); err == nil {
+		t.Fatal("unknown model unexpectedly succeeded")
+	}
+	if got := c.CurrentProvider(); got != "cs" {
+		t.Fatalf("provider changed after failure: %q", got)
+	}
+	if got := c.ProviderModel(); got != "doubao" {
+		t.Fatalf("model changed after failure: %q", got)
 	}
 }
 

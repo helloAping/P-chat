@@ -161,7 +161,7 @@ func buildToolDefs() []tool.Tool {
 		},
 		{
 			Name:        "browser_evaluate",
-			Description: "Execute a JavaScript expression in the page context via an isolated world (bypasses page CSP). Returns the result as a string. Use for DOM queries, reading __INITIAL_STATE__, etc.",
+			Description: "Execute a JavaScript expression in the page context via an isolated world (bypasses page CSP). Returns the result as a string. Use for DOM queries, reading __INITIAL_STATE__, etc. Read-only by default: expressions that mutate the page or send data (fetch, postMessage, DOM writes, navigation, storage) are blocked unless browser.allow_eval_write=true.",
 			Parameters: tool.ObjectSchema(map[string]any{
 				"expression": tool.StringProp("JavaScript expression to evaluate. Has access to DOM APIs (querySelector, textContent, etc.) and page JS globals."),
 				"browser_id": bidPropOpt,
@@ -264,6 +264,7 @@ func makeHandler(hub *BridgeHub, policyFn PolicyProvider, toolName, method strin
 		}
 
 		browserID, _ := params["browser_id"].(string)
+		_, explicitTabID := params["tab_id"]
 		// Inject preferred tab when the model did not specify one.
 		// browser/tabs manages tabs itself; do not force tab_id there.
 		pageURL := ""
@@ -275,6 +276,33 @@ func makeHandler(hub *BridgeHub, policyFn PolicyProvider, toolName, method strin
 						params["tab_id"] = aid
 					}
 				}
+			}
+
+		}
+
+		// 显式 tab_id 的策略必须绑定到实际目标页，不能借用 preferred tab 的缓存 URL。
+		// Bind an explicit tab_id policy decision to its real target URL, never the preferred-tab cache.
+		// 否则缓存过期时会绕过 blocked_hosts；tab 管理命令自行解析目标，不能递归 list。
+		// A stale cache could bypass blocked_hosts; tab management resolves itself and must not recursively list.
+		if explicitTabID && method != "browser/tabs" {
+			tabID, ok := browserTabID(params["tab_id"])
+			if !ok {
+				return &tool.CallResult{Content: "E_BROWSER_POLICY: explicit tab_id is invalid", IsError: true}, nil
+			}
+			tabs, err := hub.ListTabs(ctx, browserID)
+			if err != nil {
+				return &tool.CallResult{Content: fmt.Sprintf("E_BROWSER_POLICY: cannot resolve explicit tab_id %d before policy check: %v", tabID, err), IsError: true}, nil
+			}
+			resolved := false
+			for _, tab := range tabs.Tabs {
+				if tab.ID == tabID {
+					pageURL = tab.URL
+					resolved = true
+					break
+				}
+			}
+			if !resolved {
+				return &tool.CallResult{Content: fmt.Sprintf("E_BROWSER_POLICY: explicit tab_id %d was not found before policy check", tabID), IsError: true}, nil
 			}
 		}
 
@@ -341,6 +369,30 @@ func makeHandler(hub *BridgeHub, policyFn PolicyProvider, toolName, method strin
 	}
 }
 
+// browserTabID accepts the JSON-decoded tab_id types used by tool handlers.
+// Zero and fractional values are invalid Chrome tab identifiers.
+func browserTabID(value any) (int, bool) {
+	switch id := value.(type) {
+	case float64:
+		if id <= 0 || id != float64(int(id)) {
+			return 0, false
+		}
+		return int(id), true
+	case int:
+		if id <= 0 {
+			return 0, false
+		}
+		return id, true
+	case int64:
+		if id <= 0 || int64(int(id)) != id {
+			return 0, false
+		}
+		return int(id), true
+	default:
+		return 0, false
+	}
+}
+
 // gateBrowserCall applies BR-04 policy. Returns blocked=true when the
 // call must not proceed (hard block or user rejected / confirm error).
 func gateBrowserCall(
@@ -351,24 +403,15 @@ func gateBrowserCall(
 	pageURL string,
 	rawArgs json.RawMessage,
 ) (blocked bool, result *tool.CallResult) {
-	if policyFn == nil {
-		return false, nil
+	// policyFn 缺失时仍采用安全默认值；evaluate 只读闸门不能被测试/应急 nil policy 绕过。
+	// A missing policyFn still gets safe defaults; nil policy must not bypass the evaluate read-only gate.
+	cfg := PolicyConfig{}
+	if policyFn != nil {
+		cfg = policyFn()
 	}
-	// permission=full skips confirm AND allowlist-only paths, but
-	// still honour hard BlockedHosts so a misconfigured "full"
-	// session cannot drive the browser onto blocked domains.
-	cfg := policyFn()
 	verdict := Decide(cfg, toolName, params, pageURL)
-
-	// evaluate write guard (independent of domain policy).
-	if toolName == "browser_evaluate" && !cfg.AllowEvalWrite {
-		// Soft note only — we still allow the call; the extension
-		// side may further restrict. Leave as policy signal for now.
-		_ = cfg.AllowEvalWrite
-	}
-
-	switch verdict.Decision {
-	case tool.SandboxBlock:
+	// blocked_hosts 始终先于 evaluate 的任何确认路径。blocked_hosts always wins before any evaluate confirmation path.
+	if verdict.Decision == tool.SandboxBlock {
 		return true, &tool.CallResult{
 			Content: fmt.Sprintf(
 				"E_BROWSER_POLICY: blocked\n  tool: %s\n  url: %s\n  host: %s\n  reason: %s",
@@ -376,6 +419,57 @@ func gateBrowserCall(
 			),
 			IsError: true,
 		}
+	}
+
+	// evaluate 三态闸门与域名、确认和会话 full/unsafe 权限正交：副作用硬拒绝；
+	// 明确只读走正常策略；未知表达式必须逐次显式确认。
+	// The evaluate tri-state gate is independent of host, confirmation, and full/unsafe permissions:
+	// side effects hard-fail, known reads use normal policy, and unknown expressions require explicit approval.
+	if toolName == "browser_evaluate" && !cfg.AllowEvalWrite {
+		expr, _ := params["expression"].(string)
+		class, reason := classifyEvalExpression(expr)
+		if class == evalExpressionBlocked {
+			return true, &tool.CallResult{
+				Content: fmt.Sprintf(
+					"E_BROWSER_POLICY: blocked\n  tool: %s\n  url: %s\n  reason: browser.allow_eval_write=false — %s. Use a read-only expression, or explicitly set browser.allow_eval_write=true for trusted page automation.",
+					toolName, pageURL, reason,
+				),
+				IsError: true,
+			}
+		}
+		if class == evalExpressionUnknown {
+			argsStr := string(rawArgs)
+			if argsStr == "" {
+				if encoded, err := json.Marshal(params); err == nil {
+					argsStr = string(encoded)
+				}
+			}
+			req := tool.ConfirmRequest{
+				ToolName:     toolName,
+				Args:         argsStr,
+				Reason:       "browser.evaluate expression is outside the conservative read-only subset; explicit one-time approval is required",
+				ResolvedPath: pageURL,
+				PathClass:    "browser",
+				RiskLevel:    "high",
+			}
+			approved, err := tool.RequireExplicitConfirm(ctx, req)
+			if err != nil {
+				return true, &tool.CallResult{Content: fmt.Sprintf("E_BROWSER_POLICY: explicit confirm failed: %v", err), IsError: true}
+			}
+			if !approved {
+				return true, &tool.CallResult{Content: "工具调用被用户拒绝", IsError: true}
+			}
+			return false, nil
+		}
+	}
+
+	if policyFn == nil {
+		return false, nil
+	}
+	// permission=full skips confirm AND allowlist-only paths, but
+	// still honour hard BlockedHosts so a misconfigured "full"
+	// session cannot drive the browser onto blocked domains.
+	switch verdict.Decision {
 	case tool.SandboxConfirm:
 		// Build a confirm payload the existing ToolConfirmModal
 		// already understands. ResolvedPath carries the page URL

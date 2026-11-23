@@ -159,7 +159,7 @@ func defaultToolPolicy(name string) ToolPolicy {
 	case name == "read_file" || name == "read_attachment" || name == "read_docx" || name == "read_pdf" || name == "list_files" || name == "grep" || name == "recall" || name == "wiki_lookup" || name == "wiki_list" || name == "task_status" || name == "image_recognize" || name == "media_recognize":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryRead, ToolSideEffectNone, ToolRiskLow, ToolParallelSafe
 		p.TimeoutMS = durationMS(ReadToolTimeout)
-	case name == "write_file" || name == "edit_file":
+	case name == "write_file" || name == "edit_file" || name == "apply_patch":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryMutate, ToolSideEffectWorkspace, ToolRiskConfirm, ToolParallelExclusive
 		p.TimeoutMS, p.RequiresVerification = durationMS(WriteToolTimeout), true
 	case name == "exec_command" || name == "start_process" || name == "stop_process" || name == "read_process_output" || name == "list_processes":
@@ -168,9 +168,15 @@ func defaultToolPolicy(name string) ToolPolicy {
 	case name == "todo_write":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryCheckpoint, ToolSideEffectState, ToolRiskLow, ToolParallelExclusive
 		p.TimeoutMS, p.Idempotent = durationMS(CheckpointToolTimeout), true
-	case name == "question":
+	case name == "question" || name == "remember":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryInteractive, ToolSideEffectNone, ToolRiskMedium, ToolParallelExclusive
-		p.TimeoutMS = durationMS(QuestionWaitTimeout)
+		// question 没有等待上限：用户不提交就一直停在这里。
+		// question has no wait cap; it stays open until the user submits.
+		p.TimeoutMS = -1
+		if name == "remember" {
+			p.SideEffect = ToolSideEffectState
+			p.Risk = ToolRiskConfirm
+		}
 	case name == "web_search":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryExternal, ToolSideEffectNetwork, ToolRiskMedium, ToolParallelExclusive
 		p.TimeoutMS = durationMS(WebSearchTimeout)

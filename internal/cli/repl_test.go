@@ -5,9 +5,10 @@ import (
 	"testing"
 
 	"github.com/p-chat/pchat/internal/config"
+	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
-	"github.com/p-chat/pchat/internal/subagent"
 	"github.com/p-chat/pchat/internal/style"
+	"github.com/p-chat/pchat/internal/subagent"
 )
 
 // REPL setter coverage. We don't drive Run() (it reads
@@ -31,8 +32,29 @@ func TestNewREPL_Defaults(t *testing.T) {
 	if r.rollbackUndo == nil {
 		t.Error("rollbackUndo map not initialised")
 	}
+	if r.toolCache == nil || r.toolCache.max != 20 {
+		t.Error("toolCache not initialised with the default size")
+	}
 	if r.runCtx == nil {
 		t.Error("runCtx default = nil, want context.Background()")
+	}
+}
+
+func TestREPL_SyncContextStateAfterHTTPCommand(t *testing.T) {
+	ctx := NewHTTPContext(httpcli.NewClient("http://example.test"), "tech", "coding", "openai", "session")
+	r := NewREPL(ctx, &config.Config{}, style.Tech, "openai")
+	if err := ctx.SetCurrentProvider("cs"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.SetStyle("cute"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ctx.SetMode("daily"); err != nil {
+		t.Fatal(err)
+	}
+	r.syncContextState()
+	if r.provider != "cs" || r.style != style.Cute || r.mode != config.WorkModeDaily {
+		t.Fatalf("REPL state = %q/%q/%q, want cs/cute/daily", r.provider, r.style, r.mode)
 	}
 }
 

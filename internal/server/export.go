@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -79,7 +80,15 @@ func (h *Handler) ExportSession(c *gin.Context) {
 		return
 	}
 
-	msgs := h.store.GetMessagesFullByID(id)
+	fromSeq, toSeq := int64(0), int64(0)
+	if format == export.FormatMarkdown {
+		fromSeq, toSeq, err = markdownExportRange(c)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	msgs := h.store.GetMessagesFullBySeqRange(id, fromSeq, toSeq)
 	msgs = h.resolveExportUploads(msgs)
 	if len(msgs) == 0 {
 		// Empty session still produces a valid
@@ -138,6 +147,37 @@ func (h *Handler) ExportSession(c *gin.Context) {
 			asciiName, export.URLEncodeFilename(unicodeName)))
 	c.Header("Content-Length", fmt.Sprintf("%d", len(body)))
 	c.Data(http.StatusOK, mime, body)
+}
+
+func markdownExportRange(c *gin.Context) (int64, int64, error) {
+	fromRaw := strings.TrimSpace(c.Query("from_seq"))
+	toRaw := strings.TrimSpace(c.Query("to_seq"))
+	if fromRaw == "" && toRaw == "" {
+		return 0, 0, nil
+	}
+	if fromRaw == "" || toRaw == "" {
+		return 0, 0, fmt.Errorf("from_seq and to_seq are both required")
+	}
+	fromSeq, err := parseSeqQuery(fromRaw, "from_seq")
+	if err != nil {
+		return 0, 0, err
+	}
+	toSeq, err := parseSeqQuery(toRaw, "to_seq")
+	if err != nil {
+		return 0, 0, err
+	}
+	if fromSeq > toSeq {
+		return 0, 0, fmt.Errorf("from_seq must be <= to_seq")
+	}
+	return fromSeq, toSeq, nil
+}
+
+func parseSeqQuery(raw, key string) (int64, error) {
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("%s must be a non-negative integer", key)
+	}
+	return n, nil
 }
 
 func (h *Handler) resolveExportUploads(msgs []memory.MessageFull) []memory.MessageFull {

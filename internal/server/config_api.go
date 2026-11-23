@@ -23,7 +23,7 @@ type AddProviderRequest struct {
 
 // AddProvider POST /api/v1/providers
 //
-// Writes the new provider to ~/.p-chat/config.json and reloads
+// Writes the new provider to the active config layer and reloads
 // the in-memory LLM client so the change takes effect immediately.
 // A name collision returns 409 Conflict (not 500) so the
 // web UI can show a clear "already exists" message.
@@ -37,7 +37,7 @@ func (h *Handler) AddProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := config.AddProvider(config.ProviderConfig{
+	if err := config.AddProviderAt(h.configPath, config.ProviderConfig{
 		Name:            req.Name,
 		ProviderID:      req.ProviderID,
 		StrategyVariant: req.StrategyVariant,
@@ -77,7 +77,7 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "不能删除当前默认 provider"})
 		return
 	}
-	if err := config.RemoveProvider(name); err != nil {
+	if err := config.RemoveProviderAt(h.configPath, name); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -87,12 +87,13 @@ func (h *Handler) DeleteProvider(c *gin.Context) {
 
 // UpdateProviderRequest is the body of PATCH /api/v1/providers/:name.
 //
-// Every field is optional. To set a field, include it with a
-// non-zero / non-empty value. Fields you omit are left
-// untouched on disk. To explicitly clear the API key, send
-// `{"api_key": ""}` and the server will write ""; the regular
-// "omit means leave alone" rule still applies to the other
-// fields.
+// Every field is optional. Fields you omit are left untouched on
+// disk. API key follows the Secret Redaction Contract (same as
+// web_search): omit = keep, clear_api_key=true = clear, non-empty
+// api_key = replace. An empty api_key without clear_api_key is
+// ignored (keep). custom_headers: nil = keep, empty map = clear
+// all, non-empty map replaces the key set; empty values keep the
+// previously stored value for that header name when present.
 type UpdateProviderRequest struct {
 	Name            string             `json:"name,omitempty"`
 	ProviderID      string             `json:"provider_id,omitempty"`
@@ -100,7 +101,8 @@ type UpdateProviderRequest struct {
 	Protocol        string             `json:"protocol,omitempty"`
 	BaseURL         string             `json:"base_url,omitempty"`
 	APIURL          string             `json:"api_url,omitempty"` // pre-V12 compatibility
-	APIKey          string             `json:"api_key,omitempty"`
+	APIKey          *string            `json:"api_key,omitempty"`
+	ClearAPIKey     bool               `json:"clear_api_key,omitempty"`
 	CustomHeaders   *map[string]string `json:"custom_headers,omitempty"`
 	// SetDefault, when true, makes this provider the global
 	// default. False is a no-op (the UI can always include
@@ -129,14 +131,19 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	updated, err := config.UpdateProvider(oldName, config.ProviderPatch{
+	apiKey := ""
+	if req.APIKey != nil {
+		apiKey = strings.TrimSpace(*req.APIKey)
+	}
+	updated, err := config.UpdateProviderAt(h.configPath, oldName, config.ProviderPatch{
 		Name:            req.Name,
 		ProviderID:      req.ProviderID,
 		StrategyVariant: req.StrategyVariant,
 		Protocol:        req.Protocol,
 		APIURL:          req.APIURL,
 		BaseURL:         req.BaseURL,
-		APIKey:          req.APIKey,
+		APIKey:          apiKey,
+		ClearAPIKey:     req.ClearAPIKey,
 		CustomHeaders:   req.CustomHeaders,
 		IsDefault:       req.SetDefault,
 	})
@@ -158,21 +165,10 @@ func (h *Handler) UpdateProvider(c *gin.Context) {
 		return
 	}
 	h.reloadAfterConfigChange()
-	// Return the full ProviderFull shape so the UI can re-render
-	// without a follow-up GET. Use the *new* name (which may
-	// differ from oldName when the user renamed the provider).
-	c.JSON(http.StatusOK, ProviderFull{
-		Name:            updated.Name,
-		ProviderID:      updated.GetProviderID(),
-		StrategyVariant: updated.GetStrategyVariant(),
-		Protocol:        updated.GetProtocol(),
-		BaseURL:         updated.EffectiveBaseURL(),
-		APIKey:          updated.APIKey,
-		CustomHeaders:   updated.CustomHeaders,
-		IsDefault:       updated.Name == h.getCfg().LLM.Default,
-		Models:          updated.AllModels(),
-		Model:           updated.EffectiveModel(),
-	})
+	// Return the redacted ProviderFull shape so the UI can
+	// re-render without a follow-up GET. Use the *new* name
+	// (which may differ from oldName on rename).
+	c.JSON(http.StatusOK, providerFullFrom(*updated, updated.Name == h.getCfg().LLM.Default))
 }
 
 // SetDefaultProviderRequest is the body of POST /api/v1/providers/:name/default.
@@ -185,7 +181,7 @@ func (h *Handler) SetDefaultProvider(c *gin.Context) {
 		return
 	}
 	name := c.Param("name")
-	if err := config.SetDefaultProvider(name); err != nil {
+	if err := config.SetDefaultProviderAt(h.configPath, name); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -196,6 +192,7 @@ func (h *Handler) SetDefaultProvider(c *gin.Context) {
 // AddModelRequest is the body of POST /api/v1/providers/:name/models.
 type AddModelRequest struct {
 	Name             string                             `json:"name" binding:"required"`
+	Protocol         string                             `json:"protocol,omitempty"`
 	APIEndpoint      string                             `json:"api_endpoint,omitempty"`
 	DisplayName      string                             `json:"display_name"`
 	Description      string                             `json:"description"`
@@ -217,8 +214,9 @@ func (h *Handler) AddModel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if _, err := config.AddModel(name, config.ModelConfig{
+	if _, err := config.AddModelAt(h.configPath, name, config.ModelConfig{
 		Name:             req.Name,
+		Protocol:         req.Protocol,
 		APIEndpoint:      req.APIEndpoint,
 		DisplayName:      req.DisplayName,
 		Description:      req.Description,
@@ -228,7 +226,7 @@ func (h *Handler) AddModel(c *gin.Context) {
 		Generation:       req.Generation,
 	}); err != nil {
 		status := http.StatusInternalServerError
-		if strings.Contains(err.Error(), "endpoint") || strings.Contains(err.Error(), "media generation model") || strings.Contains(err.Error(), "unsupported generation operation") {
+		if strings.Contains(err.Error(), "endpoint") || strings.Contains(err.Error(), "protocol") || strings.Contains(err.Error(), "media generation model") || strings.Contains(err.Error(), "unsupported generation operation") {
 			status = http.StatusBadRequest
 		}
 		c.JSON(status, gin.H{"error": err.Error()})
@@ -246,7 +244,7 @@ func (h *Handler) DeleteModel(c *gin.Context) {
 	}
 	name := c.Param("name")
 	model := c.Param("model")
-	if err := config.RemoveModel(name, model); err != nil {
+	if err := config.RemoveModelAt(h.configPath, name, model); err != nil {
 		if strings.Contains(err.Error(), "used by generation default") {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
@@ -266,7 +264,7 @@ func (h *Handler) SetDefaultModel(c *gin.Context) {
 	}
 	name := c.Param("name")
 	model := c.Param("model")
-	if err := config.SetDefaultModel(name, model); err != nil {
+	if err := config.SetDefaultModelAt(h.configPath, name, model); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

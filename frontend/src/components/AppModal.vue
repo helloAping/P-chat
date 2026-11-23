@@ -254,9 +254,9 @@ const sizeMap: Record<Size, number> = {
   z-index: 1;
 }
 .n-modal-container .n-card > .n-card-header {
-  padding: 16px 20px 12px !important;
+  padding: 16px 20px 4px !important;
   background: transparent !important;
-  border-bottom: 1px solid var(--border-subtle) !important;
+  border-bottom: none !important;
 }
 .n-modal-container .n-card__content,
 .n-modal-container .n-card__action {
@@ -268,9 +268,9 @@ const sizeMap: Record<Size, number> = {
   overflow-y: auto;
 }
 .n-modal-container .n-card__action {
-  border-top: 1px solid var(--border-subtle) !important;
-  padding-top: 12px !important;
-  padding-bottom: 14px !important;
+  border-top: none !important;
+  padding-top: 4px !important;
+  padding-bottom: 16px !important;
 }
 .n-modal-mask {
   background: var(--surface-overlay) !important;

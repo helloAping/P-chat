@@ -1,13 +1,17 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/p-chat/pchat/internal/httpcli"
 	"github.com/p-chat/pchat/internal/llm"
 	"github.com/p-chat/pchat/internal/memory"
 	openai "github.com/sashabaranov/go-openai"
@@ -39,6 +43,8 @@ func TestParseExportArgs_Format(t *testing.T) {
 		{"markdown", FormatMarkdown},
 		{"md", FormatMarkdown},
 		{"json", FormatJSON},
+		{"html", FormatHTML},
+		{"pdf", FormatPDF},
 		{"JSON", FormatJSON},
 		{"markdown -o x.md", FormatMarkdown},
 		{"json -o x.json", FormatJSON},
@@ -48,6 +54,45 @@ func TestParseExportArgs_Format(t *testing.T) {
 		if opts.format != c.want {
 			t.Errorf("parseExportArgs(%q).format = %q, want %q", c.in, opts.format, c.want)
 		}
+	}
+}
+
+func TestDoHTTPExportUsesSuggestedFilenameAndCurrentSession(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v1/sessions/conv-current/export" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("format"); got != "html" {
+			t.Fatalf("format = %q", got)
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="..\\export.html"`)
+		_, _ = w.Write([]byte("<html>ok</html>"))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	oldCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldCwd) })
+
+	path, err := doHTTPExport(context.Background(), httpcli.NewClient(srv.URL), "conv-current", "", "html")
+	if err != nil {
+		t.Fatalf("doHTTPExport: %v", err)
+	}
+	if filepath.Dir(path) != dir || filepath.Base(path) != "export.html" {
+		t.Fatalf("path = %q", path)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "<html>ok</html>" {
+		t.Fatalf("body = %q", body)
 	}
 }
 

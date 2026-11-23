@@ -123,11 +123,11 @@ func (h *Handler) recognitionRouteAvailable(kind config.MediaKind, route config.
 		if provider.Name != route.Provider {
 			continue
 		}
-		if kind != config.MediaImage && !config.ProtocolIsOpenAICompatible(provider.GetProtocol()) {
-			return false
-		}
 		for _, model := range provider.Models {
 			if model.Name == route.Model {
+				if kind != config.MediaImage && !config.ProtocolIsOpenAICompatible(model.EffectiveProtocol(provider.GetProtocol())) {
+					return false
+				}
 				return model.Capabilities.SupportsInput(kind)
 			}
 		}
@@ -176,7 +176,7 @@ func (h *Handler) UpdateSystemConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body: " + err.Error()})
 		return
 	}
-	updated, err := config.UpdateSystemConfig(patch)
+	updated, err := config.UpdateSystemConfigAt(h.configPath, patch)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

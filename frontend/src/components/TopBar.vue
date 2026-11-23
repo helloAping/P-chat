@@ -11,16 +11,17 @@
  *
  *   left:    sidebar collapse toggle
  *   center:  session title (H1) + project breadcrumb separator
- *   right:   theme / inspector toggle
+   *   right:   mute / theme / inspector toggle
  *
  * Brand mark lives in TitleBar (frameless chrome), not here.
  */
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { NButton, NTooltip } from 'naive-ui'
 import { state } from '../stores/chat'
+import { notifyManager } from '../utils/notify'
 import {
   FolderOpen, PanelLeftClose, PanelLeftOpen, PanelRight, PanelRightClose,
-  GitBranch, CheckCircle2, AlertCircle, Sun, Moon,
+  GitBranch, CheckCircle2, AlertCircle, Sun, Moon, Volume2, VolumeX,
 } from './icons'
 
 const props = defineProps<{
@@ -73,6 +74,14 @@ function toggleSidebar() { emit('toggle-sidebar') }
 function toggleInspector() { emit('toggle-inspector') }
 function toggleTheme() { emit('toggle-theme') }
 
+const muted = ref(notifyManager.mute)
+function toggleMute() {
+  notifyManager.unlock()
+  notifyManager.mute = !notifyManager.mute
+  muted.value = notifyManager.mute
+}
+const muteTitle = computed(() => muted.value ? '开启提示音' : '关闭提示音')
+
 const themeToggleTitle = computed(() =>
   props.themeName === 'dark' ? '切换到浅色主题' : '切换到深色主题',
 )
@@ -118,19 +127,33 @@ const themeToggleTitle = computed(() =>
         </div>
         <span v-if="sessionTitle" class="separator" aria-hidden="true">/</span>
       </template>
-      <div
-        v-if="sessionTitle"
-        class="session-title"
-        :title="sessionTitle"
-      >{{ sessionTitle }}</div>
-      <template v-else-if="!projectName">
-        <div class="session-title">全局会话</div>
-      </template>
+      <div v-if="sessionTitle || !projectName" class="title-block">
+        <div
+          v-if="sessionTitle"
+          class="session-title"
+          :title="sessionTitle"
+        >{{ sessionTitle }}</div>
+        <div v-else class="session-title">全局会话</div>
+      </div>
     </div>
 
-    <!-- Right section: theme and inspector only. Project/session utilities
-         live in the InspectorPanel so this toolbar stays calm. -->
+    <!-- Right section: mute, theme, and inspector. Session controls
+         live as floating capsules above the composer. -->
     <div class="topbar-right">
+      <NTooltip>
+        <template #trigger>
+          <NButton
+            size="tiny"
+            quaternary
+            :aria-label="muteTitle"
+            :title="muteTitle"
+            @click="toggleMute"
+          >
+            <component :is="muted ? VolumeX : Volume2" :size="16" />
+          </NButton>
+        </template>
+        {{ muteTitle }}
+      </NTooltip>
       <NTooltip>
         <template #trigger>
           <NButton
@@ -167,12 +190,13 @@ const themeToggleTitle = computed(() =>
 .topbar {
   height: 40px;
   flex-shrink: 0;
+  position: relative;
   display: flex;
   align-items: center;
   gap: var(--space-3);
   padding: 0 var(--space-4);
-  background: var(--surface-1);
-  border-bottom: 1px solid var(--border-subtle);
+  background: var(--surface-0);
+  border-bottom: none;
   z-index: 10;
 }
 
@@ -211,6 +235,11 @@ const themeToggleTitle = computed(() =>
   font-size: 13.5px;
   color: var(--text-primary);
 }
+.title-block {
+  min-width: 0;
+}
+/* The idle/empty mascot lives above the composer (see InputArea);
+ * the top bar no longer hosts a cat. */
 .session-title {
   font-weight: 500;
   white-space: nowrap;
@@ -278,6 +307,9 @@ const themeToggleTitle = computed(() =>
   align-items: center;
   gap: 4px;
   flex-shrink: 0;
+  /* Pin to the far right even when topbar-center isn't rendered
+   * (brand-new untitled session has no title, so center is absent). */
+  margin-left: auto;
 }
 
 @media (max-width: 960px) {

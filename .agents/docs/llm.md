@@ -50,11 +50,14 @@ type ProtocolAdapter interface {
 - ParseStream: 解析 `response.output_text.delta`、`response.refusal.delta`、reasoning summary / reasoning text、function call arguments、`response.completed` / `response.failed` 等事件。
 - 工具调用按 Responses 的 `call_id` / `output_item.done` 归一成 `ToolCallDelta`；usage 解析 `input_tokens` / `output_tokens` 与 cached tokens。
 - `reasoning_effort` 在 Responses 下会转换为顶层 `reasoning.effort`。
+- SSE 按标准 event 边界拼接多条 `data:` 行，支持 `data:` 后无空格；只有 `response.completed` 才是成功终态。`error`、`response.failed`、`response.incomplete`、解析失败、提前 EOF 和孤立 `[DONE]` 都返回错误，避免把截断响应误报为成功。
+- `response.output_item.done` 的原始 item 按 `output_index` 保存到助手消息 `Meta["responses_output_items"]`。工具续轮和数据库重载后直接回放原 item，保留 reasoning summary、`encrypted_content`、`fc_*` item id、`call_id` 和 message/function_call 的原始顺序。
+- Responses 开启 reasoning 时会移除 `temperature`、`top_p`、`top_logprobs`，避免当前推理模型因不兼容采样参数拒绝请求。
 
 **Anthropic Adapter** (`anthropic_adapter.go`):
 - Build: 将 ChatMessage[] 转为 Anthropic `MessagesRequest` JSON
   - **assistant 消息合并**（P2-3）：连续 assistant-role 的 text 块和 `tool_use` 块合并到同一条 assistant 消息的 content 数组；连续 `tool_result` 块也合并到同一条 user 消息的 content 数组。
-- ParseStream: 逐行读取 SSE (`event: ...` → `data: ...`)，解析 content_block_start/delta/stop、thinking_delta 等事件
+- ParseStream: 逐行读取 SSE (`event: ...` → `data: ...`)，解析 content_block_start/delta/stop、thinking_delta；`tool_use` 按 content block `index` 归集，起始事件发出 ID/名称，`input_json_delta.partial_json` 原样作为参数增量，并在无参 block stop 时补 `{}`
 - 原生支持 `thinking` 块
 - DeepSeek 带 tools 请求回传已有 thinking；其他模型不注入缺少签名的 DeepSeek thinking 块。
 - `pchat_context_*` 动态快照包装为原位置的 user 内容，不合并到顶层 system。
@@ -83,6 +86,10 @@ type ChatMessage struct {
 - `tool_call` — LLM 发出的工具调用（OpenAI native）
 - `tool_result` — 工具执行结果
 - `thinking` — 展示用思考行（不直接发送）；DeepSeek 需要的回传内容取自助手文本消息的 `Meta["thinking"]`
+
+Responses 的 reasoning 不是 `TypeThinking` 回放：适配器使用助手文本消息上的
+`Meta["responses_output_items"]` 保存并恢复原生 output item。该值是 JSON 编码的
+`[]ResponsesOutputItem`，不得改写其中未知字段。
 
 图片消息的提交边界由 Agent 决定，而不是 LLM adapter 决定：
 - 当前轮图片和重答目标图片可以保留为 `TypeImage`，adapter 才会把它转为 OpenAI `image_url` 或 Anthropic `image` block。
@@ -120,10 +127,10 @@ OpenAI 流式 usage 解析保留 `prompt_cache_hit_tokens` / `prompt_cache_miss_
 - `ChatCM()` 非流式调用也用于 provider/model 的无状态 `sayhi` 连接测试
 
 Provider 选择 `openai_chat`、`openai_responses` 或 `anthropic_messages` 协议；旧 `openai`
-与 `anthropic` 值会继续兼容。Provider 保存公共 `base_url`，每个 LLM 模型保存可编辑
-`api_endpoint`；OpenAI Chat 新模型默认 `/chat/completions`，OpenAI Responses 默认
+与 `anthropic` 值会继续兼容。Provider 保存公共 `base_url`；每个 LLM 模型可用可选
+`protocol` 覆盖 Provider 协议，空值表示继承，并保存可编辑 `api_endpoint`。OpenAI Chat 新模型默认 `/chat/completions`，OpenAI Responses 默认
 `/responses`，Anthropic Messages 默认 `/messages`。`providerEntry` 根据本次请求的
-模型解析完整 URL，避免同一 Provider 下的模型互相覆盖端点。旧完整 `api_url` 仅由兼容
+模型有效协议选择请求/响应适配器并解析完整 URL，避免同一 Provider 下的模型互相覆盖协议或端点。旧完整 `api_url` 仅由兼容
 读取与 V12 升级步骤拆分。
 
 `internal/requestheader` 从 Agent 注入的请求上下文读取 `SessionID` / `ClientMsgID`，并结合
@@ -131,6 +138,16 @@ trace、UUID、雪花 ID 与时间戳展开 `ProviderConfig.CustomHeaders`。`Ch
 `ChatCM()`、旧 OpenAI/Anthropic 流式与非流式入口都在真正发送 HTTP 请求前调用同一套
 `Apply()`，因此主对话、识别、摘要与连接测试行为一致。自定义请求头最后应用，允许兼容
 网关覆盖 `Authorization`、`x-api-key`、`Content-Type` 等协议字段；传输层字段在保存时拒绝。
+
+#### LLM 日志与 `PC_LLM_DEBUG`
+
+- 默认日志只记录 provider/model、token/字节计数、解析失败次数，以及异常 SSE 的长度和短 SHA-256 指纹；不记录请求消息、响应正文或原始 SSE payload。
+- Responses 流式请求额外记录 `[llm/responses/shape]` 结构摘要：`input` 项目数及消息／reasoning／函数调用／结果数量、原生与合成调用数量、`call_id` 配对计数、工具数量、安全的顶层参数存在性和短请求体指纹；不记录正文、参数／结果、调用 ID、工具名或模型名。此行与相邻请求共用 trace id，可用于区分多工具续轮的请求形状，不代表网关已接受请求。
+- 只有环境变量严格等于 `PC_LLM_DEBUG=1` 时，才记录前三个 SSE 事件和上游错误体的**有界预览**。预览仍统一脱敏 `api_key`、`Authorization`、`x-api-key`、Bearer/Basic 凭据、token、cookie、password、secret 与实例 capability；任何模式都不输出这些值。
+- malformed SSE 默认只写解析错误、长度和指纹；debug 模式额外写脱敏预览。脱敏覆盖 JSON 递归字段和文本 `Header: value` / `key=value` 形式：包括带厂商前缀且以 `api-key` / `api_key` / `token` / `secret` / `password` / `cookie` / `authorization` 结尾的名称（如 `X-Goog-Api-Key`）。proxy error 默认同样只写元数据，返回给调用方的错误文本不携带上游正文。
+- HTTP 非 2xx 错误保留状态码和响应体长度/指纹用于分类，默认错误链不携带上游正文；显式 debug 才把脱敏预览写入日志。
+- 网关把明确的 `Provider request failed: status=<上游状态码>` 包进 Responses SSE `server_error` 或 HTTP 5xx 时，分类器按该上游状态码处理：400 等永久错误停止阶梯重试，429/5xx 仍可重试；未知包装仍按原错误类型处理，错误正文继续省略。
+- debug 预览在凭据脱敏后仍可能含用户消息或模型回复，仅应在可信本机临时开启；复现结束后移除该环境变量，并在分享日志前再次人工检查。
 
 ### 5. 错误分类
 

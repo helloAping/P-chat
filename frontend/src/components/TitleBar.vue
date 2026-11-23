@@ -115,7 +115,7 @@ onUnmounted(() => {
   flex-shrink: 0;
   padding: 0 var(--space-2) 0 var(--space-3);
   background: var(--glass-bg);
-  border-bottom: 1px solid var(--glass-border);
+  border-bottom: none;
   backdrop-filter: blur(var(--glass-blur));
   -webkit-backdrop-filter: blur(var(--glass-blur));
   z-index: 50;
