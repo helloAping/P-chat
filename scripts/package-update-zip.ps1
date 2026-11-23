@@ -99,9 +99,20 @@ function Get-RelativePath {
         [Parameter(Mandatory = $true)][string]$Base,
         [Parameter(Mandatory = $true)][string]$Path
     )
-    $baseUri = [Uri]($Base.TrimEnd('\') + '\')
-    $pathUri = [Uri]$Path
-    return [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($pathUri).ToString()).Replace('/', '\')
+    $baseFull = [System.IO.Path]::GetFullPath($Base)
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    # Path.GetRelativePath exists on PowerShell 7. Windows PowerShell 5.1 keeps the URI fallback.
+    # A trailing backslash makes Unix paths look like relative URIs to MakeRelativeUri.
+    $getRelative = [System.IO.Path].GetMethod('GetRelativePath', [type[]]@([string], [string]))
+    if ($null -ne $getRelative) {
+        $relative = [System.IO.Path]::GetRelativePath($baseFull, $pathFull)
+    } else {
+        $separator = [System.IO.Path]::DirectorySeparatorChar
+        $baseUri = [Uri]($baseFull.TrimEnd('\', '/') + $separator)
+        $pathUri = [Uri]$pathFull
+        $relative = [Uri]::UnescapeDataString($baseUri.MakeRelativeUri($pathUri).ToString())
+    }
+    return ($relative -replace '/', '\')
 }
 
 function Write-JsonNoBom {

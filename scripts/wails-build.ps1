@@ -82,5 +82,22 @@ if ($ldFlagArgs.Count -eq 0) {
     $ldFlagArgs = @($Ldflags)
 }
 
-& wails build -platform $wailsPlatform -ldflags $ldFlagArgs -s
+$wailsArgs = @('build', '-platform', $wailsPlatform, '-ldflags') + @($ldFlagArgs) + @('-s')
+if ($wailsPlatform -like 'linux*') {
+    # Ubuntu 24.04+ only ships webkit2gtk-4.1. Wails v2 uses 4.0 unless this tag is set.
+    $has40 = $false
+    $has41 = $false
+    if (Get-Command pkg-config -ErrorAction SilentlyContinue) {
+        & pkg-config --exists webkit2gtk-4.0
+        if ($LASTEXITCODE -eq 0) { $has40 = $true }
+        & pkg-config --exists webkit2gtk-4.1
+        if ($LASTEXITCODE -eq 0) { $has41 = $true }
+    }
+    if (-not $has40 -and $has41) {
+        $wailsArgs += @('-tags', 'webkit2_41')
+    } elseif (-not $has40 -and -not $has41) {
+        throw 'webkit2gtk development files not found. Install libwebkit2gtk-4.0-dev or libwebkit2gtk-4.1-dev.'
+    }
+}
+& wails @wailsArgs
 exit $LASTEXITCODE
