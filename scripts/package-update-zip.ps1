@@ -149,26 +149,34 @@ function Get-UpdateSignature {
     if ([string]::IsNullOrWhiteSpace($key)) {
         return ""
     }
+    $sigFile = Join-Path ([System.IO.Path]::GetTempPath()) ("pchat-sig-" + [guid]::NewGuid().ToString("n") + ".txt")
+    $env:PCHAT_SIGN_SHA256 = $Sha256
+    $env:PCHAT_SIGN_VERSION = $version
+    $env:PCHAT_SIGN_KIND = $Kind
+    $env:PCHAT_SIGN_OUTPUT = $sigFile
     $signTool = Join-Path $root "bin\pchat-updatesign.exe"
-    # $args is an automatic variable. Splatting it on PowerShell 7 does not pass
-    # this array. Out-String also wraps an 88-character signature at the host
-    # width, so Linux and macOS stored a broken signature while Windows did not.
-    $signArgs = @("--sha256", $Sha256, "--version", $version, "--kind", $Kind)
-    if (Test-Path -LiteralPath $signTool) {
-        $lines = @(& $signTool @signArgs 2>$null)
-    } else {
-        Push-Location $root
-        try {
-            $lines = @(go run ./cmd/pchat-updatesign @signArgs 2>$null)
-        } finally {
-            Pop-Location
+    Push-Location $root
+    try {
+        if (Test-Path -LiteralPath $signTool) {
+            & $signTool
+        } else {
+            & go run ./cmd/pchat-updatesign
         }
+        if ($LASTEXITCODE -ne 0) {
+            throw "Failed to sign update artifact (kind=$Kind, exit $LASTEXITCODE). The private key must match the embedded public key."
+        }
+    } finally {
+        Pop-Location
+        Remove-Item Env:PCHAT_SIGN_SHA256, Env:PCHAT_SIGN_VERSION, Env:PCHAT_SIGN_KIND, Env:PCHAT_SIGN_OUTPUT -ErrorAction SilentlyContinue
     }
-    if ($LASTEXITCODE -ne 0) {
-        throw "Failed to sign update artifact (kind=$Kind, exit $LASTEXITCODE). Check PCHAT_UPDATE_SIGNING_KEY."
+    if (-not (Test-Path -LiteralPath $sigFile)) {
+        throw "Failed to sign update artifact (kind=$Kind). Signer did not write a signature file."
     }
-    $sig = [string]($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
-    $sig = $sig.Trim()
+    try {
+        $sig = [System.IO.File]::ReadAllText($sigFile).Trim()
+    } finally {
+        Remove-Item -LiteralPath $sigFile -ErrorAction SilentlyContinue
+    }
     if ($sig -notmatch '^[A-Za-z0-9+/]+=*$') {
         throw "Failed to sign update artifact (kind=$Kind). Signer output was not a base64 signature."
     }

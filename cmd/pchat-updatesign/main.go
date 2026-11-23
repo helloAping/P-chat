@@ -32,28 +32,43 @@ func main() {
 
 	fs := flag.NewFlagSet("pchat-updatesign", flag.ExitOnError)
 	key := fs.String("key", "", "base64 ed25519 private key (default: PCHAT_UPDATE_SIGNING_KEY)")
-	sha256Hex := fs.String("sha256", "", "artifact SHA-256 hex")
-	version := fs.String("version", "", "release version")
-	kind := fs.String("kind", "patch", "artifact kind: full|patch")
+	sha256Hex := fs.String("sha256", "", "artifact SHA-256 hex (default: PCHAT_SIGN_SHA256)")
+	version := fs.String("version", "", "release version (default: PCHAT_SIGN_VERSION)")
+	kind := fs.String("kind", "", "artifact kind: full|patch (default: PCHAT_SIGN_KIND or patch)")
+	output := fs.String("output", "", "write the signature to this file (default: PCHAT_SIGN_OUTPUT)")
 	_ = fs.Parse(os.Args[1:])
 
-	privRaw := strings.TrimSpace(*key)
-	if privRaw == "" {
-		privRaw = strings.TrimSpace(os.Getenv("PCHAT_UPDATE_SIGNING_KEY"))
-	}
+	privRaw := firstNonEmpty(*key, os.Getenv("PCHAT_UPDATE_SIGNING_KEY"))
 	if privRaw == "" {
 		fail(fmt.Errorf("--key or PCHAT_UPDATE_SIGNING_KEY is required"))
 	}
-	if strings.TrimSpace(*sha256Hex) == "" || strings.TrimSpace(*version) == "" {
+	sha := firstNonEmpty(*sha256Hex, os.Getenv("PCHAT_SIGN_SHA256"))
+	ver := firstNonEmpty(*version, os.Getenv("PCHAT_SIGN_VERSION"))
+	artifactKind := firstNonEmpty(*kind, os.Getenv("PCHAT_SIGN_KIND"), "patch")
+	if sha == "" || ver == "" {
 		fail(fmt.Errorf("--sha256 and --version are required"))
 	}
 	priv, err := update.ParsePrivateKeyBase64(privRaw)
 	if err != nil {
 		fail(err)
 	}
-	sig, err := update.SignArtifact(priv, *sha256Hex, *version, *kind)
+	sig, err := update.SignArtifact(priv, sha, ver, artifactKind)
 	if err != nil {
 		fail(err)
+	}
+	pub, err := update.ParsePublicKeyBase64(update.DefaultUpdatePublicKeyBase64)
+	if err != nil {
+		fail(err)
+	}
+	if err := update.VerifyArtifactSignature(pub, sha, ver, artifactKind, sig); err != nil {
+		fail(fmt.Errorf("signing key does not match the embedded public key: %w", err))
+	}
+	outPath := firstNonEmpty(*output, os.Getenv("PCHAT_SIGN_OUTPUT"))
+	if outPath != "" {
+		if err := os.WriteFile(outPath, []byte(sig), 0o644); err != nil {
+			fail(err)
+		}
+		return
 	}
 	fmt.Println(sig)
 }
@@ -68,14 +83,27 @@ func verifySignature(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if strings.TrimSpace(*sha256Hex) == "" || strings.TrimSpace(*version) == "" || strings.TrimSpace(*kind) == "" || strings.TrimSpace(*signature) == "" {
-		return fmt.Errorf("--sha256, --version, --kind, and --signature are required")
+	sha := firstNonEmpty(*sha256Hex, os.Getenv("PCHAT_SIGN_SHA256"))
+	ver := firstNonEmpty(*version, os.Getenv("PCHAT_SIGN_VERSION"))
+	artifactKind := firstNonEmpty(*kind, os.Getenv("PCHAT_SIGN_KIND"))
+	sig := firstNonEmpty(*signature, os.Getenv("PCHAT_SIGN_SIGNATURE"))
+	if sha == "" || ver == "" || artifactKind == "" || sig == "" {
+		return fmt.Errorf("sha256, version, kind, and signature are required")
 	}
 	pub, err := update.ParsePublicKeyBase64(update.DefaultUpdatePublicKeyBase64)
 	if err != nil {
 		return err
 	}
-	return update.VerifyArtifactSignature(pub, *sha256Hex, *version, *kind, *signature)
+	return update.VerifyArtifactSignature(pub, sha, ver, artifactKind, sig)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func genKey() error {

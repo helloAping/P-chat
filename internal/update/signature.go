@@ -55,6 +55,9 @@ func VerifyArtifactSignature(publicKey ed25519.PublicKey, sha256Hex, version, ki
 	if err != nil {
 		return fmt.Errorf("%w: decode: %v", ErrInvalidSignature, err)
 	}
+	if len(raw) != ed25519.SignatureSize {
+		return fmt.Errorf("%w: signature length %d, want %d", ErrInvalidSignature, len(raw), ed25519.SignatureSize)
+	}
 	if !ed25519.Verify(publicKey, ArtifactSignPayload(sha256Hex, version, kind), raw) {
 		return ErrInvalidSignature
 	}

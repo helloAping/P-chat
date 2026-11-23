@@ -117,9 +117,17 @@ function Assert-Artifact {
         throw "$fileName is missing signature"
     }
     if ($VerifyTool -and -not [string]::IsNullOrWhiteSpace($signature)) {
-        & $VerifyTool verify --sha256 $want --version $Version --kind $kind --signature $signature
-        if ($LASTEXITCODE -ne 0) {
-            throw "$fileName signature does not match the embedded public key"
+        $env:PCHAT_SIGN_SHA256 = $want
+        $env:PCHAT_SIGN_VERSION = $Version
+        $env:PCHAT_SIGN_KIND = $kind
+        $env:PCHAT_SIGN_SIGNATURE = $signature.Trim()
+        try {
+            & $VerifyTool verify
+            if ($LASTEXITCODE -ne 0) {
+                throw "$fileName signature does not match the embedded public key (kind=$kind, sha256=$want)"
+            }
+        } finally {
+            Remove-Item Env:PCHAT_SIGN_SHA256, Env:PCHAT_SIGN_VERSION, Env:PCHAT_SIGN_KIND, Env:PCHAT_SIGN_SIGNATURE -ErrorAction SilentlyContinue
         }
     }
     if ($kind -eq 'patch') {
