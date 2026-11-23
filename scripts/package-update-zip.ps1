@@ -17,6 +17,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Compress-Archive writes progress records. In GitHub Actions those records
+# can keep the PowerShell process alive after the script's last line.
+$ProgressPreference = "SilentlyContinue"
 
 . (Join-Path $PSScriptRoot 'version-utils.ps1')
 
@@ -449,3 +452,6 @@ Write-JsonNoBom -Value $releaseManifest -Path $releaseManifestPath
 Write-Host "[package-update-zip] update zip: $zipPath" -ForegroundColor Green
 Write-Host "[package-update-zip] manifest:   $releaseManifestPath" -ForegroundColor Green
 Write-Host "[package-update-zip] latest json: $latestJsonPath" -ForegroundColor Green
+# Skip PowerShell's exit cleanup. A leftover progress record otherwise
+# leaves this process running, and the GitHub Actions step never finishes.
+[Environment]::Exit(0)

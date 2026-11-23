@@ -12,6 +12,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$env:GOTELEMETRY = 'off'
 
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -77,6 +79,7 @@ function Get-VerifyTool {
     $tool = Join-Path $toolDir 'pchat-updatesign'
     Push-Location $root
     try {
+        Write-Host "[validate-release-artifacts] building signature verifier" -ForegroundColor Cyan
         & go build -o $tool ./cmd/pchat-updatesign
         if ($LASTEXITCODE -ne 0) {
             throw "go build ./cmd/pchat-updatesign failed: $LASTEXITCODE"
