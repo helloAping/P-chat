@@ -150,19 +150,27 @@ function Get-UpdateSignature {
         return ""
     }
     $signTool = Join-Path $root "bin\pchat-updatesign.exe"
-    $args = @("--sha256", $Sha256, "--version", $version, "--kind", $Kind)
+    # $args is an automatic variable. Splatting it on PowerShell 7 does not pass
+    # this array. Out-String also wraps an 88-character signature at the host
+    # width, so Linux and macOS stored a broken signature while Windows did not.
+    $signArgs = @("--sha256", $Sha256, "--version", $version, "--kind", $Kind)
     if (Test-Path -LiteralPath $signTool) {
-        $sig = (& $signTool @args 2>$null | Out-String).Trim()
+        $lines = @(& $signTool @signArgs 2>$null)
     } else {
         Push-Location $root
         try {
-            $sig = (& go run ./cmd/pchat-updatesign @args 2>$null | Out-String).Trim()
+            $lines = @(go run ./cmd/pchat-updatesign @signArgs 2>$null)
         } finally {
             Pop-Location
         }
     }
-    if ([string]::IsNullOrWhiteSpace($sig)) {
-        throw "Failed to sign update artifact (kind=$Kind). Check PCHAT_UPDATE_SIGNING_KEY."
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to sign update artifact (kind=$Kind, exit $LASTEXITCODE). Check PCHAT_UPDATE_SIGNING_KEY."
+    }
+    $sig = [string]($lines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 1)
+    $sig = $sig.Trim()
+    if ($sig -notmatch '^[A-Za-z0-9+/]+=*$') {
+        throw "Failed to sign update artifact (kind=$Kind). Signer output was not a base64 signature."
     }
     return $sig
 }
