@@ -23,11 +23,24 @@ if ($files.Count -eq 0) {
 
 foreach ($file in $files) {
     $text = [System.IO.File]::ReadAllText($file.FullName)
-    if ($text -notlike '*<upload-url>/*') {
+    # PowerShell 5.1 writes the placeholder as \u003cupload-url\u003e/.
+    $patterns = @(
+        '<upload-url>/',
+        '\u003cupload-url\u003e/',
+        '\u003Cupload-url\u003E/'
+    )
+    $found = $false
+    foreach ($pattern in $patterns) {
+        if ($text.Contains($pattern)) {
+            $found = $true
+            $text = $text.Replace($pattern, "$base/")
+        }
+    }
+    if (-not $found) {
         throw "$($file.Name) has no <upload-url>/ placeholder"
     }
-    $updated = $text.Replace('<upload-url>/', "$base/")
-    if ($updated -like '*<upload-url>*') {
+    $updated = $text
+    if ($updated -like '*<upload-url>*' -or $updated -like '*upload-url\u003e*') {
         throw "$($file.Name) still contains <upload-url>"
     }
     [System.IO.File]::WriteAllText($file.FullName, $updated, [System.Text.UTF8Encoding]::new($false))

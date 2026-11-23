@@ -121,6 +121,8 @@ function Write-JsonNoBom {
         [Parameter(Mandatory = $true)][string]$Path
     )
     $json = $Value | ConvertTo-Json -Depth 8
+    # Windows PowerShell 5.1 escapes < and > as \u003c and \u003e. Keep the upload placeholder literal.
+    $json = $json.Replace('\u003c', '<').Replace('\u003C', '<').Replace('\u003e', '>').Replace('\u003E', '>')
     [System.IO.File]::WriteAllText($Path, $json + [Environment]::NewLine, [System.Text.UTF8Encoding]::new($false))
 }
 
