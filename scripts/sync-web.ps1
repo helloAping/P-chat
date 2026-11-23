@@ -25,9 +25,11 @@ if (-not (Test-Path -LiteralPath $dst)) {
     New-Item -ItemType Directory -Path $dst -Force | Out-Null
 }
 
-$isWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
+# PowerShell 7 把 $IsWindows 做成只读变量，不能赋值。
+# PowerShell 7 reserves $IsWindows as a read-only automatic variable.
+$useRobocopy = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform(
     [System.Runtime.InteropServices.OSPlatform]::Windows)
-if ($isWindows) {
+if ($useRobocopy) {
     # robocopy returns non-zero exit codes even on success (1=files copied,
     # 2=extras, 3=both). We only treat >=8 as a real error.
     # Use GetTempPath: $env:TEMP is unset in PowerShell on Linux and macOS.
