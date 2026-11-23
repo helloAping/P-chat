@@ -14,7 +14,7 @@ import (
 //
 // The matching private key is held by release operators and supplied via
 // PCHAT_UPDATE_SIGNING_KEY when packaging. It must never be committed.
-const DefaultUpdatePublicKeyBase64 = "TUzgC2Rl2YGqZoced9B/moz8pCx3wf8Sa0mACbVcAmc="
+const DefaultUpdatePublicKeyBase64 = "qMbkBNvMOyYHXO9JjDhfTo//GLnyExogxX9YyijjiZU="
 
 // ErrMissingSignature reports that an installable artifact has no publisher signature.
 var ErrMissingSignature = errors.New("update artifact signature missing")
