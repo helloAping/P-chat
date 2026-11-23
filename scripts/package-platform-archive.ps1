@@ -15,7 +15,9 @@ param(
     [Alias('PlatformName', 'Name')]
     [string]$Platform,
 
-    [switch]$AllowMissingGui
+    [switch]$AllowMissingGui,
+
+    [string]$Arch = 'amd64'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -114,9 +116,9 @@ switch ($platformLabel) {
         break
     }
     'mac' {
-        Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-server-darwin-amd64') -Destination (Join-Path $stage 'pchat-server') -Hint "run 'task build:server:macos'"
-        Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-darwin-amd64') -Destination (Join-Path $stage 'pchat') -Hint "run 'task build:cli:macos'"
-        Copy-RequiredFile -Source (Join-Path $root 'bin\pchat-updater-darwin-amd64') -Destination (Join-Path $stage 'pchat-updater') -Hint "run 'task build:updater:macos'"
+        Copy-RequiredFile -Source (Join-Path $root "bin\pchat-server-darwin-$Arch") -Destination (Join-Path $stage 'pchat-server') -Hint "run 'task build:server:macos ARCH=$Arch'"
+        Copy-RequiredFile -Source (Join-Path $root "bin\pchat-darwin-$Arch") -Destination (Join-Path $stage 'pchat') -Hint "run 'task build:cli:macos ARCH=$Arch'"
+        Copy-RequiredFile -Source (Join-Path $root "bin\pchat-updater-darwin-$Arch") -Destination (Join-Path $stage 'pchat-updater') -Hint "run 'task build:updater:macos ARCH=$Arch'"
         Copy-RequiredFile -Source (Join-Path $root 'scripts\install-macos.sh') -Destination (Join-Path $stage 'install.sh') -Hint 'missing install script'
         Copy-RequiredFile -Source (Join-Path $root 'scripts\uninstall-macos.sh') -Destination (Join-Path $stage 'uninstall.sh') -Hint 'missing uninstall script'
         Copy-WebAssets

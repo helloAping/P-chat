@@ -582,15 +582,6 @@ function jumpToBottom() {
   scrollToBottom(true)
 }
 
-function locateOpenQuestion() {
-  const el = messagesEl.value?.querySelector('.question-card.status-open') as HTMLElement | null
-  if (!el) {
-    jumpToBottom()
-    return
-  }
-  el.scrollIntoView({ behavior: 'smooth', block: 'center' })
-}
-
 // 搜索定位只在 Vue 完成本轮 DOM 更新后解析，成功/失败都回传 store。
 // Search navigation resolves only after Vue has applied the current DOM patch;
 // both success and failure settle the store promise so the sidebar never drops
@@ -1046,7 +1037,7 @@ function messageKey(m: any, i: number): string | number {
     </div>
     <InputArea>
       <template #composer-docks>
-        <QuestionModal @locate-question="locateOpenQuestion" />
+        <QuestionModal />
         <SubAgentJobsPanel
           :session-id="state.currentID"
           @job-terminal="handleSubAgentJobTerminal"

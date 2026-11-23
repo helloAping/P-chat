@@ -58,7 +58,7 @@ func TestEffectivePolicyTimeoutsMatchSharedBudgets(t *testing.T) {
 		{"write_file", WriteToolTimeout},
 		{"exec_command", DefaultToolTimeout},
 		{"todo_write", CheckpointToolTimeout},
-		{"question", QuestionWaitTimeout},
+		{"question", 0},
 		{"web_search", WebSearchTimeout},
 		{"web_fetch", WebFetchTimeout},
 		{"browser_click", WebFetchTimeout},

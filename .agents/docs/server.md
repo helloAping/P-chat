@@ -47,9 +47,11 @@ Provider/Model、系统配置、Web Search、Browser、MCP 与知识库的写入
 
 ### 稳定版与 Beta 更新
 
-`GET /updates/check` 默认只接受稳定版；传 `include_prerelease=1` 时允许稳定版和 `.beta`。`POST /updates/download` 的 JSON body 可传 `include_prerelease` 与 `expected_version`，后端在同一渠道重查；若最新版本与界面展示的不一致，返回 409。`internal/update` 同时校验 `latest.json` 的版本后缀和 `channel`，拒绝不一致的元数据。发布站需对 `include_prerelease=1` 返回稳定版/Beta 中最高的可用版本，客户端无法从单份稳定版元数据推断未返回的 Beta。
+`GET /updates/check` 默认只接受稳定版；传 `include_prerelease=1` 时允许稳定版和 `.beta`。`POST /updates/download` 的 JSON body 可传 `include_prerelease` 与 `expected_version`，后端在同一渠道重查；若最新版本与界面展示的不一致，返回 409。`internal/update` 同时校验清单的版本后缀和 `channel`，拒绝不一致的元数据。
 
-SEC-05：默认元数据地址为 `https://www.08ms.cn/software/p-chat/latest.json`；非 loopback 的 `http://` 元数据/产物 URL 一律拒绝。下载前校验 artifact `sha256` 与 ed25519 `signature`（载荷 `pchat-update-v1\n{sha256}\n{version}\n{kind}\n`，公钥见 `internal/update.DefaultUpdatePublicKeyBase64`）。打包时设置 `PCHAT_UPDATE_SIGNING_KEY` 并由 `cmd/pchat-updatesign` / `scripts/package-update-zip.ps1` 写入签名；`pchat-updater` 无 `--expected-sha256` 时拒绝安装（仅 `--allow-insecure` 可跳过）。本地排障可设 `PCHAT_UPDATE_REQUIRE_SIGNATURE=0`。
+默认更新目录是 `https://helloaping.github.io/P-chat/updates/`。稳定版读取 `{platform}-{arch}.json`，勾选 Beta 时读取 `{platform}-{arch}.beta.json`。Beta 文件由发布流水线写成稳定版和 Beta 中版本更高的那一份。`PCHAT_UPDATE_URL` 若指向具体 `*.json` 文件，仍附带 `platform`、`arch`、`current_version`、`include_prerelease` 查询参数。清单里的 `platform` / `arch` 与本机不一致时检查直接失败，不会下载。
+
+SEC-05：非 loopback 的 `http://` 元数据/产物 URL 一律拒绝。下载前校验 artifact `sha256` 与 ed25519 `signature`（载荷 `pchat-update-v1\n{sha256}\n{version}\n{kind}\n`，公钥见 `internal/update.DefaultUpdatePublicKeyBase64`）。打包时设置 `PCHAT_UPDATE_SIGNING_KEY` 并由 `cmd/pchat-updatesign` / `scripts/package-update-zip.ps1` 写入签名；`pchat-updater` 无 `--expected-sha256` 时拒绝安装（仅 `--allow-insecure` 可跳过）。本地排障可设 `PCHAT_UPDATE_REQUIRE_SIGNATURE=0`。GitHub Actions 在 tag `v*` 上构建 Windows amd64、Linux amd64 和 macOS arm64 包，创建 Draft Release；Release 发布后才更新上面的索引。
 
 ### Provider / Model 连接测试
 

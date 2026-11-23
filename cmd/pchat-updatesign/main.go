@@ -23,6 +23,12 @@ func main() {
 		}
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "verify" {
+		if err := verifySignature(os.Args[2:]); err != nil {
+			fail(err)
+		}
+		return
+	}
 
 	fs := flag.NewFlagSet("pchat-updatesign", flag.ExitOnError)
 	key := fs.String("key", "", "base64 ed25519 private key (default: PCHAT_UPDATE_SIGNING_KEY)")
@@ -50,6 +56,26 @@ func main() {
 		fail(err)
 	}
 	fmt.Println(sig)
+}
+
+// verifySignature checks a signature against the embedded production public key.
+func verifySignature(args []string) error {
+	fs := flag.NewFlagSet("verify", flag.ContinueOnError)
+	sha256Hex := fs.String("sha256", "", "artifact SHA-256 hex")
+	version := fs.String("version", "", "release version")
+	kind := fs.String("kind", "", "artifact kind: full|patch")
+	signature := fs.String("signature", "", "base64 ed25519 signature")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if strings.TrimSpace(*sha256Hex) == "" || strings.TrimSpace(*version) == "" || strings.TrimSpace(*kind) == "" || strings.TrimSpace(*signature) == "" {
+		return fmt.Errorf("--sha256, --version, --kind, and --signature are required")
+	}
+	pub, err := update.ParsePublicKeyBase64(update.DefaultUpdatePublicKeyBase64)
+	if err != nil {
+		return err
+	}
+	return update.VerifyArtifactSignature(pub, *sha256Hex, *version, *kind, *signature)
 }
 
 func genKey() error {

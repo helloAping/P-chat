@@ -111,6 +111,8 @@ test_http/
 scratch/
 tmp/
 .tmp/
+# 根目录的临时预览和截图。 / Temporary previews and screenshots in the repository root.
+/.tmp-*
 
 # -----------------------------------------------------------------------------
 # Local config overrides
@@ -189,6 +191,8 @@ $RECYCLE.BIN/
 /build/
 dist/
 artifacts/
+# 本地生成的图片、动画、预览和素材包。 / Locally generated images, animations, previews and asset exports.
+/output/
 *.tar.gz
 *.zip
 # Compiled object / linker files.
@@ -236,6 +240,8 @@ pnpm-lock.yaml
 # keep the bundle size bounded. They are NOT source.
 web/index.html
 web/assets/
+# Vite 复制的猫咪资源。 / Cat assets copied by Vite.
+/web/cat/
 
 # -----------------------------------------------------------------------------
 # Wails generated bindings / build outputs
@@ -290,6 +296,8 @@ cmd/pchat-gui/build/bin/
 # and only ignore the generated output inside.
 cmd/pchat-server/web/index.html
 cmd/pchat-server/web/assets/
+# 同步到服务端的猫咪构建资源。 / Cat build assets synchronized to the server.
+/cmd/pchat-server/web/cat/
 # Ad-hoc dev binaries built straight from the source tree (e.g.
 # `go build -o cmd/pchat-server/pchat-server.exe`). The release
 # bundle lives at cmd/pchat-gui/build/bin/, not here.

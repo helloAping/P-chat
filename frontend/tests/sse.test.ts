@@ -222,6 +222,36 @@ test('nextStreamIdleTimeoutMs stretches while a tool or sub-agent is running', (
   assert.equal(afterToolOk, STREAM_IDLE_AFTER_LLM_MS)
 })
 
+test('nextStreamIdleTimeoutMs waits indefinitely while a question is open', () => {
+  const afterQuestionTool = nextStreamIdleTimeoutMs(
+    { type: 'tool', tool_status: 'start', tool_name: 'question' },
+    STREAM_IDLE_AFTER_LLM_MS,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterQuestionTool, 0)
+
+  const afterQuestionEvent = nextStreamIdleTimeoutMs(
+    { type: 'question' },
+    STREAM_IDLE_AFTER_TOOL_MS,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterQuestionEvent, 0)
+
+  const duringWait = nextStreamIdleTimeoutMs(
+    { type: 'phase', step: 'tool-heartbeat' },
+    0,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(duringWait, 0)
+
+  const afterSubmit = nextStreamIdleTimeoutMs(
+    { type: 'tool', tool_status: 'ok', tool_name: 'question' },
+    0,
+    STREAM_IDLE_AFTER_LLM_MS,
+  )
+  assert.equal(afterSubmit, STREAM_IDLE_AFTER_LLM_MS)
+})
+
 test('consumeSSEStream lets a buffered burst paint before the rest arrives', async () => {
   const frames = Array.from({ length: 5 }, (_, i) =>
     `data: ${JSON.stringify({ type: 'content', content: String(i) })}\nid: ${i + 1}\n\n`,

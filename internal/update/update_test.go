@@ -1,4 +1,4 @@
-﻿package update
+package update
 
 import (
 	"crypto/ed25519"
@@ -170,6 +170,58 @@ func TestCheckPrefersPatchZipWhenAvailable(t *testing.T) {
 	}
 	if res.URL != srv.URL+"/pchat-update-windows-amd64-v1.0.13.zip" {
 		t.Fatalf("url = %q, want patch url", res.URL)
+	}
+}
+
+func TestStaticIndexURL(t *testing.T) {
+	stable, ok := staticIndexURL("https://helloaping.github.io/P-chat/updates/", "windows", "amd64", false)
+	if !ok || stable != "https://helloaping.github.io/P-chat/updates/windows-amd64.json" {
+		t.Fatalf("stable index = %q ok=%v", stable, ok)
+	}
+	beta, ok := staticIndexURL("https://helloaping.github.io/P-chat/updates", "macos", "arm64", true)
+	if !ok || beta != "https://helloaping.github.io/P-chat/updates/macos-arm64.beta.json" {
+		t.Fatalf("beta index = %q ok=%v", beta, ok)
+	}
+	if _, ok := staticIndexURL("http://127.0.0.1:9", "windows", "amd64", false); ok {
+		t.Fatal("host-only URL should stay on the query API")
+	}
+	if _, ok := staticIndexURL("http://127.0.0.1:9/latest.json", "windows", "amd64", true); ok {
+		t.Fatal("explicit json URL should stay on the query API")
+	}
+}
+
+func TestCheckUsesStaticIndexFile(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.RawQuery != "" {
+			t.Fatalf("static index request has query %q", r.URL.RawQuery)
+		}
+		if r.URL.Path != "/updates/windows-amd64.json" {
+			t.Fatalf("path = %q", r.URL.Path)
+		}
+		fmt.Fprint(w, `{"version":"1.0.15","channel":"stable","platform":"windows","arch":"amd64","patch":{"kind":"patch","platform":"windows","arch":"amd64","url":"https://example.test/pchat-update-windows-amd64-v1.0.15.zip","sha256":"abc"}}`)
+	}))
+	defer srv.Close()
+
+	svc := newTestService(Options{LatestURL: srv.URL + "/updates/", Platform: "windows", Arch: "amd64"})
+	res, err := svc.Check(t.Context(), "1.0.14")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.HasUpdate || !res.Installable || res.Latest != "1.0.15" {
+		t.Fatalf("static check = %#v", res)
+	}
+}
+
+func TestCheckRejectsMismatchedPlatform(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"version":"1.0.15","channel":"stable","platform":"linux","arch":"amd64","patch":{"kind":"patch","url":"https://example.test/pchat-update.zip","sha256":"abc"}}`)
+	}))
+	defer srv.Close()
+
+	svc := newTestService(Options{LatestURL: srv.URL + "/latest.json", Platform: "windows", Arch: "amd64"})
+	_, err := svc.Check(t.Context(), "1.0.14")
+	if !errors.Is(err, ErrManifestTargetMismatch) {
+		t.Fatalf("Check error = %v, want ErrManifestTargetMismatch", err)
 	}
 }
 

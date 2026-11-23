@@ -2065,6 +2065,15 @@ func hasTaskToolCall(toolCalls []nativeToolCall) bool {
 	return false
 }
 
+func hasQuestionToolCall(toolCalls []nativeToolCall) bool {
+	for _, tc := range toolCalls {
+		if tc.Name == "question" {
+			return true
+		}
+	}
+	return false
+}
+
 // ChatWithTools performs a ReAct-style loop: send messages to the LLM with
 // available tools, execute any tool calls, and feed results back to the LLM
 // until it gives a final answer.
@@ -3213,16 +3222,27 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 			if len(toolCalls) > 0 {
 				fullContent = cleanMarkdownToolCalls(fullContent)
 			}
-			if hasTaskToolCall(toolCalls) {
+			// task 与 question 都不能被 MaxTurnSeconds 掐断：子代理可能跑很久，
+			// 提问则要一直等到用户选择并提交。两者都切到无截止时间的 abortCtx，
+			// 用户停止或连接断开仍会取消。
+			// task and question must outlive MaxTurnSeconds. Sub-agents can run
+			// for a long time, and a question waits until the user submits.
+			// Both switch to the deadline-free abortCtx; user stop and
+			// disconnect still cancel the wait.
+			if hasTaskToolCall(toolCalls) || hasQuestionToolCall(toolCalls) {
 				if detached, ok := detachTurnDeadlineForTask(ctx); ok {
 					ctx = detached
-					sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
-						Phase:    "tool",
-						Step:     "task-detached",
-						Message:  "检测到子代理编排/等待任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
-						Round:    roundNum,
-						MaxRound: maxRounds,
-					})
+					if hasTaskToolCall(toolCalls) {
+						sendOrDrop(ctx, ch, nextSeq, ChatStreamChunk{
+							Phase:    "tool",
+							Step:     "task-detached",
+							Message:  "检测到子代理编排/等待任务，已切换为仅受用户取消/连接断开控制，避免父回合 wall-clock 截断。",
+							Round:    roundNum,
+							MaxRound: maxRounds,
+						})
+					} else {
+						log.Printf("%s[question] detached turn deadline; waiting until the user submits or cancels", trace.LogPrefix(ctx))
+					}
 				}
 			}
 
@@ -3727,10 +3747,13 @@ func (a *Agent) ChatWithTools(ctx context.Context, req ChatRequest) <-chan ChatS
 				// User-facing waits (sandbox confirm, question, browser
 				// RequireConfirm) must not share the per-tool execution
 				// deadline — otherwise write_file's 60s budget expires
-				// while the confirm modal is still on screen. The turn
-				// ctx still cancels those waits on user stop / turn
-				// timeout; ConfirmWaitTimeout / QuestionWaitTimeout are
-				// the interactive caps.
+				// while the confirm modal is still on screen. Confirm
+				// waits are capped by ConfirmWaitTimeout. question has
+				// no cap: it blocks until the user submits, or until
+				// the interactive context is cancelled (user stop /
+				// disconnect). A question call also detaches
+				// MaxTurnSeconds above so the turn deadline cannot
+				// cancel that wait.
 				tctx = tool.WithInteractiveContext(tctx, ctx)
 				toolTimeout := tool.DefaultToolTimeout
 				if meta, _, ok := a.tools.LookupForProject(tc.Name, req.ProjectRoot); ok {

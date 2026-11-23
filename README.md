@@ -66,7 +66,7 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 
 ### 方式 A — 全平台安装包（推荐新用户）
 
-1. 从 [P-Chat 软件发布页](http://www.08ms.cn/software/p-chat) 下载当前版本对应系统的安装包，Windows / Linux / macOS 均在该页面提供；需要手动更新时，也在该页面下载增量更新包或全量包
+1. 从 [GitHub Releases](https://github.com/helloAping/P-chat/releases) 下载当前版本对应系统的安装包。Windows / Linux 为 amd64，macOS 自动更新包为 arm64；需要手动更新时，也在该页面下载增量 zip 或安装包
 2. Windows 下载 `pchat-setup-v*.exe` 后双击运行；Linux 下载 `pchat-linux-setup-v*.tar.gz` 后解压并执行 `./install.sh`；macOS 下载 `pchat-mac-setup-v*.tar.gz` 后解压并执行 `./install.sh`
 3. 安装程序会解压 GUI / server / CLI / updater 二进制和 `web/` 资源，并按系统创建对应的快捷入口或命令入口
 4. 安装完成后启动 **P-Chat**
@@ -756,7 +756,7 @@ assistant 消息底部「重答」会保留所有历史版本，消息下方出�
 快照下载因敏感性默认关闭。退出 server，在可信本机环境设置 `PC_DIAGNOSTICS_SNAPSHOTS=1` 后重启即可启用；即使开启也只接受 loopback 请求。pprof 使用独立开关 `PC_PPROF=1`。
 
 **13. 怎么下载 Beta 预览版？**
-打开「关于 P-Chat」，勾选「接收预览版本（Beta）」并点击「重新检查」。出现较新的 `.beta` 版本后，确认版本号再下载；下载完成后可在同一窗口重启更新。勾选状态保存在当前浏览器或桌面 WebView；取消勾选会清除当前显示的预览版和已下载状态。若勾选后仍未发现 Beta，先确认[软件发布页](http://www.08ms.cn/software/p-chat/)有适合当前系统的较新版本；自动检查还需要发布站的 `latest.json?include_prerelease=1` 返回对应的 `channel=beta` 元数据。
+打开「关于 P-Chat」，勾选「接收预览版本（Beta）」并点击「重新检查」。出现较新的 `.beta` 版本后，确认版本号再下载；下载完成后可在同一窗口重启更新。勾选状态保存在当前浏览器或桌面 WebView；取消勾选会清除当前显示的预览版和已下载状态。自动检查读取 `https://helloaping.github.io/P-chat/updates/{platform}-{arch}.beta.json`，这份文件是当前稳定版和 Beta 中版本更高的一个。若仍未发现更新，到 [GitHub Releases](https://github.com/helloAping/P-chat/releases) 确认对应系统已经发布，并且该 Release 已从 Draft 改为 Publish。
 
 ---
 
@@ -780,6 +780,8 @@ cd frontend && npx vue-tsc -b
 
 `scripts/` 下都是平台无关工具脚本（`clean-frontend-output.ps1` / `sync-web.ps1` / `package-gui.ps1` / `build-installer.ps1` 等）。
 
+发布时把 `VERSION` 改成目标版本，执行 `task release:run` 推送对应 tag。GitHub Actions 会在 Windows amd64、Linux amd64、macOS arm64 上签名打包，并创建 Draft Release。确认附件后点 Publish，应用内更新索引才会写到 `https://helloaping.github.io/P-chat/updates/`。仓库需要 secret `PCHAT_UPDATE_SIGNING_KEY`，它必须配对客户端里的 `DefaultUpdatePublicKeyBase64`。第一次使用这套索引的安装包需要从 Releases 手动安装一次。
+
 ### 文档维护约定
 
 新增或调整用户可见功能时，同步更新这些文档：
@@ -788,7 +790,7 @@ cd frontend && npx vue-tsc -b
 | --- | --- |
 | `README.md` | 用户入口、GUI 操作步骤、常见问题、当前进度摘要变化 |
 | `docs/p-chat-article-2026-09.md` | 完整安装与使用流程、截图说明、面向新用户的逐步操作发生变化 |
-| [软件下载页](http://www.08ms.cn/software/p-chat) | 下载当前版本 setup 安装包、增量更新包和全量包 |
+| [GitHub Releases](https://github.com/helloAping/P-chat/releases) | 下载当前版本 setup 安装包、增量更新包和 server 二进制 |
 | [网页版说明文档](http://www.08ms.cn/article/p-chat) | 安装、API 厂商接入、CLI/GUI 使用指南（与官网说明同步） |
 | `docs/feature-opportunities.md` | 功能从待办变为已落地、backlog 优先级变化、废弃历史计划 |
 | `CHANGELOG.md` | 版本交付、升级说明、重要 bug 修复和测试覆盖 |

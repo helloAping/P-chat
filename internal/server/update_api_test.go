@@ -125,6 +125,9 @@ func TestDownloadUpdateEndpoint(t *testing.T) {
 	}))
 	defer upstream.Close()
 	t.Setenv("PCHAT_UPDATE_URL", upstream.URL+"/latest.json")
+	// 这条用例覆盖下载路径，签名校验由 internal/update 的专用测试负责。
+	// This case covers the download route; signature checks live in internal/update.
+	t.Setenv("PCHAT_UPDATE_REQUIRE_SIGNATURE", "0")
 
 	s, _ := newTestServer(t)
 	w := httptest.NewRecorder()

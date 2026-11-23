@@ -2234,6 +2234,7 @@ watch([() => state.currentID, queueSignature], () => {
     aria-label="写作与会话快捷操作"
   >
     <div class="composer-toolbar-group" role="group" aria-label="写作与会话快捷操作">
+      <span id="pchat-question-capsule" class="question-capsule-anchor" />
       <NPopover
         v-model:show="showScenePicker"
         trigger="click"
@@ -3430,6 +3431,13 @@ watch([() => state.currentID, queueSignature], () => {
   align-items: center;
   gap: var(--space-1);
   min-width: 0;
+}
+.question-capsule-anchor {
+  display: inline-flex;
+  align-items: center;
+}
+.question-capsule-anchor:empty {
+  display: none;
 }
 .input-footer {
   display: flex;

@@ -13,10 +13,11 @@ export interface StreamEventLike {
 // interrupt.
 export const STREAM_IDLE_AFTER_LLM_MS = 210_000
 // STREAM_IDLE_AFTER_TOOL_MS covers long-running tools (exec 5m,
-// question 10m, sub-agent 30m) that emit a start event then go
-// silent until they finish. A 150s idle here cancelled the reader,
-// the server write-timeout killed the turn, and in-progress todos
-// stopped with no error in the bubble.
+// sub-agent 30m) that emit a start event then go silent until they
+// finish. A 150s idle here cancelled the reader, the server
+// write-timeout killed the turn, and in-progress todos stopped with
+// no error in the bubble. An open `question` disables this watchdog
+// (returns 0) until the user submits or the tool call ends.
 export const STREAM_IDLE_AFTER_TOOL_MS = 35 * 60 * 1000
 
 export interface SSEConsumerOptions<T extends StreamEventLike> {
@@ -41,6 +42,8 @@ export interface SSEConsumerOptions<T extends StreamEventLike> {
 // tool / sub-agent is in flight, then snaps back after it completes.
 // Heartbeats and other phase events keep the current budget so a
 // long exec_command is not cut short by a keep-alive frame.
+// An open question returns 0, which disables the watchdog until the
+// question tool call finishes.
 export function nextStreamIdleTimeoutMs(
   event: StreamEventLike | undefined,
   current: number,
@@ -51,6 +54,13 @@ export function nextStreamIdleTimeoutMs(
   const type = String(event.type || '')
   const toolStatus = String(event.tool_status || '')
   const subStatus = String(event.sub_agent_status || '')
+  const toolName = String(event.tool_name || '')
+  // question 一直等到用户提交，空闲看门狗不能把这条流判死。
+  // An open question waits until the user submits; the idle watchdog
+  // must not treat that silence as a stuck turn.
+  if (type === 'question' || (type === 'tool' && toolName === 'question' && (toolStatus === 'start' || toolStatus === ''))) {
+    return 0
+  }
   if ((type === 'tool' && toolStatus === 'start') || subStatus === 'start') {
     return Math.max(current, STREAM_IDLE_AFTER_TOOL_MS)
   }

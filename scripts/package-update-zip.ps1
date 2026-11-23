@@ -294,13 +294,13 @@ switch ($platformOS) {
             Write-Host "[package-update-zip] WARNING: macOS pchat-gui.app missing (patch zip will not contain GUI)" -ForegroundColor Yellow
         }
 
-        Assert-BinaryVersion -Label "pchat-server-darwin-amd64" -Path (Join-Path $bin "pchat-server-darwin-amd64")
-        Assert-BinaryVersion -Label "pchat-darwin-amd64" -Path (Join-Path $bin "pchat-darwin-amd64")
-        Assert-BinaryVersion -Label "pchat-updater-darwin-amd64" -Path (Join-Path $bin "pchat-updater-darwin-amd64")
+        Assert-BinaryVersion -Label "pchat-server-darwin-$Arch" -Path (Join-Path $bin "pchat-server-darwin-$Arch")
+        Assert-BinaryVersion -Label "pchat-darwin-$Arch" -Path (Join-Path $bin "pchat-darwin-$Arch")
+        Assert-BinaryVersion -Label "pchat-updater-darwin-$Arch" -Path (Join-Path $bin "pchat-updater-darwin-$Arch")
 
-        Copy-Item -LiteralPath (Join-Path $bin "pchat-server-darwin-amd64") -Destination (Join-Path $resources "pchat-server") -Force
-        Copy-Item -LiteralPath (Join-Path $bin "pchat-darwin-amd64") -Destination (Join-Path $resources "pchat") -Force
-        Copy-Item -LiteralPath (Join-Path $bin "pchat-updater-darwin-amd64") -Destination (Join-Path $resources "pchat-updater") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-server-darwin-$Arch") -Destination (Join-Path $resources "pchat-server") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-darwin-$Arch") -Destination (Join-Path $resources "pchat") -Force
+        Copy-Item -LiteralPath (Join-Path $bin "pchat-updater-darwin-$Arch") -Destination (Join-Path $resources "pchat-updater") -Force
 
         $browserExt = Join-Path $root "cmd\pchat-server\browser-extension.zip"
         if (Test-Path -LiteralPath $browserExt) {

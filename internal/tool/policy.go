@@ -170,11 +170,12 @@ func defaultToolPolicy(name string) ToolPolicy {
 		p.TimeoutMS, p.Idempotent = durationMS(CheckpointToolTimeout), true
 	case name == "question" || name == "remember":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryInteractive, ToolSideEffectNone, ToolRiskMedium, ToolParallelExclusive
-		p.TimeoutMS = durationMS(QuestionWaitTimeout)
+		// question 没有等待上限：用户不提交就一直停在这里。
+		// question has no wait cap; it stays open until the user submits.
+		p.TimeoutMS = -1
 		if name == "remember" {
 			p.SideEffect = ToolSideEffectState
 			p.Risk = ToolRiskConfirm
-			p.TimeoutMS = -1
 		}
 	case name == "web_search":
 		p.Category, p.SideEffect, p.Risk, p.Parallelism = ToolCategoryExternal, ToolSideEffectNetwork, ToolRiskMedium, ToolParallelExclusive

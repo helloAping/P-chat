@@ -92,6 +92,10 @@
   /* 2.6 Status */
   --success-50:       rgba(85, 170, 85, 0.16);
   --success-500:      #5AAE5A;
+  /* Question selection only. Does not replace --brand-*. */
+  --question-green:       #8FB59A;
+  --question-green-ink:   #C5DCCB;
+  --question-on-green:    #1C1F26;
   --warn-50:          rgba(234, 170, 85, 0.16);
   --warn-500:         #EAAA55;
   --error-50:         rgba(238, 85, 85, 0.14);
@@ -251,6 +255,10 @@
   --ai-100:           rgba(91, 61, 187, 0.16);
   --ai-500:           #5B3DDB;
   --ai-600:           #4A2EBF;
+  /* Question selection only. Same hue as dark, tuned for a light surface. */
+  --question-green:       #6FA884;
+  --question-green-ink:   #3E6B4C;
+  --question-on-green:    #FFFFFF;
 
   /* 2.7b Code highlight — GitHub-light palette. Dark text on a
    * light grey code surface so code stays readable on white. */

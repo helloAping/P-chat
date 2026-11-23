@@ -1,6 +1,6 @@
 const BASE = ''
 
-export const SOFTWARE_RELEASE_PAGE = 'http://www.08ms.cn/software/p-chat/'
+export const SOFTWARE_RELEASE_PAGE = 'https://github.com/helloAping/P-chat/releases'
 
 export interface UpdateArtifact {
   artifact_id?: number

@@ -34,4 +34,24 @@ foreach ($version in $invalidVersions) {
     }
 }
 
+$versionOrder = @(
+    @{ Left = '1.0.13'; Right = '1.0.12'; Want = 1 },
+    @{ Left = 'v1.0.12'; Right = '1.0.12-release'; Want = 0 },
+    @{ Left = '1.2.0'; Right = '1.10.0'; Want = -1 },
+    @{ Left = '1.0.13.beta'; Right = '1.0.12'; Want = 1 },
+    @{ Left = '1.0.13'; Right = '1.0.13.beta'; Want = 1 },
+    @{ Left = '1.0.13.beta'; Right = '1.0.13'; Want = -1 },
+    @{ Left = '1.0.13.beta.2'; Right = '1.0.13.beta.1'; Want = 1 },
+    @{ Left = '1.0.13-beta.2'; Right = '1.0.13.beta.2'; Want = 0 },
+    @{ Left = '1.0.13.rc.1'; Right = '1.0.13.beta.9'; Want = 1 },
+    @{ Left = '1.0.13.beta'; Right = '1.0.13.alpha'; Want = 1 },
+    @{ Left = 'dev'; Right = '1.0.0'; Want = -1 }
+)
+foreach ($case in $versionOrder) {
+    $got = Compare-PChatVersion -Left $case.Left -Right $case.Right
+    if ($got -ne $case.Want) {
+        throw "Compare-PChatVersion $($case.Left) vs $($case.Right) = $got, want $($case.Want)"
+    }
+}
+
 Write-Host '[test-version-utils] version formats and release channels passed' -ForegroundColor Green

@@ -25,13 +25,19 @@ import (
 )
 
 const (
-	// DefaultLatestURL is the 08ms update metadata endpoint documented for
-	// P-Chat clients. SEC-05 requires HTTPS.
-	DefaultLatestURL = "https://www.08ms.cn/software/p-chat/latest.json"
+	// DefaultLatestURL is the GitHub Pages directory of per-platform update
+	// manifests. A trailing slash selects static index mode:
+	// {platform}-{arch}.json, or {platform}-{arch}.beta.json when the user
+	// opted into pre-releases. SEC-05 requires HTTPS.
+	DefaultLatestURL = "https://helloaping.github.io/P-chat/updates/"
 	defaultTimeout   = 10 * time.Minute
 )
 
 var errNoArtifact = errors.New("no update artifact available")
+
+// ErrManifestTargetMismatch 表示清单声明的平台或架构与当前客户端不一致。
+// ErrManifestTargetMismatch reports a manifest built for another platform or arch.
+var ErrManifestTargetMismatch = errors.New("update manifest target mismatch")
 
 // ErrExpectedVersionChanged 表示检查与下载之间的最新版本发生了变化。
 // ErrExpectedVersionChanged reports a version change between check and download.
@@ -53,17 +59,17 @@ type Artifact struct {
 
 // Latest describes the 08ms latest.json response.
 type Latest struct {
-	Name         string    `json:"name,omitempty"`
-	Slug         string    `json:"slug,omitempty"`
-	Version      string    `json:"version,omitempty"`
-	Channel      string    `json:"channel,omitempty"`
-	ReleaseNotes string    `json:"release_notes,omitempty"`
-	PublishedAt  string    `json:"published_at,omitempty"`
-	Platform     string    `json:"platform,omitempty"`
-	Arch         string    `json:"arch,omitempty"`
-	Size         int64     `json:"size,omitempty"`
-	SHA256       string    `json:"sha256,omitempty"`
-	URL          string    `json:"url,omitempty"`
+	Name         string `json:"name,omitempty"`
+	Slug         string `json:"slug,omitempty"`
+	Version      string `json:"version,omitempty"`
+	Channel      string `json:"channel,omitempty"`
+	ReleaseNotes string `json:"release_notes,omitempty"`
+	PublishedAt  string `json:"published_at,omitempty"`
+	Platform     string `json:"platform,omitempty"`
+	Arch         string `json:"arch,omitempty"`
+	Size         int64  `json:"size,omitempty"`
+	SHA256       string `json:"sha256,omitempty"`
+	URL          string `json:"url,omitempty"`
 	// Signature covers the top-level full artifact when nested full/patch
 	// omit their own signature (legacy single-artifact manifests).
 	Signature string    `json:"signature,omitempty"`
@@ -224,6 +230,9 @@ func (s *Service) Check(ctx context.Context, currentVersion string) (*CheckResul
 			Installable: false,
 		}, nil
 	}
+	if err := s.manifestTargetError(latest); err != nil {
+		return nil, err
+	}
 
 	res := &CheckResult{
 		Name:         latest.Name,
@@ -350,16 +359,25 @@ func (s *Service) fetchLatestOnce(ctx context.Context, currentVersion string) (L
 	if err != nil {
 		return Latest{}, 0, fmt.Errorf("parse update url: %w", err)
 	}
-	q := u.Query()
-	q.Set("platform", s.platform)
-	q.Set("arch", s.arch)
-	if currentVersion != "" {
-		q.Set("current_version", currentVersion)
+	if indexURL, ok := staticIndexURL(s.latestURL, s.platform, s.arch, s.includePrerelease); ok {
+		u, err = url.Parse(indexURL)
+		if err != nil {
+			return Latest{}, 0, fmt.Errorf("parse update index url: %w", err)
+		}
+	} else {
+		// 显式 *.json 地址保持查询参数，兼容发布站和本地测试。
+		// An explicit *.json URL keeps the query-string contract for a dynamic index and tests.
+		q := u.Query()
+		q.Set("platform", s.platform)
+		q.Set("arch", s.arch)
+		if currentVersion != "" {
+			q.Set("current_version", currentVersion)
+		}
+		if s.includePrerelease {
+			q.Set("include_prerelease", "1")
+		}
+		u.RawQuery = q.Encode()
 	}
-	if s.includePrerelease {
-		q.Set("include_prerelease", "1")
-	}
-	u.RawQuery = q.Encode()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -383,6 +401,38 @@ func (s *Service) fetchLatestOnce(ctx context.Context, currentVersion string) (L
 		return Latest{}, resp.StatusCode, fmt.Errorf("decode update response: %w", err)
 	}
 	return latest, resp.StatusCode, nil
+}
+
+// staticIndexURL 在 raw 是目录时返回本机对应的清单地址。
+// 空路径或以 .json 结尾的地址继续走查询参数。
+// staticIndexURL reports the per-platform manifest URL when raw is a directory.
+// An empty path or a path ending in .json stays on the legacy query-string API.
+func staticIndexURL(raw, platform, arch string, includePrerelease bool) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return "", false
+	}
+	if u.Path == "" || strings.EqualFold(path.Ext(u.Path), ".json") {
+		return "", false
+	}
+	name := fmt.Sprintf("%s-%s.json", strings.TrimSpace(platform), strings.TrimSpace(arch))
+	if includePrerelease {
+		name = fmt.Sprintf("%s-%s.beta.json", strings.TrimSpace(platform), strings.TrimSpace(arch))
+	}
+	u.Path = strings.TrimRight(u.Path, "/") + "/" + name
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String(), true
+}
+
+func (s *Service) manifestTargetError(latest Latest) error {
+	if p := strings.TrimSpace(latest.Platform); p != "" && !strings.EqualFold(p, s.platform) {
+		return fmt.Errorf("%w: platform %s, client %s", ErrManifestTargetMismatch, p, s.platform)
+	}
+	if a := strings.TrimSpace(latest.Arch); a != "" && !strings.EqualFold(a, s.arch) {
+		return fmt.Errorf("%w: arch %s, client %s", ErrManifestTargetMismatch, a, s.arch)
+	}
+	return nil
 }
 
 // allowsLatest 默认只接收稳定版，并校验版本后缀与元数据渠道一致。
