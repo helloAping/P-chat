@@ -15,6 +15,7 @@
 #>
 
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 $root = Split-Path -Parent $PSScriptRoot
 
 # Read version from VERSION file (single source of truth).

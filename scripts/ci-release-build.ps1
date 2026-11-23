@@ -13,6 +13,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$env:GOTELEMETRY = 'off'
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $root
 
@@ -132,5 +134,9 @@ switch ($Platform) {
     }
 }
 
+Write-Host "[ci-release-build] validating release artifacts" -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot 'validate-release-artifacts.ps1') -Directory (Join-Path $root 'bin') -RequireSignature
+if ($LASTEXITCODE -ne 0) {
+    throw "validate-release-artifacts failed: $LASTEXITCODE"
+}
 Write-Host "[ci-release-build] $Platform/$Arch packages verified" -ForegroundColor Green
