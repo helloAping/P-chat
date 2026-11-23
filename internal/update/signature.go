@@ -78,8 +78,9 @@ func ParsePublicKeyBase64(raw string) (ed25519.PublicKey, error) {
 	return ed25519.PublicKey(b), nil
 }
 
-// ParsePrivateKeyBase64 decodes a standard-base64 ed25519 private key
-// (64-byte seed+public form as returned by ed25519.GenerateKey).
+// ParsePrivateKeyBase64 decodes a standard-base64 ed25519 private key.
+// Both the 64-byte seed+public form from ed25519.GenerateKey and a 32-byte
+// seed are accepted. The seed is expanded with ed25519.NewKeyFromSeed.
 // ParsePrivateKeyBase64 decodes a base64-encoded private key.
 func ParsePrivateKeyBase64(raw string) (ed25519.PrivateKey, error) {
 	raw = strings.TrimSpace(raw)
@@ -90,10 +91,14 @@ func ParsePrivateKeyBase64(raw string) (ed25519.PrivateKey, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode private key: %w", err)
 	}
-	if len(b) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("private key length %d, want %d", len(b), ed25519.PrivateKeySize)
+	switch len(b) {
+	case ed25519.SeedSize:
+		return ed25519.NewKeyFromSeed(b), nil
+	case ed25519.PrivateKeySize:
+		return ed25519.PrivateKey(b), nil
+	default:
+		return nil, fmt.Errorf("private key length %d, want %d or %d", len(b), ed25519.SeedSize, ed25519.PrivateKeySize)
 	}
-	return ed25519.PrivateKey(b), nil
 }
 
 func defaultPublicKey() ed25519.PublicKey {

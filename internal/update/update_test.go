@@ -1,9 +1,11 @@
 package update
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -641,6 +643,27 @@ func TestDownloadRequiresPublisherSignature(t *testing.T) {
 	}
 	if got.SHA256 != sum {
 		t.Fatalf("sha256 = %q", got.SHA256)
+	}
+}
+
+func TestParsePrivateKeyAcceptsSeed(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seedKey, err := ParsePrivateKeyBase64(base64.StdEncoding.EncodeToString(priv.Seed()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fullKey, err := ParsePrivateKeyBase64(base64.StdEncoding.EncodeToString(priv))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(seedKey, priv) || !bytes.Equal(fullKey, priv) {
+		t.Fatal("parsed private key does not match the generated key")
+	}
+	if _, err := ParsePrivateKeyBase64(base64.StdEncoding.EncodeToString([]byte("short"))); err == nil {
+		t.Fatal("expected a length error for a short key")
 	}
 }
 
