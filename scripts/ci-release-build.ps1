@@ -13,6 +13,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$env:GOTELEMETRY = 'off'
 $root = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 Set-Location -LiteralPath $root
 
@@ -21,6 +23,32 @@ if ([string]::IsNullOrWhiteSpace($env:PCHAT_UPDATE_SIGNING_KEY)) {
 }
 
 $proxy = if ($env:GOPROXY) { $env:GOPROXY } else { 'https://proxy.golang.org,direct' }
+
+function Build-UpdateSignTool {
+    $bin = Join-Path $root 'bin'
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    $isWin = $env:OS -eq 'Windows_NT'
+    $out = Join-Path $bin ($(if ($isWin) { 'pchat-updatesign.exe' } else { 'pchat-updatesign' }))
+    $stdout = Join-Path $bin 'pchat-updatesign-build.out'
+    $stderr = Join-Path $bin 'pchat-updatesign-build.err'
+    Write-Host "[ci-release-build] building pchat-updatesign -> $out" -ForegroundColor Cyan
+    # Pass each go argument separately. A shell string gets split on Linux and
+    # macOS, so go runs with no arguments and only prints its help.
+    $proc = Start-Process -FilePath 'go' -ArgumentList @('build', '-o', $out, './cmd/pchat-updatesign') -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    if (-not $proc.WaitForExit(180000)) {
+        if ($isWin) {
+            & taskkill.exe /F /T /PID $proc.Id | Out-Null
+        } else {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+        }
+        throw "go build pchat-updatesign timed out after 180s. See $stderr"
+    }
+    if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $out)) {
+        $tail = @($stdout, $stderr) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { (Get-Content -LiteralPath $_ -Tail 40) -join [Environment]::NewLine }
+        throw "go build pchat-updatesign failed ($($proc.ExitCode)). $($tail -join [Environment]::NewLine)"
+    }
+    Remove-Item -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue
+}
 
 function Invoke-CheckedTask {
     param([Parameter(Mandatory = $true)][string[]]$TaskArgs)
@@ -76,6 +104,8 @@ function Assert-UnixArch {
     }
 }
 
+Build-UpdateSignTool
+
 switch ($Platform) {
     'win' {
         if ($Arch -ne 'amd64') {
@@ -104,6 +134,8 @@ switch ($Platform) {
             Assert-UnixArch -Path (Join-Path $root $relative) -Expected 'amd64'
         }
         & (Join-Path $PSScriptRoot 'package-platform-archive.ps1') -Platform linux
+        & (Join-Path $PSScriptRoot 'build-installer.ps1') -Platform linux
+        if ($LASTEXITCODE -ne 0) { throw "linux setup program failed: $LASTEXITCODE" }
         & (Join-Path $PSScriptRoot 'package-update-zip.ps1') -Platform linux -Arch amd64 -RequireSetup
     }
     'mac' {
@@ -128,9 +160,15 @@ switch ($Platform) {
         }
         Assert-UnixArch -Path $gui -Expected $Arch
         & (Join-Path $PSScriptRoot 'package-platform-archive.ps1') -Platform mac -Arch $Arch
+        & (Join-Path $PSScriptRoot 'build-installer.ps1') -Platform mac -Arch $Arch
+        if ($LASTEXITCODE -ne 0) { throw "macOS setup program failed: $LASTEXITCODE" }
         & (Join-Path $PSScriptRoot 'package-update-zip.ps1') -Platform mac -Arch $Arch -RequireSetup
     }
 }
 
+Write-Host "[ci-release-build] validating release artifacts" -ForegroundColor Cyan
 & (Join-Path $PSScriptRoot 'validate-release-artifacts.ps1') -Directory (Join-Path $root 'bin') -RequireSignature
+if ($LASTEXITCODE -ne 0) {
+    throw "validate-release-artifacts failed: $LASTEXITCODE"
+}
 Write-Host "[ci-release-build] $Platform/$Arch packages verified" -ForegroundColor Green

@@ -17,6 +17,9 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# Compress-Archive writes progress records. In GitHub Actions those records
+# can keep the PowerShell process alive after the script's last line.
+$ProgressPreference = "SilentlyContinue"
 
 . (Join-Path $PSScriptRoot 'version-utils.ps1')
 
@@ -156,10 +159,13 @@ function Get-UpdateSignature {
     $env:PCHAT_SIGN_VERSION = $version
     $env:PCHAT_SIGN_KIND = $Kind
     $env:PCHAT_SIGN_OUTPUT = $sigFile
-    $signTool = Join-Path $root "bin\pchat-updatesign.exe"
+    $signTool = @(
+        (Join-Path $root "bin\pchat-updatesign.exe"),
+        (Join-Path $root "bin\pchat-updatesign")
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     Push-Location $root
     try {
-        if (Test-Path -LiteralPath $signTool) {
+        if ($signTool) {
             & $signTool
         } else {
             & go run ./cmd/pchat-updatesign
@@ -225,12 +231,14 @@ function Find-SetupPackage {
         }
         "linux" {
             return Find-FirstExisting @(
+                (Join-Path $bin ("pchat-linux-setup-v{0}" -f $version)),
                 (Join-Path $bin ("pchat-linux-setup-v{0}.tar.gz" -f $version)),
                 (Join-Path $bin ("pchat-linux-setup-v{0}.zip" -f $version))
             )
         }
         "darwin" {
             return Find-FirstExisting @(
+                (Join-Path $bin ("pchat-mac-setup-v{0}.dmg" -f $version)),
                 (Join-Path $bin ("pchat-mac-setup-v{0}.tar.gz" -f $version)),
                 (Join-Path $bin ("pchat-mac-setup-v{0}.zip" -f $version))
             )
@@ -449,3 +457,6 @@ Write-JsonNoBom -Value $releaseManifest -Path $releaseManifestPath
 Write-Host "[package-update-zip] update zip: $zipPath" -ForegroundColor Green
 Write-Host "[package-update-zip] manifest:   $releaseManifestPath" -ForegroundColor Green
 Write-Host "[package-update-zip] latest json: $latestJsonPath" -ForegroundColor Green
+# Skip PowerShell's exit cleanup. A leftover progress record otherwise
+# leaves this process running, and the GitHub Actions step never finishes.
+[Environment]::Exit(0)
