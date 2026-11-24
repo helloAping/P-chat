@@ -8,6 +8,9 @@
 
 ## 已完成 ✅
 
+### v1.0.15.beta — 开发中
+- 发布版本真源更新为 `1.0.15.beta`
+
 ### v1.0.14 — 稳定版
 - 发布版本从 `1.0.14.beta` 提升为稳定版 `1.0.14`
 - GitHub Actions 构建 Windows amd64、Linux amd64 与 macOS arm64 的安装包和更新包
