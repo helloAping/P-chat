@@ -29,28 +29,25 @@ function Build-UpdateSignTool {
     New-Item -ItemType Directory -Force -Path $bin | Out-Null
     $isWin = $env:OS -eq 'Windows_NT'
     $out = Join-Path $bin ($(if ($isWin) { 'pchat-updatesign.exe' } else { 'pchat-updatesign' }))
-    $log = Join-Path $bin 'pchat-updatesign-build.log'
+    $stdout = Join-Path $bin 'pchat-updatesign-build.out'
+    $stderr = Join-Path $bin 'pchat-updatesign-build.err'
     Write-Host "[ci-release-build] building pchat-updatesign -> $out" -ForegroundColor Cyan
-    # cmd/bash owns the pipes. PowerShell's native-command wrapper can deadlock
-    # when go writes to stderr under ErrorActionPreference=Stop.
-    if ($isWin) {
-        $proc = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d', '/c', "go build -o `"$out`" ./cmd/pchat-updatesign > `"$log`" 2>&1") -WorkingDirectory $root -PassThru -WindowStyle Hidden
-    } else {
-        $proc = Start-Process -FilePath 'bash' -ArgumentList @('-lc', "go build -o '$out' ./cmd/pchat-updatesign > '$log' 2>&1") -WorkingDirectory $root -PassThru
-    }
+    # Pass each go argument separately. A shell string gets split on Linux and
+    # macOS, so go runs with no arguments and only prints its help.
+    $proc = Start-Process -FilePath 'go' -ArgumentList @('build', '-o', $out, './cmd/pchat-updatesign') -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
     if (-not $proc.WaitForExit(180000)) {
         if ($isWin) {
             & taskkill.exe /F /T /PID $proc.Id | Out-Null
         } else {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
         }
-        throw "go build pchat-updatesign timed out after 180s. See $log"
+        throw "go build pchat-updatesign timed out after 180s. See $stderr"
     }
     if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $out)) {
-        $tail = if (Test-Path -LiteralPath $log) { (Get-Content -LiteralPath $log -Tail 40) -join [Environment]::NewLine } else { '' }
-        throw "go build pchat-updatesign failed ($($proc.ExitCode)). $tail"
+        $tail = @($stdout, $stderr) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { (Get-Content -LiteralPath $_ -Tail 40) -join [Environment]::NewLine }
+        throw "go build pchat-updatesign failed ($($proc.ExitCode)). $($tail -join [Environment]::NewLine)"
     }
-    Remove-Item -LiteralPath $log -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue
 }
 
 function Invoke-CheckedTask {
