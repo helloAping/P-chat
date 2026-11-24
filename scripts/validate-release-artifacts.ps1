@@ -74,14 +74,33 @@ function Assert-ZipContains {
 }
 
 function Get-VerifyTool {
+    $bin = Join-Path $root 'bin'
     foreach ($name in @('pchat-updatesign.exe', 'pchat-updatesign')) {
-        $path = Join-Path $root (Join-Path 'bin' $name)
+        $path = Join-Path $bin $name
         if (Test-Path -LiteralPath $path) {
             Write-Host "[validate-release-artifacts] using $path" -ForegroundColor Cyan
             return (Resolve-Path -LiteralPath $path).Path
         }
     }
-    throw "pchat-updatesign is missing from bin/. The release build must compile it before validation."
+    # The publish job only downloads release artifacts, so bin/ has no signer yet.
+    New-Item -ItemType Directory -Force -Path $bin | Out-Null
+    $isWin = $env:OS -eq 'Windows_NT'
+    $out = Join-Path $bin ($(if ($isWin) { 'pchat-updatesign.exe' } else { 'pchat-updatesign' }))
+    $stdout = Join-Path $bin 'pchat-updatesign-build.out'
+    $stderr = Join-Path $bin 'pchat-updatesign-build.err'
+    Write-Host "[validate-release-artifacts] building pchat-updatesign -> $out" -ForegroundColor Cyan
+    $env:GOTELEMETRY = 'off'
+    $proc = Start-Process -FilePath 'go' -ArgumentList @('build', '-o', $out, './cmd/pchat-updatesign') -WorkingDirectory $root -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    if (-not $proc.WaitForExit(180000)) {
+        if ($isWin) { & taskkill.exe /F /T /PID $proc.Id | Out-Null } else { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+        throw "go build pchat-updatesign timed out after 180s. See $stderr"
+    }
+    if ($proc.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $out)) {
+        $tail = @($stdout, $stderr) | Where-Object { Test-Path -LiteralPath $_ } | ForEach-Object { (Get-Content -LiteralPath $_ -Tail 40) -join [Environment]::NewLine }
+        throw "go build pchat-updatesign failed ($($proc.ExitCode)). $($tail -join [Environment]::NewLine)"
+    }
+    Remove-Item -LiteralPath $stdout, $stderr -ErrorAction SilentlyContinue
+    return (Resolve-Path -LiteralPath $out).Path
 }
 
 function Assert-Artifact {
