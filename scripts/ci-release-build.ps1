@@ -134,6 +134,8 @@ switch ($Platform) {
             Assert-UnixArch -Path (Join-Path $root $relative) -Expected 'amd64'
         }
         & (Join-Path $PSScriptRoot 'package-platform-archive.ps1') -Platform linux
+        & (Join-Path $PSScriptRoot 'build-installer.ps1') -Platform linux
+        if ($LASTEXITCODE -ne 0) { throw "linux setup program failed: $LASTEXITCODE" }
         & (Join-Path $PSScriptRoot 'package-update-zip.ps1') -Platform linux -Arch amd64 -RequireSetup
     }
     'mac' {
@@ -158,6 +160,8 @@ switch ($Platform) {
         }
         Assert-UnixArch -Path $gui -Expected $Arch
         & (Join-Path $PSScriptRoot 'package-platform-archive.ps1') -Platform mac -Arch $Arch
+        & (Join-Path $PSScriptRoot 'build-installer.ps1') -Platform mac -Arch $Arch
+        if ($LASTEXITCODE -ne 0) { throw "macOS setup program failed: $LASTEXITCODE" }
         & (Join-Path $PSScriptRoot 'package-update-zip.ps1') -Platform mac -Arch $Arch -RequireSetup
     }
 }

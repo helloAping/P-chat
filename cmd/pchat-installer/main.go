@@ -4,9 +4,10 @@ import (
 	"embed"
 	"fmt"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 //go:embed assets
@@ -22,9 +23,10 @@ func main() {
 		fail("解压文件失败", err)
 	}
 
-	if err := runInstall(tmp, os.Args[1:]); err != nil {
+	if err := runPlatformInstall(tmp, os.Args[1:]); err != nil {
 		fail(fmt.Sprintf("安装失败，临时文件保留在: %s", tmp), err)
 	}
+	showInstallerNotice("P-Chat 安装程序", "安装完成。")
 
 	if err := os.RemoveAll(tmp); err != nil {
 		showInstallerError("P-Chat 安装程序", fmt.Sprintf("安装已完成，但清理临时目录失败，可手动删除:\n%s\n\n%v", tmp, err))
@@ -60,7 +62,28 @@ func copyFile(src string, dst string) error {
 	if filepath.Ext(dst) == ".ps1" && !hasUTF8BOM(data) {
 		data = append([]byte{0xEF, 0xBB, 0xBF}, data...)
 	}
-	return os.WriteFile(dst, data, 0644)
+	return os.WriteFile(dst, data, installFileMode(dst))
+}
+
+func installFileMode(dst string) os.FileMode {
+	if runtime.GOOS == "windows" {
+		return 0644
+	}
+	base := filepath.Base(dst)
+	switch filepath.Ext(dst) {
+	case ".sh":
+		return 0755
+	case "":
+		return 0755
+	}
+	if strings.Contains(dst, filepath.Join("Contents", "MacOS")) {
+		return 0755
+	}
+	switch base {
+	case "pchat", "pchat-gui", "pchat-server", "pchat-updater":
+		return 0755
+	}
+	return 0644
 }
 
 func hasUTF8BOM(data []byte) bool {
@@ -87,22 +110,6 @@ func copyDir(src string, dst string) error {
 				return err
 			}
 		}
-	}
-	return nil
-}
-
-func runInstall(tmp string, args []string) error {
-	ps1 := filepath.Join(tmp, "install.ps1")
-	psArgs := installPowerShellArgs(ps1, args)
-	cmd := exec.Command("powershell", psArgs...)
-	cmd.Dir = tmp
-	configureInstallCommand(cmd)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		if len(output) > 0 {
-			return fmt.Errorf("%w\n\n%s", err, string(output))
-		}
-		return err
 	}
 	return nil
 }

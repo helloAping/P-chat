@@ -67,7 +67,7 @@ P-Chat 现在已经不是单纯的聊天壳，而是围绕本地 AI 编程助手
 ### 方式 A — 全平台安装包（推荐新用户）
 
 1. 从 [GitHub Releases](https://github.com/helloAping/P-chat/releases) 下载当前版本对应系统的安装包。Windows / Linux 为 amd64，macOS 自动更新包为 arm64；需要手动更新时，也在该页面下载增量 zip 或安装包
-2. Windows 下载 `pchat-setup-v*.exe` 后双击运行；Linux 下载 `pchat-linux-setup-v*.tar.gz` 后解压并执行 `./install.sh`；macOS 下载 `pchat-mac-setup-v*.tar.gz` 后解压并执行 `./install.sh`
+2. Windows 下载 `pchat-setup-v*.exe` 后双击运行；Linux 下载可执行文件 `pchat-linux-setup-v*` 后 `chmod +x` 再运行；macOS 下载 `pchat-mac-setup-v*.dmg`，打开后双击里面的 `pchat-setup.app`
 3. 安装程序会解压 GUI / server / CLI / updater 二进制和 `web/` 资源，并按系统创建对应的快捷入口或命令入口
 4. 安装完成后启动 **P-Chat**
 

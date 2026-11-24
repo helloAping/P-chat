@@ -231,12 +231,14 @@ function Find-SetupPackage {
         }
         "linux" {
             return Find-FirstExisting @(
+                (Join-Path $bin ("pchat-linux-setup-v{0}" -f $version)),
                 (Join-Path $bin ("pchat-linux-setup-v{0}.tar.gz" -f $version)),
                 (Join-Path $bin ("pchat-linux-setup-v{0}.zip" -f $version))
             )
         }
         "darwin" {
             return Find-FirstExisting @(
+                (Join-Path $bin ("pchat-mac-setup-v{0}.dmg" -f $version)),
                 (Join-Path $bin ("pchat-mac-setup-v{0}.tar.gz" -f $version)),
                 (Join-Path $bin ("pchat-mac-setup-v{0}.zip" -f $version))
             )

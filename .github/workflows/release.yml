@@ -98,8 +98,8 @@ jobs:
           if-no-files-found: error
           path: |
             bin/pchat-setup-*.exe
-            bin/pchat-linux-setup-*.tar.gz
-            bin/pchat-linux-setup-*.zip
+            bin/pchat-linux-setup-v*
+            bin/pchat-mac-setup-*.dmg
             bin/pchat-mac-setup-*.tar.gz
             bin/pchat-mac-setup-*.zip
             bin/pchat-update-*.zip
